@@ -1,0 +1,95 @@
+{
+  "name": "@sirzero/pi-sandbox",
+  "version": "1.0.0",
+  "description": "Unified permission engine and model reviewer for the Pi coding agent",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zero-zrc0/pi-sandbox.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "permissions",
+    "approval-chain"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "npm@10.9.4",
+  "exports": {
+    ".": {
+      "types": "./dist/public.d.ts",
+      "default": "./src/service.ts"
+    },
+    "./extension": "./src/index.ts",
+    "./schema": "./schemas/permissions.schema.json",
+    "./sdk": {
+      "types": "./dist/sdk.d.ts",
+      "default": "./src/sdk/index.ts"
+    }
+  },
+  "imports": {
+    "#approve-core/*": "./src/approve-core/*",
+    "#sandbox/*": "./src/sandbox/*",
+    "#config/*": "./src/config/*",
+    "#approve-core-test/*": "./test/approve-core/*",
+    "#permissions": "./src/service.ts"
+  },
+  "files": [
+    "src",
+    "dist",
+    "config",
+    "schemas",
+    "docs",
+    "licenses",
+    "scripts/build-windows-mxc.ps1",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "npm run build:codemode-worker && npm run build:types",
+    "build:codemode-worker": "node scripts/build-codemode-worker.mjs",
+    "build:types": "rollup -c rollup.dts.config.mjs",
+    "build:windows-mxc": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-mxc.ps1",
+    "prepack": "npm run build",
+    "test": "vitest run --configLoader native",
+    "test:watch": "vitest --configLoader native",
+    "test:integration": "vitest run --configLoader native test/integration",
+    "gen:schema": "node --experimental-strip-types --import ./scripts/register-ts-resolve.mjs scripts/generate-permissions-schema.ts",
+    "verify:public-types": "node scripts/verify-public-types.mjs",
+    "verify:windows-mxc-package": "node scripts/verify-public-types.mjs --windows-mxc"
+  },
+  "dependencies": {
+    "@earendil-works/pi-codemode": "1.4.0",
+    "@earendil-works/pi-mcp": "1.4.0",
+    "tree-sitter-bash": "^0.25.1",
+    "undici": "8.10.2",
+    "web-tree-sitter": "^0.26.9",
+    "zod": "4.4.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=1.4.0",
+    "@earendil-works/pi-coding-agent": ">=1.4.0",
+    "@earendil-works/pi-tui": ">=1.0.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.0.0",
+    "@types/node": "24.13.3",
+    "rollup": "4.63.1",
+    "rollup-plugin-dts": "6.5.1",
+    "typescript": "6.0.3",
+    "vite": "7.3.7",
+    "vitest": "4.1.11"
+  }
+}

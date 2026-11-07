@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+*.tgz
+*.log
+debug.txt
+.cache/
+.specflo/
+drafts/
+.worktrees/
+target/
+*.exe
