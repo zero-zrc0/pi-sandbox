@@ -1,0 +1,11 @@
+# The published JSON Schema is a generated artifact: a parity test compares the
+# committed file byte-for-byte with the generator output (LF), so it must not be
+# rewritten with CRLF on checkout.
+schemas/permissions.schema.json text eol=lf
+
+# Shell scripts run on Linux and WSL; CRLF breaks `set -o pipefail`.
+*.sh text eol=lf
+
+# Generated single-file bundle: keep the committed bytes identical to the build
+# output and out of diffs.
+src/sandbox/builtin-worker.bundle.mjs -text

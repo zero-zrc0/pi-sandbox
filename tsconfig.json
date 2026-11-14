@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "types": ["node", "vitest/globals"],
+    "paths": {
+      "#approve-core/*": ["./src/approve-core/*"],
+      "#sandbox/*": ["./src/sandbox/*"],
+      "#config/*": ["./src/config/*"],
+      "#approve-core-test/*": ["./test/approve-core/*"],
+      "#permissions": ["./src/service.ts"]
+    }
+  },
+  "include": ["src", "test", "vitest.config.ts"]
+}
