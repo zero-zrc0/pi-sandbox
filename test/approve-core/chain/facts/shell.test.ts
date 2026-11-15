@@ -1,3 +1,6 @@
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { BashProgramFactsView, CallState } from "#approve-core/contracts";
 import { projectShellFacts, type ShellFactsProjection } from "#approve-core/chain/facts/shell";
@@ -55,6 +58,7 @@ interface BashFixtureOptions {
   readonly platform?: NodeJS.Platform;
   readonly toolName?: string;
   readonly unitIds?: readonly string[];
+  readonly additionalLocalPaths?: readonly string[];
 }
 
 interface BashFixture {
@@ -84,6 +88,7 @@ async function bashFixture(
     normalizer: new PathNormalizer(pathFlavorForPlatform(platform), cwd, {
       realpathSync: (value) => value,
       existsSync: () => false,
+      additionalLocalPaths: options.additionalLocalPaths,
     }),
   });
   const program = await provider(request);
@@ -144,14 +149,15 @@ function programCall(
   commandName: string,
   argumentsValue: readonly string[],
   commandLength: number,
+  start = 0,
 ): PowerShellProgramCall {
   return {
     commandName,
     arguments: argumentsValue,
     dynamic: false,
     dotSource: false,
-    start: 0,
-    end: commandLength,
+    start,
+    end: start + commandLength,
   };
 }
 
@@ -159,8 +165,9 @@ function languageOperation(
   kind: PowerShellLanguageOperation["kind"],
   target: string,
   commandLength: number,
+  start = 0,
 ): PowerShellLanguageOperation {
-  return { kind, target, start: 0, end: commandLength };
+  return { kind, target, start, end: start + commandLength };
 }
 
 function requireProjection(
@@ -403,6 +410,37 @@ describe("bash access facts", () => {
     });
   });
 
+  it("treats a session temporary directory as local shell output", async () => {
+    const sessionWorkspace = "/agent/workspaces/pi-sandbox/session-hash";
+    const target = `${sessionWorkspace}/tmp/result.txt`;
+    const fixture = await bashFixture(`echo hi > '${target}'`, {
+      additionalLocalPaths: [sessionWorkspace],
+    });
+    const projection = requireProjection(await projectShellFacts({
+      call: fixture.call,
+      bashView: fixture.view,
+      options: { platform: "linux", cwd: POSIX_CWD, additionalLocalPaths: [sessionWorkspace] },
+    }));
+    const targetWrite = accessOf(projection, `${CALL_ID}:u0`).find(fact => fact.path === target);
+
+    expect(targetWrite).toMatchObject({ kind: "write", external: false });
+  });
+
+  it("keeps host /tmp outside the session-local shell root", async () => {
+    const sessionWorkspace = "/agent/workspaces/pi-sandbox/session-hash";
+    const fixture = await bashFixture("echo hi > /tmp/host-temp.txt", {
+      additionalLocalPaths: [sessionWorkspace],
+    });
+    const projection = requireProjection(await projectShellFacts({
+      call: fixture.call,
+      bashView: fixture.view,
+      options: { platform: "linux", cwd: POSIX_CWD, additionalLocalPaths: [sessionWorkspace] },
+    }));
+    const targetWrite = accessOf(projection, `${CALL_ID}:u0`).find(fact => fact.path === "/tmp/host-temp.txt");
+
+    expect(targetWrite).toMatchObject({ kind: "write", external: true });
+  });
+
   it("keeps an external write local when a shell write grant covers it", async () => {
     const fixture = await bashFixture("echo hi > /shared/out.txt");
     const projection = requireProjection(await projectShellFacts({
@@ -643,6 +681,60 @@ describe("powershell access facts", () => {
       path: "C:\\workspace\\output.txt",
       external: false,
     }]);
+  });
+
+  it("treats writes under the session temporary directory as local", async () => {
+    const sessionWorkspace = "C:\\Users\\agent\\workspaces\\pi-sandbox\\session-hash";
+    const target = `${sessionWorkspace}\\tmp\\result.txt`;
+    const command = `Set-Content -Path '${target}'`;
+    const fixture = powerShellFixture(command, {
+      programCalls: [programCall("Set-Content", ["-Path", target], command.length)],
+      languageOperations: [languageOperation("file-write", target, command.length)],
+    });
+    const projection = requireProjection(await projectShellFacts({
+      call: fixture.call,
+      powershellView: fixture.view,
+      options: { platform: "win32", cwd: WINDOWS_CWD, additionalLocalPaths: [sessionWorkspace] },
+    }));
+
+    expect(accessOf(projection, fixture.call.units[0]!.unitId)).toContainEqual(expect.objectContaining({
+      kind: "write",
+      path: target,
+      external: false,
+    }));
+  });
+
+  it.skipIf(process.platform !== "win32")("treats sl as an internal location alias and resolves later relative paths", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-powershell-sl-"));
+    const subdirectory = join(cwd, "subdir");
+    mkdirSync(subdirectory);
+    const locationCommand = "sl subdir";
+    const fileCommand = "Set-Content -Path output.txt";
+    const fileStart = locationCommand.length + 2;
+    const command = `${locationCommand}; ${fileCommand}`;
+
+    try {
+      const fixture = powerShellFixture(command, {
+        cwd,
+        programCalls: [
+          programCall("sl", ["subdir"], locationCommand.length),
+          programCall("Set-Content", ["-Path", "output.txt"], fileCommand.length, fileStart),
+        ],
+        languageOperations: [
+          languageOperation("location-change", "subdir", locationCommand.length),
+          languageOperation("file-write", "output.txt", fileCommand.length, fileStart),
+        ],
+      });
+
+      expect(fixture.view.analysis.operations.every(operation => operation.complete)).toBe(true);
+      expect(fixture.view.analysis.operations.some(operation => operation.owner === "external-command")).toBe(false);
+      expect(fixture.view.analysis.operations[1]?.fileTargets).toMatchObject({
+        status: "known",
+        value: expect.arrayContaining([{ path: join(subdirectory, "output.txt"), effect: "file.create" }]),
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("marks a recursive forced delete for review", async () => {

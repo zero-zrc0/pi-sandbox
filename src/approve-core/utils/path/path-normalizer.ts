@@ -40,6 +40,8 @@ export interface PathNormalizerDeps {
   readonly statSync?: (path: string) => unknown;
   /** Configured infrastructure read paths (home prefixes and globs allowed). */
   readonly infrastructureReadPaths?: readonly string[];
+  /** Additional session-local directories treated as in-tree access. */
+  readonly additionalLocalPaths?: readonly string[];
   /** Directories excluded from the infrastructure read exemption. */
   readonly infrastructureExclusions?: readonly string[];
 }
@@ -223,7 +225,12 @@ export class PathNormalizer {
     if (canonicalCwd === undefined) return false;
     const canonical = this.canonicalize(path);
     if (canonical.length === 0) return false;
-    return isOutsideCanonicalCwd(canonical, canonicalCwd, this.flavor);
+    if (!isOutsideCanonicalCwd(canonical, canonicalCwd, this.flavor)) return false;
+    for (const localPath of this.deps.additionalLocalPaths ?? []) {
+      const canonicalLocal = this.canonicalize(localPath);
+      if (canonicalLocal.length > 0 && !isOutsideCanonicalCwd(canonical, canonicalLocal, this.flavor)) return false;
+    }
+    return true;
   }
 
   /** Native-tool style existence probe; follows symbolic links. */

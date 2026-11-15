@@ -58,6 +58,7 @@ export interface ShellFactsOptions {
   /** The mode the unit is being judged in; defaults to `default`. */
   readonly mode?: PermissionMode;
   readonly workspaceRoot?: string;
+  readonly additionalLocalPaths?: readonly string[];
   readonly shellPolicy?: ShellPolicy;
   readonly shellPathVariables?: ShellPolicyPathVariables;
   readonly enabledShellNodes?: readonly string[];
@@ -195,6 +196,9 @@ function modeNodeOptions(options: ShellFactsOptions, cwd: string): ModeNodeOptio
     ...(options.shellPathVariables === undefined
       ? {}
       : { shellPathVariables: options.shellPathVariables }),
+    ...(options.additionalLocalPaths === undefined
+      ? {}
+      : { additionalLocalPaths: options.additionalLocalPaths }),
     ...(options.enabledShellNodes === undefined
       ? {}
       : { enabledShellNodes: options.enabledShellNodes }),

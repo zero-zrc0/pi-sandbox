@@ -48,6 +48,7 @@ export const DEFAULT_HELPER_ENVIRONMENT_ALLOWLIST = Object.freeze([
   "TEMP",
   "TMP",
   "TMPDIR",
+  "PI_SANDBOX_WORK_DIR",
   "HOME",
   "USERPROFILE",
   "LANG",

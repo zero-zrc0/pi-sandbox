@@ -28,6 +28,7 @@ import type {
   ToolCallEvent,
   ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
+import { formatPiSandboxError } from "../../error-format";
 import {
   DynamicBorder,
   getLanguageFromPath,
@@ -376,12 +377,12 @@ export interface SandboxBypassReviewInput {
   readonly targetToolName: string;
   readonly arguments: unknown;
   readonly reason: string;
-  readonly elevation?: import("../../elevation").ToolElevation;
+  readonly elevation: import("../../elevation").ToolElevation;
 }
 
 /**
  * The bypass-channel answer: `undefined` approves the elevation (the bypass
- * tool then executes the target on the host), and a block refuses it.
+ * tool then executes the target at the requested tier), and a block refuses it.
  */
 export type SandboxBypassReviewAnswer =
   | { readonly block: true; readonly reason: string }
@@ -414,9 +415,9 @@ function serializeArguments(value: unknown): string {
 }
 
 function summarizeReasons(summary: CallSummary, fallback: string): string {
-  const reasons = summary.reasons
+  const reasons = [...new Set(summary.reasons
     .map((reason) => reason.reason)
-    .filter((reason) => typeof reason === "string" && reason.length > 0);
+    .filter((reason) => typeof reason === "string" && reason.length > 0))];
   return reasons.length === 0 ? fallback : reasons.join("; ");
 }
 
@@ -496,13 +497,18 @@ export function humanPromptFacts(request: HumanRequest): HumanPromptFacts {
   const toolName = nonEmpty(request.call.toolName) ?? "tool";
   const askFor = request.summary.askFor === "escalate" ? "escalate" : "allow";
   const escalation = askFor === "escalate";
+  const tier = request.call.hostExecutionRequest?.elevation.tier;
   const reason = summarizeReasons(request.summary, escalation
-    ? "one-time host execution was requested"
+    ? tier === undefined ? "ordinary approvals cannot grant Host execution" : `one-time ${tier} elevation was requested`
     : "no reason was recorded");
   const args = serializeArguments(request.call.arguments);
-  const title = escalation
-    ? `Host execution request for ${toolName}. Reason: ${reason}. Final arguments: ${args}`
-    : `Approve ${toolName} call? Reason: ${reason}. Arguments: ${args}`;
+  const title = tier === "host"
+    ? `Host execution request for ${toolName} (outside the OS sandbox). Reason: ${reason}. Final arguments: ${args}`
+    : tier === "default"
+      ? `Default sandbox elevation request for ${toolName}. Reason: ${reason}. Final arguments: ${args}`
+      : escalation
+        ? `Ordinary ${toolName} call cannot receive Host execution. Reason: ${reason}. Arguments: ${args}`
+        : `Approve ${toolName} call? Reason: ${reason}. Arguments: ${args}`;
   return {
     escalation,
     askFor,
@@ -620,9 +626,11 @@ function renderHumanTitle(request: HumanRequest, cwd: string, highlight: (value:
   const fileTool = request.call.toolName === "write" || request.call.toolName === "edit";
   const absolutePath = path === "" ? "" : isAbsolute(path) ? path : resolve(cwd, path);
   const elevation = request.call.hostExecutionRequest?.elevation;
-  const tier = elevation?.tier ?? (escalation ? "host" : undefined);
+  const tier = elevation?.tier;
   const scope = elevation?.scope.map(entry => `${text === approvalText.zh ? entry.access === "write" ? "写入" : "读取" : entry.access} ${entry.path}`).join(`\n${text.scope}  `);
   const requestTitle = text.request(request.call.toolName, tier === undefined ? undefined : highlight(text.elevation(tier)));
+  const hostBoundary = tier === "host" ? text.hostBoundary : "";
+  const ordinaryHostNotice = escalation && elevation === undefined ? text.ordinaryHostUnavailable : "";
   let operation = "";
   if (request.call.toolName === "write") {
     operation = absolutePath !== "" && existsSync(absolutePath) ? text.overwriteFile : text.createFile;
@@ -631,6 +639,8 @@ function renderHumanTitle(request: HumanRequest, cwd: string, highlight: (value:
   }
   return [
     requestTitle,
+    hostBoundary,
+    ordinaryHostNotice,
     fileTool ? `${text.operation}  ${operation} · ${path === "" ? "" : basename(path)}` : "",
     scope !== undefined ? `${text.scope}  ${scope}` : path !== "" ? `${text.path}  ${absolutePath}` : "",
     reason.length > 0 ? `${text.reason}  ${reason}` : "",
@@ -901,7 +911,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
       const session = sessions.get(event.sessionId);
       try {
         session?.ctx?.ui?.notify(
-          "permission: the audit log could not be written; approval results are unaffected",
+          formatPiSandboxError("permission: the audit log could not be written; approval results are unaffected"),
           "warning",
         );
       } catch {
@@ -1297,13 +1307,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
           pathApproval = undefined;
         }
       }
-      const externalWriteApproval = request.summary.reasons.some((entry) =>
-        entry.reason.includes("external-write-needs-approval"));
-      const sessionMayApproveEscalatedWrite = toolName === "write"
-        && request.call?.hostExecutionRequest === undefined
-        && externalWriteApproval
-        && pathApproval?.surface === "path_write";
-      const sessionChoices = !escalation || sessionMayApproveEscalatedWrite;
+      const sessionChoices = !escalation;
       const scopeSuffix = pathApproval === undefined ? "" : `: ${pathApproval.scope}`;
       const allowSessionChoice = `${text.allowSession}${scopeSuffix}`;
       const denySessionChoice = `${text.denySession}${scopeSuffix}`;
@@ -1410,11 +1414,18 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
   function answerFor(outcome: StepOutcome, allowHostExecution: boolean, executionRequest?: ExecutionRequest): ReviewAnswer {
     if (outcome.decision === "allow") return undefined;
     if (outcome.decision === "blocked") return { block: true, reason: `permission:${outcome.reason}` };
-    const reasons = outcome.result.reasons
+    const reasons = [...new Set(outcome.result.reasons
       .map((reason) => reason.reason)
-      .filter((reason) => typeof reason === "string" && reason.length > 0);
+      .filter((reason) => typeof reason === "string" && reason.length > 0))];
+    const reviewDenials = [...new Set(outcome.result.reasons
+      .filter((reason) => reason.review?.decision === "deny")
+      .map((reason) => reason.review?.reason)
+      .filter((reason) => typeof reason === "string" && reason.length > 0))];
     const detail = reasons.length === 0 ? "denied by the approval chain" : reasons.join("; ");
     if (outcome.decision === "deny") {
+      if (reviewDenials.length > 0) {
+        return { block: true, reason: reviewDenials.join("; ") };
+      }
       const permissionDenied = reasons.length > 0 && reasons.every(reason =>
         /^mode:read-only:(write|network)-forbidden$/.test(reason));
       return { block: true, reason: `permission:denied: ${detail}`, ...(permissionDenied ? { permissionDenied: true } : {}) };
@@ -1425,7 +1436,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
     if (sandboxReview) return undefined;
     return allowHostExecution
       ? { kind: "host-execution", reason: `permission:host-execution: ${detail}` }
-      : { block: true, reason: "permission:host-execution-unavailable" };
+      : { block: true, reason: "permission:ordinary-host-execution-forbidden; request_tool_elevation is available for supported built-in file tools" };
   }
 
   // -------------------------------------------------------------------------
@@ -1964,7 +1975,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
     if ("kind" in answer && answer.kind === "host-execution") {
       return { block: true, reason: "permission:host-execution-unavailable" };
     }
-    return { block: true, reason: answer.reason };
+    return { block: true, reason: formatPiSandboxError(answer.reason) };
   }
 
   async function handleToolCall(event: ToolCallEvent, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> {
@@ -2002,7 +2013,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
     }
     session.handledToolCallIds.add(event.toolCallId);
     const review = (_input?: { readonly ask?: boolean }) => resolveApproval(session, ctx, event, {
-      allowHostExecution: true,
+      allowHostExecution: false,
     });
     try {
       if (options.sandbox !== undefined) {
@@ -2010,7 +2021,6 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
         return toToolCallResult(answer);
       }
       const answer = await review();
-      if (answer !== undefined && "kind" in answer && answer.kind === "host-execution") return undefined;
       return toToolCallResult(answer);
     } catch (error) {
       auditError(session.id, "tool-call", error);
@@ -2057,7 +2067,12 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
       if (session === undefined) return;
       await ensurePublication(ctx, session, false);
     });
-    api.on("tool_call", async (event, ctx) => handleToolCall(event, ctx));
+    api.on("tool_call", async (event, ctx) => {
+      const result = await handleToolCall(event, ctx);
+      return result?.block === true
+        ? { ...result, reason: formatPiSandboxError(result.reason) }
+        : result;
+    });
     api.on("tool_execution_start", (event, ctx) => {
       const session = sessions.get(ctx.sessionManager.getSessionId());
       if (session === undefined) return;

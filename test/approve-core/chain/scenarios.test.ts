@@ -47,7 +47,10 @@ function call(
     units,
     ...(hostExecutionReason === undefined
       ? {}
-      : { hostExecutionRequest: { reason: hostExecutionReason } }),
+      : { hostExecutionRequest: {
+        reason: hostExecutionReason,
+        elevation: { tier: "host", scope: [{ path: "/outside/target", access: "write" }] },
+      } }),
   };
 }
 

@@ -5,6 +5,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import { Value } from "typebox/value";
+import { formatPiSandboxError } from "../error-format";
 
 import {
   captureToolInvocationSeed,
@@ -348,7 +349,7 @@ function executionError<TDetails>(
 ): AgentToolResult<TDetails> {
   return {
     content: [
-      { type: "text", text: `Permission binding blocked execution: ${reason}` },
+      { type: "text", text: formatPiSandboxError(`Permission binding blocked execution: ${reason}`) },
     ],
     isError: true,
     details,

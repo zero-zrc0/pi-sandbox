@@ -125,29 +125,31 @@ describe("mode-base", () => {
     expect(verdict.reason).toBe("mode:default:destructive-needs-approval");
   });
 
-  it("denies a host execution request in read-only", async () => {
+  it("asks for a Host request in read-only mode", async () => {
     const verdict = await decide(unit({ access: [{ kind: "write" }] }), {
       mode: "read-only",
-      hostExecutionRequest: { reason: "bypass" },
+      hostExecutionRequest: { reason: "bypass", elevation: { tier: "host", scope: [{ path: "/outside/target", access: "write" }] } },
     });
-    expect(verdict.reason).toBe("mode:read-only:host-execution-forbidden");
+    expect(verdict.state).toBe("ask");
+    expect(verdict.reason).toBe("mode:read-only:one-time-host-execution");
   });
 
-  it("escalates a host execution request outside read-only and full-access", async () => {
-    const verdict = await decide(unit({ access: [{ kind: "unknown" }] }), {
-      hostExecutionRequest: { reason: "bypass" },
+  it("asks for a Host request outside read-only mode", async () => {
+    const verdict = await decide(unit({ access: [{ kind: "write" }] }), {
+      hostExecutionRequest: { reason: "bypass", elevation: { tier: "host", scope: [{ path: "/outside/target", access: "write" }] } },
     });
     expect(verdict.state).toBe("ask");
     expect(verdict.askFor).toBe("escalate");
     expect(verdict.reason).toBe("mode:default:one-time-host-execution");
   });
 
-  it("allows a host execution request in full-access", async () => {
-    const verdict = await decide(unit({ access: [] }), {
+  it("keeps an explicit Host request reviewable in full-access mode", async () => {
+    const verdict = await decide(unit({ access: [{ kind: "write" }] }), {
       mode: "full-access",
-      hostExecutionRequest: { reason: "bypass" },
+      hostExecutionRequest: { reason: "bypass", elevation: { tier: "host", scope: [{ path: "/outside/target", access: "write" }] } },
     });
-    expect(verdict.state).toBe("allow");
+    expect(verdict.state).toBe("ask");
+    expect(verdict.reason).toBe("mode:full-access:one-time-host-execution");
   });
 });
 
@@ -179,9 +181,10 @@ describe("explicit-rules", () => {
 
   it("cannot lift an escalation ask with an allow rule", async () => {
     const verdict = await decide(unit({
+      access: [{ kind: "write" }],
       rule: { decision: "allow", pattern: "*", origin: "global" },
     }), {
-      hostExecutionRequest: { reason: "bypass" },
+      hostExecutionRequest: { reason: "bypass", elevation: { tier: "host", scope: [{ path: "/outside/target", access: "write" }] } },
     });
     expect(verdict.state).toBe("ask");
     expect(verdict.askFor).toBe("escalate");

@@ -8,13 +8,15 @@ import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ExtensionToolContext, type RegisteredMcpServer } from "@earendil-works/pi-coding-agent";
 import { resolveConfigPaths } from "#config/config-paths";
 import { createApprovalChainConfigOwner } from "#config/owner";
 import { createControlledExecution } from "#sandbox/production";
+import { createSandboxBypass } from "#sandbox/bypass";
+import { sessionWorkspacePath } from "#sandbox/session-workspace";
 import { ExecutionController } from "#sandbox/lifecycle";
 import type { SandboxRuntimeState } from "#sandbox/runtime-manager";
 import type { RuntimeFileEntry, RuntimeFileRole } from "#sandbox/runtime-catalog";
@@ -152,6 +154,7 @@ function setup(
     on: (event: string, handler: (...args: unknown[]) => unknown) => { handlers.set(event, [...(handlers.get(event) ?? []), handler]); return () => undefined; },
   } as unknown as ExtensionAPI;
   const execution = createControlledExecution({
+    agentDir: layout.agent,
     runtime: () => runtimeState,
     snapshot: (snapshotCtx: ExtensionContext) => {
       const id = snapshotCtx.sessionManager.getSessionId();
@@ -171,7 +174,7 @@ function setup(
   const emit = async (name: string, eventContext: ExtensionToolContext = ctx, event: unknown = { type: name }) => {
     for (const handler of handlers.get(name) ?? []) await handler(event, eventContext);
   };
-  return { layout, paths, ctx, owner, sessionOwners, execution, definitions, sources, records, controllers, registeredServers, emit };
+  return { layout, paths, ctx, owner, sessionOwners, execution, definitions, sources, records, controllers, registeredServers, api, emit };
 }
 
 describe("production controlled execution boundary", () => {
@@ -194,8 +197,8 @@ describe("production controlled execution boundary", () => {
       expect(selectedSystemBinary).toBe(systemBinary);
       const event = { type: "tool_call" as const, toolName: "write", toolCallId: "protected-system-bwrap",
         input: { path: "notes.txt", content: "approved" } };
-      await rig.execution.guard(event, rig.ctx, async () => ({ block: true, permissionDenied: true, reason: "mode:read-only:write-forbidden" }));
-      const elevation = rig.execution.takeElevation("write", event.input, rig.ctx)!;
+      const elevation = rig.execution.prepareElevation("write", event.input, "default", rig.ctx);
+      if ("block" in elevation) throw new Error(elevation.reason);
 
       await expect(rig.execution.executeDefault({ toolCallId: "protected-system-bwrap-execution", targetToolName: "write",
         arguments: event.input, reason: "save notes", elevation }, undefined, undefined, rig.ctx)).rejects.toThrow("captured execution plan");
@@ -209,50 +212,91 @@ describe("production controlled execution boundary", () => {
     }
   });
 
-  it("binds a read-only permission denial to a single Default sandbox call", async () => {
+  it.each(["project", "session-workspace"] as const)(
+    "runs an explicit Default write to the %s directory in read-only mode without changing the session mode",
+    async directory => {
     const rig = setup("read-only");
+    const workspace = rig.execution.sessionWorkspace(rig.ctx);
+    const target = join(directory === "project" ? rig.layout.workspace : workspace, "notes.txt");
     const event = { type: "tool_call" as const, toolName: "write", toolCallId: "readonly-write",
-      input: { path: "notes.txt", content: "approved" } };
-    await rig.execution.guard(event, rig.ctx, async () => ({ block: true, permissionDenied: true, reason: "permission:denied: mode:read-only:write-forbidden" }));
-    expect(rig.execution.takeElevation("write", { ...event.input, content: "changed" }, rig.ctx)).toBeUndefined();
-    const elevation = rig.execution.takeElevation("write", event.input, rig.ctx)!;
-    expect(elevation.tier).toBe("default");
-    expect(rig.execution.takeElevation("write", event.input, rig.ctx)).toBeUndefined();
+      input: { path: target, content: "approved" } };
+    const elevation = rig.execution.prepareElevation("write", event.input, "default", rig.ctx);
+    if ("block" in elevation) throw new Error(elevation.reason);
+    expect(elevation).toMatchObject({ tier: "default", scope: [
+      { path: rig.layout.workspace, access: "write" },
+      { path: workspace, access: "write" },
+    ] });
     const result = await rig.execution.executeDefault({ toolCallId: "default-target", targetToolName: "write",
       arguments: event.input, reason: "save notes", elevation }, undefined, undefined, rig.ctx);
     expect(result.isError).not.toBe(true);
+    expect(readFileSync(target, "utf8")).toBe("approved");
     expect(rig.owner.snapshot({ sessionId: rig.ctx.sessionManager.getSessionId() }).config.mode).toBe("read-only");
     expect(rig.records).toContainEqual(expect.objectContaining({ executionMode: "sandbox", state: "completed" }));
   });
 
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
-    "writes through native Default elevation while the session stays read-only", async () => {
+  it(
+    "compiles read-only Default elevation into directory-level project and session workspace grants", async () => {
       const rig = setup("read-only", true);
-      const event = { type: "tool_call" as const, toolName: "write", toolCallId: "native-readonly-elevation",
+      const event = { type: "tool_call" as const, toolName: "write", toolCallId: "capture-native-default-elevation",
         input: { path: "elevated.txt", content: "one-time default" } };
-      const denied = { block: true as const, permissionDenied: true, reason: "mode:read-only:write-forbidden" };
-      await rig.execution.guard(event, rig.ctx, async () => denied);
-      const elevation = rig.execution.takeElevation("write", event.input, rig.ctx)!;
-      const result = await rig.execution.executeDefault({ toolCallId: "native-default-target", targetToolName: "write",
-        arguments: event.input, reason: "save file", elevation }, undefined, undefined, rig.ctx);
-      expect(result.isError).not.toBe(true);
-      expect(readFileSync(join(rig.layout.workspace, "elevated.txt"), "utf8")).toBe("one-time default");
-      const next = { ...event, toolCallId: "ordinary-after-elevation", input: { path: "ordinary.txt", content: "must remain blocked" } };
-      expect(await rig.execution.guard(next, rig.ctx, async () => denied)).toMatchObject({ block: true });
-      expect(existsSync(join(rig.layout.workspace, "ordinary.txt"))).toBe(false);
-      expect(rig.owner.snapshot({ sessionId: rig.ctx.sessionManager.getSessionId() }).config.mode).toBe("read-only");
+      const elevation = rig.execution.prepareElevation("write", event.input, "default", rig.ctx);
+      if ("block" in elevation) throw new Error(elevation.reason);
+      let capturedPlan: import("#sandbox/types").ExecutionPlan | undefined;
+      const execute = vi.spyOn(ExecutionController.prototype, "execute").mockImplementation(async input => {
+        capturedPlan = input.plan;
+        throw new Error("captured execution plan");
+      });
+
+      try {
+        await expect(rig.execution.executeDefault({ toolCallId: "capture-default-target", targetToolName: "write",
+          arguments: event.input, reason: "save file", elevation }, undefined, undefined, rig.ctx))
+          .rejects.toThrow("captured execution plan");
+      } finally {
+        execute.mockRestore();
+      }
+
+      expect(capturedPlan?.filesystem).toContainEqual(expect.objectContaining({
+        path: rig.layout.workspace,
+        access: "write",
+        granularity: "directory",
+        source: "approved-extension",
+      }));
+      expect(capturedPlan?.filesystem).toContainEqual(expect.objectContaining({
+        path: rig.execution.sessionWorkspace(rig.ctx),
+        access: "write",
+        granularity: "directory",
+        source: "approved-extension",
+      }));
+      expect(capturedPlan?.filesystem).not.toContainEqual(expect.objectContaining({
+        path: join(rig.layout.workspace, "elevated.txt"), access: "write", granularity: "file",
+      }));
     },
   );
 
-  it("does not turn explicit or risk denials into elevation authority", async () => {
-    const rig = setup("read-only");
-    const input = { path: "denied.txt", content: "blocked" };
-    for (const reason of ["rules:project:deny:*", "risk:catastrophic-delete:blocked", "permission:internal-error"]) {
-      await rig.execution.guard({ type: "tool_call", toolName: "write", toolCallId: reason, input }, rig.ctx,
-        async () => ({ block: true, reason }));
-      expect(rig.execution.takeElevation("write", input, rig.ctx)).toBeUndefined();
-    }
-  });
+  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))
+    .each(["project", "session-workspace"] as const)(
+    "writes through native Default elevation to the %s directory while the session stays read-only", async directory => {
+      const rig = setup("read-only", true);
+      const workspace = rig.execution.sessionWorkspace(rig.ctx);
+      const root = directory === "project" ? rig.layout.workspace : workspace;
+      const target = join(root, "elevated.txt");
+      const event = { type: "tool_call" as const, toolName: "write", toolCallId: "native-readonly-elevation",
+        input: { path: target, content: "one-time default" } };
+      const elevation = rig.execution.prepareElevation("write", event.input, "default", rig.ctx);
+      if ("block" in elevation) throw new Error(elevation.reason);
+      const result = await rig.execution.executeDefault({ toolCallId: "native-default-target", targetToolName: "write",
+        arguments: event.input, reason: "save file", elevation }, undefined, undefined, rig.ctx);
+      expect(result.isError).not.toBe(true);
+      expect(readFileSync(target, "utf8")).toBe("one-time default");
+      const next = { ...event, toolCallId: "ordinary-after-elevation", input: { path: join(root, "ordinary.txt"), content: "must remain blocked" } };
+      expect(await rig.execution.guard(next, rig.ctx, async () => undefined)).toMatchObject({
+        block: true,
+        reason: expect.stringContaining(directory === "project" ? 'tier "default"' : "session-workspace-write-forbidden"),
+      });
+      expect(existsSync(join(root, "ordinary.txt"))).toBe(false);
+      expect(rig.owner.snapshot({ sessionId: rig.ctx.sessionManager.getSessionId() }).config.mode).toBe("read-only");
+    },
+  );
 
   it("keeps sandbox resources until the approval host commits a reload", async () => {
     const rig = setup();
@@ -274,177 +318,220 @@ describe("production controlled execution boundary", () => {
     expect(dispose).toHaveBeenCalledTimes(1);
   });
 
-  it("executes an escalated managed call once with host permissions and records its mode", async () => {
+  it("blocks ordinary approvals from routing managed calls to Host", async () => {
     const rig = setup();
     const event = {
       type: "tool_call" as const,
       toolName: "write",
-      toolCallId: "host-escalate-write",
-      input: { path: "host-escalated.txt", content: "written once" },
+      toolCallId: "ordinary-host-forbidden",
+      input: { path: "host-escalated.txt", content: "must remain blocked" },
     };
-    expect(await rig.execution.guard(event, rig.ctx, async () => ({
+    const review = vi.fn(async () => ({
       kind: "host-execution" as const,
-      reason: "user chose one-time escalation",
-    }))).toBeUndefined();
+      reason: "ordinary approval cannot issue Host",
+    }));
 
-    const tool = rig.definitions.get("write")!;
-    const result = await tool.execute(event.toolCallId, event.input, undefined, undefined, rig.ctx);
-    expect(result.isError).not.toBe(true);
-    expect(readFileSync(join(rig.layout.workspace, "host-escalated.txt"), "utf8")).toBe("written once");
-    await expect(tool.execute(event.toolCallId, event.input, undefined, undefined, rig.ctx))
-      .rejects.toThrow("host-execution:approval-unavailable");
-    expect(rig.records).toEqual([expect.objectContaining({
-      toolCallId: event.toolCallId,
-      toolName: "write",
-      executionMode: "host",
-      started: true,
-      impact: "known",
-      state: "completed",
-    })]);
+    expect(await rig.execution.guard(event, rig.ctx, review)).toMatchObject({
+      block: true,
+      reason: expect.stringContaining("ordinary-host-execution-forbidden"),
+    });
+    expect(review).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(rig.layout.workspace, "host-escalated.txt"))).toBe(false);
   });
 
-  it("binds an escalation to session and exact arguments", async () => {
-    const rig = setup();
+  it("blocks out-of-scope file calls with the exact path and requested tier", async () => {
+    const rig = setup("read-only");
     const event = {
       type: "tool_call" as const,
       toolName: "write",
-      toolCallId: "host-escalate-bound",
-      input: { path: "bound.txt", content: "approved" },
+      toolCallId: "readonly-write-requires-default",
+      input: { path: "readonly.txt", content: "must remain blocked" },
     };
-    expect(await rig.execution.guard(event, rig.ctx, async () => ({
-      kind: "host-execution" as const,
-      reason: "one-time test",
-    }))).toBeUndefined();
+    const review = vi.fn(async () => undefined);
 
-    const otherSession = {
+    expect(await rig.execution.guard(event, rig.ctx, review)).toMatchObject({
+      block: true,
+      reason: expect.stringContaining("tier \"default\""),
+    });
+    expect(review).not.toHaveBeenCalled();
+    expect(existsSync(join(rig.layout.workspace, "readonly.txt"))).toBe(false);
+
+    const externalPath = join(rig.layout.agent, "external-input.txt");
+    const external = await rig.execution.guard({
+      type: "tool_call" as const,
+      toolName: "read",
+      toolCallId: "external-read-requires-host",
+      input: { path: externalPath },
+    }, rig.ctx, review);
+    expect(external).toMatchObject({
+      block: true,
+      reason: expect.stringContaining(externalPath),
+    });
+    expect(external?.reason).toContain('tier "host"');
+    expect(review).not.toHaveBeenCalled();
+    expect(rig.execution.prepareElevation("read", { path: externalPath }, "default", rig.ctx)).toMatchObject({
+      block: true,
+      reason: expect.stringContaining("default-scope-exceeds-project-and-session-workspace"),
+    });
+    expect(rig.execution.prepareElevation("read", { path: externalPath }, "host", rig.ctx)).toMatchObject({
+      tier: "host",
+      scope: [{ path: externalPath, access: "read" }],
+    });
+  });
+
+  it("keeps ordinary session workspace writes read-only and grants directory scopes only for explicit elevation", async () => {
+    const rig = setup("read-only");
+    const workspace = rig.execution.sessionWorkspace(rig.ctx);
+    const target = join(workspace, "forbidden.txt");
+    const event = {
+      type: "tool_call" as const,
+      toolName: "write",
+      toolCallId: "readonly-session-workspace-write",
+      input: { path: target, content: "must remain blocked" },
+    };
+    const ordinaryReview = vi.fn(async () => undefined);
+
+    expect(await rig.execution.guard(event, rig.ctx, ordinaryReview)).toMatchObject({
+      block: true,
+      reason: expect.stringContaining("session-workspace-write-forbidden"),
+    });
+    expect(ordinaryReview).not.toHaveBeenCalled();
+    expect(rig.execution.prepareElevation("write", event.input, "default", rig.ctx)).toMatchObject({
+      tier: "default",
+      scope: [
+        { path: rig.layout.workspace, access: "write" },
+        { path: workspace, access: "write" },
+      ],
+    });
+    expect(rig.execution.prepareElevation("write", event.input, "host", rig.ctx)).toMatchObject({
+      tier: "host",
+      scope: [{ path: target, access: "write" }],
+    });
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("executes an external Host file request only after the elevation reviewer approves", async () => {
+    const rig = setup("read-only");
+    const target = join(rig.layout.agent, "approved-host.txt");
+    const ordinaryReview = vi.fn(async () => undefined);
+    const ordinary = await rig.execution.guard({
+      type: "tool_call" as const,
+      toolName: "write",
+      toolCallId: "ordinary-external-write",
+      input: { path: target, content: "ordinary must not write" },
+    }, rig.ctx, ordinaryReview);
+    expect(ordinary).toMatchObject({ block: true, reason: expect.stringContaining('tier "host"') });
+    expect(ordinaryReview).not.toHaveBeenCalled();
+    expect(existsSync(target)).toBe(false);
+
+    const bypass = createSandboxBypass({
+      mode: ctx => rig.owner.snapshot({ sessionId: ctx.sessionManager.getSessionId() }).config.mode,
+      policyRevision: ctx => rig.execution.configurationRevision(ctx),
+      resolveHostTool: (name, schema) => rig.execution.resolveHostTool(name, schema),
+      prepareElevation: (name, args, tier, ctx) => rig.execution.prepareElevation(name, args, tier, ctx),
+      validateElevation: (name, args, elevation, ctx) => rig.execution.validateElevation(name, args, elevation, ctx),
+      executeDefault: (input, signal, onUpdate, ctx) => rig.execution.executeDefault(input, signal, onUpdate, ctx),
+      recordExecution: event => rig.records.push(event),
+    });
+    bypass.install(rig.api);
+    bypass.setReviewer(async input => {
+      expect(input.elevation.tier).toBe("host");
+      return undefined;
+    });
+
+    try {
+      const result = await bypass.tool.execute("approved-host-request", {
+        reason: "write the requested external output",
+        toolName: "write",
+        arguments: { path: target, content: "host approved" },
+        tier: "host",
+      }, undefined, undefined, rig.ctx);
+      expect(result.isError).not.toBe(true);
+      expect(readFileSync(target, "utf8")).toBe("host approved");
+      expect(rig.records).toContainEqual(expect.objectContaining({ executionMode: "host", state: "completed" }));
+      expect(rig.owner.snapshot({ sessionId: rig.ctx.sessionManager.getSessionId() }).config.mode).toBe("read-only");
+    } finally {
+      rmSync(target, { force: true });
+    }
+  });
+
+  it.each(["default", "auto-review"] as const)("gives each session a persistent, writable workspace and matching temporary environment in %s mode", async mode => {
+    const rig = setup(mode);
+    const sessionId = rig.ctx.sessionManager.getSessionId();
+    const workspace = rig.execution.sessionWorkspace(rig.ctx);
+    expect(workspace).toBe(sessionWorkspacePath(rig.layout.agent, sessionId));
+    expect(existsSync(join(workspace, "tmp"))).toBe(true);
+
+    const event = {
+      type: "tool_call" as const,
+      toolName: "write",
+      toolCallId: "session-workspace-write",
+      input: { path: join(workspace, "artifact.txt"), content: "persisted" },
+    };
+    expect(await rig.execution.guard(event, rig.ctx, async () => undefined)).toBeUndefined();
+    let capturedPlan: import("#sandbox/types").ExecutionPlan | undefined;
+    const execute = vi.spyOn(ExecutionController.prototype, "execute").mockImplementation(async input => {
+      capturedPlan = input.plan;
+      throw new Error("captured execution plan");
+    });
+    try {
+      await expect(rig.definitions.get("write")!.execute(event.toolCallId, event.input, undefined, undefined, rig.ctx))
+        .rejects.toThrow("captured execution plan");
+    } finally {
+      execute.mockRestore();
+    }
+
+    expect(capturedPlan?.filesystem).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: workspace, access: "read", source: "baseline" }),
+      expect.objectContaining({ path: workspace, access: "write", source: "baseline" }),
+    ]));
+    expect(capturedPlan?.environment).toMatchObject({
+      PI_SANDBOX_WORK_DIR: workspace,
+      TEMP: join(workspace, "tmp"),
+      TMP: join(workspace, "tmp"),
+      TMPDIR: join(workspace, "tmp"),
+    });
+
+    const forkContext = {
       ...rig.ctx,
-      sessionManager: SessionManager.inMemory(rig.layout.workspace, { id: "different-session" }),
+      sessionManager: SessionManager.inMemory(rig.layout.workspace, { id: "controlled-session-fork" }),
     } as ExtensionToolContext;
-    const tool = rig.definitions.get("write")!;
-    await expect(tool.execute(event.toolCallId, event.input, undefined, undefined, otherSession))
-      .rejects.toThrow("host-execution:approval-binding-invalidated");
-    await rig.emit("session_shutdown", otherSession);
-    await expect(tool.execute(event.toolCallId, {
-      path: "changed.txt",
-      content: "not approved",
-    }, undefined, undefined, rig.ctx)).rejects.toThrow("host-execution:action-changed-before-execution");
-    expect(existsSync(join(rig.layout.workspace, "bound.txt"))).toBe(false);
-    expect(existsSync(join(rig.layout.workspace, "changed.txt"))).toBe(false);
-    expect(rig.records).toEqual([expect.objectContaining({
-      executionMode: "host",
-      started: false,
-      impact: "none",
-      code: "action-changed-before-execution",
-    })]);
+    expect(rig.execution.sessionWorkspace(forkContext)).not.toBe(workspace);
+    writeFileSync(join(workspace, "retained.txt"), "retained");
+    await rig.emit("session_shutdown", rig.ctx);
+    expect(existsSync(join(workspace, "retained.txt"))).toBe(true);
+    expect(rig.execution.sessionWorkspace(rig.ctx)).toBe(workspace);
   });
 
-  it("rejects a grant after a policy change without falling back to sandbox execution", async () => {
+  it("canonicalizes project roots before checking file scope", async () => {
+    const rig = setup("default");
+    const projectAlias = join(rig.layout.root, "workspace-alias");
+    symlinkSync(rig.layout.workspace, projectAlias, process.platform === "win32" ? "junction" : "dir");
+    const aliasContext = { ...rig.ctx, cwd: projectAlias } as ExtensionToolContext;
+    const inProject = { type: "tool_call" as const, toolName: "write", toolCallId: "symlink-project-write",
+      input: { path: "through-alias.txt", content: "in project" } };
+    expect(await rig.execution.guard(inProject, aliasContext, async () => undefined)).toBeUndefined();
+
+    const externalDirectory = join(rig.layout.agent, "external-directory");
+    mkdirSync(externalDirectory);
+    symlinkSync(externalDirectory, join(rig.layout.workspace, "external-link"), process.platform === "win32" ? "junction" : "dir");
+    const outsideTarget = join(projectAlias, "external-link", "outside.txt");
+    expect(await rig.execution.guard({ ...inProject, toolCallId: "symlink-outside-write",
+      input: { path: outsideTarget, content: "outside project" } }, aliasContext, async () => undefined)).toMatchObject({
+      block: true,
+      reason: expect.stringContaining('tier "host"'),
+    });
+    expect(existsSync(join(externalDirectory, "outside.txt"))).toBe(false);
+  });
+
+  it("refuses a symlinked session workspace", () => {
     const rig = setup();
-    const event = {
-      type: "tool_call" as const,
-      toolName: "write",
-      toolCallId: "host-escalate-invalidated",
-      input: { path: "invalidated.txt", content: "must not write" },
-    };
-    expect(await rig.execution.guard(event, rig.ctx, async () => ({
-      kind: "host-execution" as const,
-      reason: "one-time test",
-    }))).toBeUndefined();
+    const workspace = sessionWorkspacePath(rig.layout.agent, rig.ctx.sessionManager.getSessionId());
+    const parent = dirname(workspace);
+    mkdirSync(parent, { recursive: true });
+    symlinkSync(rig.layout.workspace, workspace, process.platform === "win32" ? "junction" : "dir");
 
-    rig.execution.configurationChanged("controlled-session");
-
-    await expect(rig.definitions.get("write")!.execute(
-      event.toolCallId,
-      event.input,
-      undefined,
-      undefined,
-      rig.ctx,
-    )).rejects.toThrow("host-execution:approval-unavailable");
-    expect(existsSync(join(rig.layout.workspace, "invalidated.txt"))).toBe(false);
-    expect(rig.records).toEqual([expect.objectContaining({
-      executionMode: "host",
-      started: false,
-      impact: "none",
-      code: "approval-invalidated",
-    })]);
-  });
-
-  it("records an unknown host result and never retries it", async () => {
-    const rig = setup();
-    writeFileSync(join(rig.layout.workspace, "occupied"), "not a directory");
-    const event = {
-      type: "tool_call" as const,
-      toolName: "write",
-      toolCallId: "host-escalate-unknown",
-      input: { path: "occupied/child.txt", content: "must not write" },
-    };
-    expect(await rig.execution.guard(event, rig.ctx, async () => ({
-      kind: "host-execution" as const,
-      reason: "one-time test",
-    }))).toBeUndefined();
-
-    const tool = rig.definitions.get("write")!;
-    await expect(tool.execute(event.toolCallId, event.input, undefined, undefined, rig.ctx)).rejects.toThrow();
-    expect(rig.records).toEqual([expect.objectContaining({
-      executionMode: "host",
-      started: "unknown",
-      impact: "unknown",
-      state: "failed",
-    })]);
-    await expect(tool.execute(event.toolCallId, event.input, undefined, undefined, rig.ctx))
-      .rejects.toThrow("host-execution:approval-unavailable");
-    expect(rig.records).toHaveLength(1);
-  });
-
-  it("rejects read-only, cancelled, and timed-out escalations before execution", async () => {
-    const readOnly = setup("read-only");
-    const readOnlyEvent = {
-      type: "tool_call" as const,
-      toolName: "write",
-      toolCallId: "host-escalate-readonly",
-      input: { path: "readonly.txt", content: "must not write" },
-    };
-    expect(await readOnly.execution.guard(readOnlyEvent, readOnly.ctx, async () => ({
-      kind: "host-execution" as const,
-      reason: "one-time test",
-    }))).toMatchObject({ block: true, reason: "host-execution:forbidden-in-read-only" });
-    expect(existsSync(join(readOnly.layout.workspace, "readonly.txt"))).toBe(false);
-
-    const cancelled = setup();
-    const event = {
-      type: "tool_call" as const,
-      toolName: "write",
-      toolCallId: "host-escalate-cancelled",
-      input: { path: "cancelled.txt", content: "must not write" },
-    };
-    expect(await cancelled.execution.guard(event, cancelled.ctx, async () => ({
-      kind: "host-execution" as const,
-      reason: "one-time test",
-    }))).toBeUndefined();
-    const abort = new AbortController();
-    abort.abort();
-    await expect(cancelled.definitions.get("write")!.execute(
-      event.toolCallId,
-      event.input,
-      abort.signal,
-      undefined,
-      cancelled.ctx,
-    )).rejects.toThrow("host-execution:cancelled-before-execution");
-    expect(cancelled.records).toEqual([expect.objectContaining({
-      executionMode: "host",
-      started: false,
-      impact: "none",
-      code: "cancelled-before-execution",
-    })]);
-
-    const timedOut = setup();
-    const timeoutEvent = { ...event, toolCallId: "host-escalate-timeout" };
-    expect(await timedOut.execution.guard(timeoutEvent, timedOut.ctx, async () => ({
-      block: true as const,
-      reason: "approval-chain:deadline",
-    }))).toMatchObject({ block: true, reason: "approval-chain:deadline" });
-    expect(timedOut.records).toEqual([]);
-    expect(existsSync(join(timedOut.layout.workspace, "cancelled.txt"))).toBe(false);
+    expect(() => rig.execution.sessionWorkspace(rig.ctx)).toThrow("session-workspace:expected-real-directory");
   });
 
   it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(

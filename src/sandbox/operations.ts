@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 import { isSamePath, normalizeHostPath } from "#sandbox/path";
+import { formatPiSandboxError } from "../error-format";
 import {
   MAX_FILE_CONTENT_BYTES,
   type ExecutionOperation,
@@ -58,12 +59,9 @@ export class ControlledOperationError extends Error {
   constructor(code: string, reason: string) {
     // Pi's shell tool matches these two messages exactly, so keep them
     // compatible instead of wrapping them in the diagnostic prefix.
-    const message =
-      code === "aborted"
-        ? "aborted"
-        : code === "timeout"
-          ? reason
-          : `[${code}] ${reason}`;
+    const message = code === "aborted" || code === "timeout"
+      ? code === "aborted" ? "aborted" : reason
+      : formatPiSandboxError(`[${code}] ${reason}`);
     super(message);
     this.name = "ControlledOperationError";
     this.code = code;

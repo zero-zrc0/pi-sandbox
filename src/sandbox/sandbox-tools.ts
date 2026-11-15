@@ -17,6 +17,7 @@ import { createRequire } from "node:module";
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { formatPiSandboxError } from "../error-format";
 import type { ApprovalChainConfigSnapshot } from "#config/owner";
 import type { JsonValue } from "../json";
 import type { AnyToolDefinition } from "./pi";
@@ -185,7 +186,7 @@ export interface SandboxToolHostContext {
 /** Shape of one tool module result; an invalid shape is an execution error. */
 function readToolResult(value: unknown): { content: readonly unknown[]; details?: unknown; isError?: boolean } {
   if (!isPlainObject(value) || !Array.isArray(value.content)) {
-    throw new Error("sandbox-tool-invalid-result: execute() must return { content: [...] }");
+    throw new Error(formatPiSandboxError("sandbox-tool-invalid-result: execute() must return { content: [...] }"));
   }
   return value as unknown as { content: readonly unknown[]; details?: unknown; isError?: boolean };
 }
@@ -212,16 +213,16 @@ export async function runSandboxToolOnHost(
   try {
     module = await import(pathToFileURL(spec.modulePath).href) as { execute?: unknown; probe?: unknown };
   } catch (error) {
-    throw new Error(`sandbox-tool-not-loadable: ${spec.name}: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(formatPiSandboxError(`sandbox-tool-not-loadable: ${spec.name}: ${error instanceof Error ? error.message : String(error)}`));
   }
   if (typeof module.execute !== "function") {
-    throw new Error(`sandbox-tool-not-loadable: ${spec.name}: module does not export execute()`);
+    throw new Error(formatPiSandboxError(`sandbox-tool-not-loadable: ${spec.name}: module does not export execute()`));
   }
   if (typeof module.probe === "function") {
     try {
       await (module.probe as () => unknown)();
     } catch (error) {
-      throw new Error(`sandbox-tool-not-loadable: ${spec.name}: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(formatPiSandboxError(`sandbox-tool-not-loadable: ${spec.name}: ${error instanceof Error ? error.message : String(error)}`));
     }
   }
   try {
@@ -233,6 +234,8 @@ export async function runSandboxToolOnHost(
       signal: controller.signal,
     });
     return readToolResult(result);
+  } catch (error) {
+    throw new Error(formatPiSandboxError(error));
   } finally {
     if (context.signal !== undefined) context.signal.removeEventListener("abort", forwardAbort);
   }
@@ -263,7 +266,7 @@ export function createHostSandboxToolDefinition(
     ...sandboxToolDefinitionFields(spec),
     execute: async (toolCallId: string, args: unknown, signal?: AbortSignal, _onUpdate?: unknown, ctx?: { cwd?: string }) => {
       if (options.isDeclared !== undefined && !options.isDeclared(ctx ?? {})) {
-        throw new Error(`sandbox-tool-not-declared: ${spec.name}`);
+        throw new Error(formatPiSandboxError(`sandbox-tool-not-declared: ${spec.name}`));
       }
       return runSandboxToolOnHost(spec, args, {
         cwd: typeof ctx?.cwd === "string" ? ctx.cwd : process.cwd(),

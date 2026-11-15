@@ -30,6 +30,7 @@ interface RunOptions {
   /** C2: the trusted `defaultPolicy` and the execution layer's capability. */
   readonly defaultPolicy?: "ask" | "sandbox-run";
   readonly sandboxRun?: SandboxRunCapability;
+  readonly additionalLocalPaths?: readonly string[];
 }
 
 /**
@@ -56,7 +57,11 @@ async function decide(command: string, options: RunOptions = {}): Promise<CallSu
   });
   if (!capture.ok) throw Error(capture.reason);
   const provider = createBashProgramProvider(capture.capture.directCalls, {
-    normalizer: new PathNormalizer(POSIX, CWD, { realpathSync: (p) => p, existsSync: () => false }),
+    normalizer: new PathNormalizer(POSIX, CWD, {
+      realpathSync: (p) => p,
+      existsSync: () => false,
+      additionalLocalPaths: options.additionalLocalPaths,
+    }),
   });
   const units = await analyzeStep(capture.capture, { getBashProgram: provider });
   const prepared = prepareStep(capture.capture, units);
@@ -81,6 +86,7 @@ async function decide(command: string, options: RunOptions = {}): Promise<CallSu
     }),
     ...(options.sessionReviews === undefined ? {} : { sessionReviews: options.sessionReviews }),
     ...(options.sandboxRun === undefined ? {} : { sandboxRun: options.sandboxRun }),
+    ...(options.additionalLocalPaths === undefined ? {} : { additionalLocalPaths: options.additionalLocalPaths }),
     ...(options.defaultPolicy === undefined
       ? {}
       : { shellPolicy: { version: 1 as const, rules: [], modes: { default: { defaultPolicy: options.defaultPolicy }, "auto-review": { defaultPolicy: options.defaultPolicy } } } }),
@@ -233,6 +239,15 @@ describe("decision node: read-only and full-access", () => {
     const summary = await decide("echo hi > out.txt", { mode: "read-only" });
     expect(summary.decision).toBe("deny");
     expect(summary.reasons[0].reason).toBe("mode:read-only:write-forbidden");
+  });
+
+  it("treats session temporary writes as local but still denies them in read-only", async () => {
+    const sessionWorkspace = "/agent/workspaces/pi-sandbox/session-hash";
+    const command = `echo hi > '${sessionWorkspace}/tmp/result.txt'`;
+    const additionalLocalPaths = [sessionWorkspace];
+
+    expect((await decide(command, { additionalLocalPaths })).decision).toBe("allow");
+    expect((await decide(command, { mode: "read-only", additionalLocalPaths })).decision).toBe("deny");
   });
 
   it("allows an ordinary command in full-access", async () => {

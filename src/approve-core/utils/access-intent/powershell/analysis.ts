@@ -1,5 +1,5 @@
 import { jsonDigest } from "../../../../json";
-import { pathFlavorForPlatform } from "#approve-core/utils/path/path-flavor";
+import { pathFlavorForPlatform, type PathFlavor } from "#approve-core/utils/path/path-flavor";
 import { PathNormalizer } from "#approve-core/utils/path/path-normalizer";
 import type {
   ExecutableIdentity,
@@ -73,11 +73,12 @@ function known<T>(value: T): Knowledge<T> {
 }
 
 const POWERSHELL_INTERNAL_COMMANDS = new Set([
-  "add-content", "clear-content", "clear-item", "copy-item", "export-csv", "get-childitem",
+  "add-content", "cd", "chdir", "clear-content", "clear-item", "copy-item", "dir", "export-csv",
+  "get-childitem", "gci",
   "get-command", "get-content", "get-date", "get-help", "get-item", "get-itemproperty",
-  "get-location", "get-variable", "invoke-command", "invoke-expression", "invoke-restmethod",
+  "get-location", "get-variable", "invoke-command", "invoke-expression", "invoke-restmethod", "ls", "sl",
   "invoke-webrequest", "measure-object", "move-item", "new-alias", "new-item", "out-file",
-  "out-null", "out-string", "pop-location", "push-location", "remove-alias", "remove-item",
+  "out-null", "out-string", "pop-location", "popd", "push-location", "pushd", "remove-alias", "remove-item",
   "remove-itemproperty", "select-object", "set-alias", "set-content", "set-item", "set-location",
   "sort-object", "start-job", "start-process", "test-path", "where-object", "write-host",
   "write-output",
@@ -97,14 +98,81 @@ function unitForExtent(units: readonly PowerShellAnalysisUnit[], extent: SourceE
     units[0]?.unitId ?? "unknown-unit";
 }
 
+interface ScriptContext {
+  readonly cwd: string | undefined;
+  readonly environmentStable: boolean;
+}
+
+interface ScriptContextState {
+  readonly offset: number;
+  readonly context: ScriptContext;
+}
+
+function contextBefore(offset: number, states: readonly ScriptContextState[], initial: ScriptContext): ScriptContext {
+  let low = 0;
+  let high = states.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (states[middle]!.offset < offset) low = middle + 1;
+    else high = middle;
+  }
+  return low === 0 ? initial : states[low - 1]!.context;
+}
+
+function resolvedLocation(
+  target: string | null,
+  cwd: string | undefined,
+  workspaceRoot: string,
+  flavor: PathFlavor,
+  normalizer: PathNormalizer,
+): { readonly cwd: string; readonly insideWorkspace: boolean } | undefined {
+  if (target === null || target.length === 0 || /[*?]/u.test(target) ||
+      /^[A-Za-z][A-Za-z0-9+.-]*:(?![\\/])/u.test(target) ||
+      (!flavor.isAbsolute(target) && cwd === undefined)) return undefined;
+
+  const targetPath = normalizer.normalPath(target, cwd);
+  const rootPath = normalizer.normalPath(workspaceRoot);
+  if (targetPath.display.length === 0 || targetPath.boundary.length === 0 ||
+      targetPath.boundaryUnproven === true || targetPath.boundaryFromAncestor === true ||
+      rootPath.boundary.length === 0 || rootPath.boundaryUnproven === true || rootPath.boundaryFromAncestor === true) {
+    return undefined;
+  }
+  return {
+    cwd: targetPath.boundary,
+    insideWorkspace: flavor.contains(rootPath.boundary, targetPath.boundary),
+  };
+}
+
 function operationForLanguageFact(
   call: PowerShellAnalysisCall,
   operation: PowerShellParseSummary["languageOperations"][number],
   unitId: string,
-  cwd: string,
+  cwd: string | undefined,
+  workspaceRoot: string,
+  flavor: PathFlavor,
   normalizer: PathNormalizer,
 ): ShellOperationFact {
   const id = operationId(call.toolCallId, call.digest, operation.kind, operation);
+  if (operation.kind === "location-change") {
+    const location = resolvedLocation(operation.target, cwd, workspaceRoot, flavor, normalizer);
+    if (location !== undefined) {
+      const outsideTarget: FileTargetFact[] = location.insideWorkspace
+        ? []
+        : [{ path: location.cwd, effect: "file.read" }];
+      return Object.freeze({
+        operationId: id,
+        unitId,
+        owner: "powershell",
+        effects: known<readonly ShellEffect[]>(location.insideWorkspace ? [] : ["file.read"]),
+        fileTargets: known<readonly FileTargetFact[]>(outsideTarget),
+        networkTargets: known<readonly NetworkTargetFact[]>([]),
+        dynamicExecution: known(false),
+        processSpawn: known(false),
+        complete: true,
+        source: "powershell-parser",
+      });
+    }
+  }
   if (operation.kind === "process-spawn") {
     return Object.freeze({
       operationId: id,
@@ -238,6 +306,7 @@ export function analyzePowerShellParse(input: {
   readonly call: PowerShellAnalysisCall;
   readonly commandText: string;
   readonly cwd: string;
+  readonly workspaceRoot?: string;
   readonly result: PowerShellParseResult;
   readonly platform?: NodeJS.Platform;
 }): PowerShellCallAnalysis {
@@ -267,32 +336,43 @@ export function analyzePowerShellParse(input: {
     });
   }
 
-  const normalizer = new PathNormalizer(
-    pathFlavorForPlatform(input.platform ?? process.platform),
-    input.cwd,
-  );
+  const flavor = pathFlavorForPlatform(input.platform ?? process.platform);
+  const workspaceRoot = input.workspaceRoot ?? input.cwd;
+  const normalizer = new PathNormalizer(flavor, input.cwd);
   const operations: ShellOperationFact[] = [];
   const contextChanges = new Set([
     "alias-change", "assignment", "control-flow", "dot-source", "dynamic-execution",
-    "environment-change", "function-definition", "location-change", "process-spawn", "unknown",
+    "environment-change", "function-definition", "process-spawn", "unknown",
   ]);
-  let firstContextChange = Number.POSITIVE_INFINITY;
-  let firstLocationChange = Number.POSITIVE_INFINITY;
-  for (const operation of summary.languageOperations) {
-    if (contextChanges.has(operation.kind)) firstContextChange = Math.min(firstContextChange, operation.start);
-    if (operation.kind === "location-change") firstLocationChange = Math.min(firstLocationChange, operation.start);
+  const initialContext: ScriptContext = { cwd: input.cwd, environmentStable: true };
+  let currentContext = initialContext;
+  const contextStates: ScriptContextState[] = [];
+  const orderedLanguageOperations = [...summary.languageOperations].sort((left, right) => left.start - right.start);
+  for (const operation of orderedLanguageOperations) {
+    if (operation.kind === "location-change") {
+      const location = currentContext.environmentStable
+        ? resolvedLocation(operation.target, currentContext.cwd, workspaceRoot, flavor, normalizer)
+        : undefined;
+      currentContext = { ...currentContext, cwd: location?.cwd };
+    } else if (contextChanges.has(operation.kind)) {
+      currentContext = { ...currentContext, environmentStable: false };
+    }
+    contextStates.push({ offset: operation.start, context: currentContext });
   }
   const languageFactsByExtent = new Map<string, ShellOperationFact[]>();
-  for (const operation of summary.languageOperations) {
+  for (const operation of orderedLanguageOperations) {
     const unitId = unitForExtent(units, operation);
+    const context = contextBefore(operation.start, contextStates, initialContext);
     const fact = operationForLanguageFact(
       input.call,
       operation,
       unitId,
-      input.cwd,
+      context.environmentStable ? context.cwd : undefined,
+      workspaceRoot,
+      flavor,
       normalizer,
     );
-    const contextStable = firstContextChange >= operation.start;
+    const contextStable = context.environmentStable && context.cwd !== undefined;
     const key = `${operation.start}:${operation.end}`;
     const extentFacts = languageFactsByExtent.get(key) ?? [];
     extentFacts.push(fact);
@@ -317,11 +397,12 @@ export function analyzePowerShellParse(input: {
   for (const programCall of summary.programCalls) {
     const extent = { start: programCall.start, end: programCall.end };
     const unitId = unitForExtent(units, extent);
+    const context = contextBefore(programCall.start, contextStates, initialContext);
     const candidate = programCall.commandName !== null && !programCall.dynamic
       ? known(programCall.commandName)
       : unknown<string>("dynamic-command-name");
-    const contextStable = firstContextChange >= programCall.start;
-    const locationChanged = firstLocationChange < programCall.start;
+    const contextStable = context.environmentStable && context.cwd !== undefined;
+    const workingDirectory = context.cwd;
     const argv = programCall.arguments === null
       ? unknown<readonly string[]>("dynamic-or-unsupported-arguments")
       : known<readonly string[]>(Object.freeze([...programCall.arguments]));
@@ -345,7 +426,7 @@ export function analyzePowerShellParse(input: {
         shell: "powershell",
         program: candidate.status === "known" ? candidate.value : undefined,
         argv: argv.status === "known" ? argv.value : undefined,
-        cwd: locationChanged ? undefined : input.cwd,
+        cwd: workingDirectory,
         extent,
         environmentStable: contextStable,
         platform: input.platform,
@@ -358,7 +439,9 @@ export function analyzePowerShellParse(input: {
         program: candidate,
         executable: adapted.executable,
         argv,
-        cwd: locationChanged ? unknown<string>("working-directory-changed-in-script") : known<string>(input.cwd),
+        cwd: workingDirectory === undefined
+          ? unknown<string>("working-directory-unresolved-in-script")
+          : known(workingDirectory),
         extent: Object.freeze(extent),
       }));
       continue;
@@ -371,7 +454,9 @@ export function analyzePowerShellParse(input: {
         program: candidate,
         executable: unknown<ExecutableIdentity>("powershell-cmdlet"),
         argv,
-        cwd: locationChanged ? unknown<string>("working-directory-changed-in-script") : known<string>(input.cwd),
+        cwd: workingDirectory === undefined
+          ? unknown<string>("working-directory-unresolved-in-script")
+          : known(workingDirectory),
         extent: Object.freeze(extent),
       }));
     }

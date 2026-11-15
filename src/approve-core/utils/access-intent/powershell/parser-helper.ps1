@@ -224,8 +224,11 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         if ($commandName -match '^(?i:Start-Process|Start-Job|Invoke-Command|pwsh|powershell|cmd|cmd\.exe)$') {
           Add-LanguageOperation "process-spawn" $command
         }
-        if ($commandName -match '^(?i:Set-Location|Push-Location|Pop-Location|cd|chdir)$') {
-          Add-LanguageOperation "location-change" $command
+        if ($commandName -match '^(?i:Set-Location|Push-Location|Pop-Location|cd|chdir|sl|pushd|popd)$') {
+          $target = if ($commandName -match '^(?i:Pop-Location|popd)$') { $null } else {
+            Get-StaticCommandTarget $command @("Path", "LiteralPath") 0
+          }
+          Add-LanguageOperation "location-change" $command $target
         }
         if ($commandName -match '^(?i:Set-Alias|New-Alias|Remove-Alias)$') {
           Add-LanguageOperation "alias-change" $command
@@ -248,8 +251,11 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
           $target = Get-StaticCommandTarget $command @("Path", "LiteralPath", "Name") 0
           Add-LanguageOperation "file-delete" $command $target
         }
-        if ($commandName -match '^(?i:Get-Content|Get-ChildItem|Get-Item|Test-Path|Get-ItemProperty)$') {
+        if ($commandName -match '^(?i:Get-Content|Get-ChildItem|Get-Item|Test-Path|Get-ItemProperty|gci|dir|ls)$') {
           $target = Get-StaticCommandTarget $command @("Path", "LiteralPath", "Name") 0
+          if ($null -eq $target -and $commandName -match '^(?i:Get-ChildItem|gci|dir|ls)$' -and $command.CommandElements.Count -eq 1) {
+            $target = "."
+          }
           Add-LanguageOperation "file-read" $command $target
         }
         if ($commandName -match '^(?i:Invoke-WebRequest|Invoke-RestMethod)$') {

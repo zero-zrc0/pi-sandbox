@@ -26,6 +26,7 @@ const ENVIRONMENT_ALLOWLIST = new Set([
   "TEMP",
   "TMP",
   "TMPDIR",
+  "PI_SANDBOX_WORK_DIR",
   "HOME",
   "LANG",
   "LC_ALL",

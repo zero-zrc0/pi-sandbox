@@ -833,7 +833,7 @@ describe("host publication lifecycle (§5)", () => {
 
     // The old step is fenced: its late allow is never published.
     h.chain.resolve(chainResult(h.chain.calls[0]!.capture, "call-1", "allow", 1));
-    expect(await call).toEqual({ block: true, reason: "permission:generation-stale" });
+    expect(await call).toEqual({ block: true, reason: expect.stringContaining("permission:generation-stale") });
 
     // A step started afterwards uses the current publication.
     const next = h.toolCall("call-2");
@@ -865,7 +865,7 @@ describe("host tool call processing (§6)", () => {
     extension.install(api.api);
     await api.fire("session_start", { type: "session_start", reason: "startup" }, ctx);
     const answer = await api.fire("tool_call", { type: "tool_call", toolCallId: "call-1", toolName: "bash", input: { command: "ls" } } as unknown as ToolCallEvent, ctx);
-    expect(answer).toEqual({ block: true, reason: "permission:config-unavailable" });
+    expect(answer).toEqual({ block: true, reason: expect.stringContaining("permission:config-unavailable") });
   });
 
   it("passes an allow result through and blocks a deny with the aggregated reasons", async () => {
@@ -889,14 +889,17 @@ describe("host tool call processing (§6)", () => {
     const call = h.toolCall("call-3");
     await waitFor(() => h.chain.calls.length === 1, "escalation chain run");
     h.chain.resolve(chainResult(h.chain.calls[0]!.capture, "call-3", "escalate", 1));
-    expect(await call).toBeUndefined();
+    expect(await call).toMatchObject({
+      block: true,
+      reason: expect.stringContaining("ordinary-host-execution-forbidden"),
+    });
   });
 
   it("blocks instead of mixing evidence when the session changes during analysis", async () => {
     let h!: Harness;
     h = await harness({ onAnalyze: () => h.memory.bumpAuthorization() });
     const answer = await h.toolCall("call-4");
-    expect(answer).toEqual({ block: true, reason: "permission:evidence-changed" });
+    expect(answer).toEqual({ block: true, reason: expect.stringContaining("permission:evidence-changed") });
     expect(h.chain.calls).toHaveLength(0);
   });
 
@@ -974,8 +977,8 @@ describe("host tool call processing (§6)", () => {
     await h.fire("resources_discover", { type: "resources_discover", cwd: CWD, reason: "reload" });
     expect(h.publications.disposed).toEqual([]);
     release();
-    expect(await first).toEqual({ block: true, reason: "permission:generation-stale" });
-    expect(await second).toEqual({ block: true, reason: "permission:generation-stale" });
+    expect(await first).toEqual({ block: true, reason: expect.stringContaining("permission:generation-stale") });
+    expect(await second).toEqual({ block: true, reason: expect.stringContaining("permission:generation-stale") });
     await waitFor(() => h.publications.disposed.includes(1), "preparation reference release");
     expect(h.publications.disposed).toEqual([1]);
     expect(h.chain.calls).toHaveLength(0);
@@ -1006,7 +1009,7 @@ describe("host tool call processing (§6)", () => {
     await waitFor(() => releases.length === 1, "first retry preparation");
     await h.fire("input", { type: "input", text: "new task", source: "interactive" });
     expect(signals[0]?.aborted).toBe(true);
-    expect(await first).toEqual({ block: true, reason: "permission:evidence-changed" });
+    expect(await first).toEqual({ block: true, reason: expect.stringContaining("permission:evidence-changed") });
 
     const retry = h.toolCall("call-a", "bash", { command: "ls" });
     await waitFor(() => releases.length === 2, "replacement preparation");
@@ -1057,7 +1060,7 @@ describe("host tool call processing (§6)", () => {
 
     expect(await h.toolCall("call-first", "write", firstInput)).toEqual({
       block: true,
-      reason: "permission:duplicate-call",
+      reason: expect.stringContaining("permission:duplicate-call"),
     });
     expect(h.chain.calls).toHaveLength(1);
   });
@@ -1083,9 +1086,9 @@ describe("host tool call processing (§6)", () => {
       { toolCallId: "call-a", decision: "allow" },
       { toolCallId: "call-b", decision: "allow" },
     ], 1));
-    expect(await changed).toEqual({ block: true, reason: "permission:capture-mismatch" });
-    expect(await renamed).toEqual({ block: true, reason: "permission:duplicate-call" });
-    expect(await nested).toEqual({ block: true, reason: "permission:duplicate-call" });
+    expect(await changed).toEqual({ block: true, reason: expect.stringContaining("permission:capture-mismatch") });
+    expect(await renamed).toEqual({ block: true, reason: expect.stringContaining("permission:duplicate-call") });
+    expect(await nested).toEqual({ block: true, reason: expect.stringContaining("permission:duplicate-call") });
     expect(await first).toBeUndefined();
   });
 
@@ -1105,7 +1108,7 @@ describe("host tool call processing (§6)", () => {
     void call.then(() => { settled = true; });
     await waitFor(() => settled || h.chain.calls.length > 0, "invalidated result or chain");
     if (h.chain.calls.length > 0) h.chain.resolve(chainResult(h.chain.calls[0]!.capture, "call-delayed", "allow", 1));
-    expect(await call).toEqual({ block: true, reason: "permission:evidence-changed" });
+    expect(await call).toEqual({ block: true, reason: expect.stringContaining("permission:evidence-changed") });
     expect(h.chain.calls).toHaveLength(0);
   });
 
@@ -1147,6 +1150,7 @@ describe("host sandbox bypass channel (§6)", () => {
       targetToolName: "write",
       arguments: { path: "a.txt", content: "x" },
       reason: "first",
+      elevation: { tier: "host" as const, scope: [{ path: "a.txt", access: "write" as const }] },
     };
     const first = h.extension.reviewSandboxBypass(request, h.ctx as never);
     await waitFor(() => h.chain.calls.length === 1, "bypass chain run");
@@ -1164,6 +1168,7 @@ describe("host sandbox bypass channel (§6)", () => {
         targetToolName: "write",
         arguments: { path: "a.txt", content: "x" },
         reason: "need host access",
+        elevation: { tier: "host", scope: [{ path: "a.txt", access: "write" }] },
       },
       h.ctx as never,
     );
@@ -1181,6 +1186,7 @@ describe("host sandbox bypass channel (§6)", () => {
         targetToolName: "write",
         arguments: { path: "a.txt", content: "x" },
         reason: "need host access",
+        elevation: { tier: "host", scope: [{ path: "a.txt", access: "write" }] },
       },
       h.ctx as never,
     );
@@ -1234,7 +1240,7 @@ describe("host sandbox guard channel (§6)", () => {
     const h = await harness({
       sandbox: { guard: async () => ({ block: true, reason: "sandbox:unmanaged-tool" }) },
     });
-    expect(await h.toolCall("call-h")).toEqual({ block: true, reason: "sandbox:unmanaged-tool" });
+    expect(await h.toolCall("call-h")).toEqual({ block: true, reason: expect.stringContaining("sandbox:unmanaged-tool") });
     expect(h.chain.calls).toHaveLength(0);
   });
 
@@ -1404,7 +1410,7 @@ describe("host spec-conformance fixes", () => {
     expect(h.publications.disposed).toEqual([2]);
 
     h.chain.resolve(chainResult(h.chain.calls[0]!.capture, "call-retire", "allow", 1));
-    expect(await call).toEqual({ block: true, reason: "permission:generation-stale" });
+    expect(await call).toEqual({ block: true, reason: expect.stringContaining("permission:generation-stale") });
     await waitFor(() => h.publications.disposed.includes(1), "retired generation release");
     expect(new Set(h.publications.disposed)).toEqual(new Set([1, 2]));
   });
@@ -1685,10 +1691,30 @@ describe("session-scoped ask decisions (§5.6)", () => {
     expect(plain).toContain(language === "zh" ? "删除目标位于当前工作目录之外" : "The deletion target is outside the working directory");
     expect(plain).not.toContain(language === "zh" ? "写入目标" : "The write target");
     expect(output).toContain(language === "zh"
-      ? "\u001b[33m提权 host\u001b[39m\u001b[34m 执行"
-      : "\u001b[33melevation host\u001b[39m\u001b[34m execution");
+      ? "普通审批不能授予宿主权限"
+      : "An ordinary approval cannot run this call with Host permissions");
     await driver.cancel();
     await call;
+  });
+
+  it("shows the requested Host tier, scope and sandbox boundary", async () => {
+    vi.stubEnv("LC_ALL", "en-US");
+    const { h, driver } = await askHarness();
+    const review = h.extension.reviewSandboxBypass({
+      toolCallId: "explicit-host-review",
+      targetToolName: "write",
+      arguments: { path: "/tmp/external.txt", content: "approved" },
+      reason: "write the requested output",
+      elevation: { tier: "host", scope: [{ path: "/tmp/external.txt", access: "write" }] },
+    }, h.ctx as never);
+    await waitFor(() => driver.pending.length > 0, "explicit Host review prompt");
+    const output = driver.pending[0]!.render(100).join("\n").replace(/\u001b\[[0-9;]*m/g, "");
+
+    expect(output).toContain("elevation host");
+    expect(output).toContain("outside the OS sandbox");
+    expect(output).toContain("write /tmp/external.txt");
+    await driver.cancel();
+    expect(await review).toMatchObject({ block: true });
   });
 
   it("renders tool arguments and choices in the approval panel", async () => {
@@ -1871,7 +1897,7 @@ describe("session-scoped ask decisions (§5.6)", () => {
     const second = h.toolCall("call-b", "write", { path: "a.txt", content: "x" });
     // The remembered deny is a chain restriction now, so the block carries its
     // chain reason instead of the old host short-circuit reason.
-    expect(await second).toEqual({ block: true, reason: "permission:denied: session:remembered-deny" });
+    expect(await second).toEqual({ block: true, reason: expect.stringContaining("permission:denied: session:remembered-deny") });
     expect(chains).toHaveLength(2);
     expect(driver.pending).toHaveLength(0);
   });
@@ -1908,7 +1934,7 @@ describe("session-scoped ask decisions (§5.6)", () => {
 
     ask = false;
     const second = h.toolCall("call-b", "bash", { command: "cd sub" });
-    expect(await second).toEqual({ block: true, reason: "permission:denied: session:remembered-deny" });
+    expect(await second).toEqual({ block: true, reason: expect.stringContaining("permission:denied: session:remembered-deny") });
     expect(driver.pending).toHaveLength(0);
     expect(chains).toHaveLength(2);
   });

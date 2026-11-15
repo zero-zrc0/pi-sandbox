@@ -5,10 +5,8 @@ import {
   type McpExtensionOptions,
   type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
-import { basename, dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import type { ApprovalChainConfigSnapshot } from "../config/owner";
 import { getActiveAgentName } from "../approve-core/host/active-agent";
@@ -28,7 +26,8 @@ import { EXECUTION_INSTALL_ROOT } from "./platform";
 import type { SandboxRuntimeState } from "./runtime-manager";
 import type { ResolvedRuntimeFiles } from "./runtime-store";
 import { ManagedMcpTransports } from "./mcp";
-import { PROTECTED_CONTROL_DIRECTORY_NAMES, resolveHostPathIdentity, findProtectedControlRoot, isPathWithin } from "./path";
+import { resolveHostPathIdentity, findProtectedControlRoot, isPathWithin } from "./path";
+import { ensureSessionWorkspace } from "./session-workspace";
 import { builtinToolPath } from "./builtin-path";
 import type { ToolElevation } from "../elevation";
 import type { SandboxBypassReviewInput } from "../approve-core/host";
@@ -57,6 +56,7 @@ const factories = [createBashToolDefinition, createPowerShellToolDefinition, cre
 
 export interface ControlledExecutionOptions {
   readonly registrationPath?: string;
+  readonly agentDir?: string;
   readonly snapshot: (ctx: ExtensionContext) => ApprovalChainConfigSnapshot;
   readonly controller?: (ctx: ExtensionContext, record: (record: ExecutionRecord) => void) => ExecutionController;
   readonly mcp?: Pick<ConstructorParameters<typeof ManagedMcpTransports>[0], "runConfigCommand"> & Pick<McpExtensionOptions, "loadConfig">;
@@ -67,12 +67,6 @@ interface SessionExecution {
   readonly revision: string;
   readonly adapter: PiExecutionAdapter;
   readonly snapshot: ApprovalChainConfigSnapshot;
-}
-
-interface PendingHostExecution {
-  readonly invocation: ToolInvocationFacts;
-  readonly policyRevision: string;
-  readonly executor: AnyToolDefinition;
 }
 
 interface ManagedToolLifecycle {
@@ -90,17 +84,12 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
   const epochs = new Map<string, number>();
   const closedSessions = new Set<string>();
   const retiring = new Map<string, Promise<void>>();
-  const scratchDirectories = new Map<string, string>();
   const owned = new Map<string, AnyToolDefinition>();
   const hostExecutors = new Map<string, AnyToolDefinition>();
   const managedToolCancellers = new Map<string, NonNullable<ManagedToolLifecycle["cancelSession"]>>();
-  const pendingHostExecutions = new Map<string, PendingHostExecution>();
-  const issuedHostExecutions = new Map<string, Set<string>>();
-  const hostExecutionOwners = new Map<string, string>();
   const mcpCalls = new AsyncLocalStorage<{ attempted: boolean }>();
-  const elevationDenials = new Map<string, { elevation: ToolElevation; executor: AnyToolDefinition;
-    execute: AnyToolDefinition["execute"]; registration: string }>();
   const defaultCalls = new Map<string, import("./plan").PlanBaselineScope>();
+  const agentDirectory = resolve(options.agentDir ?? getAgentDir());
   let api: ExtensionAPI;
   let activeContext: ExtensionContext | undefined;
   const runtimeState = () => options.runtime?.() ?? { status: "disabled" as const };
@@ -124,18 +113,24 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
         directory: state.runtime.directory } : { status: state.status },
     });
   };
+  function sessionWorkspace(ctx: ExtensionContext): string {
+    return ensureSessionWorkspace(agentDirectory, ctx.sessionManager.getSessionId());
+  }
   const baselineFilesystem = (ctx: ExtensionContext, mode: ApprovalChainConfigSnapshot["config"]["mode"]): FilesystemGrantInput[] => {
-    const scratch = scratchDirectories.get(ctx.sessionManager.getSessionId());
+    const workspace = sessionWorkspace(ctx);
+    const readOnly = mode === "read-only";
     return [{ path: ctx.cwd, access: "read", granularity: "directory" },
-      ...(scratch === undefined ? [] : ["read", "write"].flatMap(access =>
-        [{ path: scratch, access: access as "read" | "write", granularity: "directory" as const }])),
-      ...(mode === "read-only" ? [] : [{ path: ctx.cwd, access: "write" as const, granularity: "directory" as const }])];
+      { path: workspace, access: "read", granularity: "directory" },
+      ...(readOnly ? [] : [{ path: workspace, access: "write" as const, granularity: "directory" as const }]),
+      ...(readOnly ? [] : [{ path: ctx.cwd, access: "write" as const, granularity: "directory" as const }])];
   };
   const environment = () => selectExecutionEnvironment(process.env as Record<string, string>);
   const executionEnvironment = (ctx: ExtensionContext) => {
-    if (options.snapshot(ctx).config.mode === "full-access") return environment();
-    const scratch = scratchDirectories.get(ctx.sessionManager.getSessionId());
-    return scratch === undefined ? environment() : { ...environment(), TEMP: scratch, TMP: scratch, TMPDIR: scratch };
+    const config = options.snapshot(ctx).config;
+    if (config.mode === "full-access" || !config.experimental.sandboxEnabled) return environment();
+    const workspace = sessionWorkspace(ctx);
+    const temporary = join(workspace, "tmp");
+    return { ...environment(), PI_SANDBOX_WORK_DIR: workspace, TEMP: temporary, TMP: temporary, TMPDIR: temporary };
   };
   const snapshot = (ctx: ExtensionContext) => options.snapshot(ctx);
   const host = {
@@ -185,11 +180,7 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     const id = ctx.sessionManager.getSessionId();
     const epoch = epochs.get(id) ?? 0;
     const current = snapshot(ctx);
-    if (current.config.mode !== "full-access" && !scratchDirectories.has(id)) {
-      const scratch = realpathSync(mkdtempSync(join(tmpdir(), "pi-sandbox-exec-")));
-      for (const name of PROTECTED_CONTROL_DIRECTORY_NAMES) mkdirSync(join(scratch, name));
-      scratchDirectories.set(id, scratch);
-    }
+    if (current.config.mode !== "full-access" && current.config.experimental.sandboxEnabled) sessionWorkspace(ctx);
     const key = revision(current);
     const previous = sessions.get(id);
     if (previous?.revision === key) return previous;
@@ -225,7 +216,7 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       },
       helperCwd: resolve(process.env.TEMP ?? process.env.TMPDIR ?? "/tmp"),
       workspace: ctx.cwd, helperEnvironment: {
-        ...currentEnvironment, PI_MXC_AGENT_DIR: resolve(getAgentDir()),
+        ...currentEnvironment, PI_MXC_AGENT_DIR: agentDirectory,
         PI_SANDBOX_WORKSPACE_ROOT: resolve(ctx.cwd),
         ...(process.env.LOCALAPPDATA ? { LOCALAPPDATA: process.env.LOCALAPPDATA } : {}),
         ...(runtime === undefined ? {} : { PI_SANDBOX_RUNTIME_DIR: runtime.directory }),
@@ -388,15 +379,9 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     const controlled = builtin ? { ...definition, execute: async (...args: Parameters<AnyToolDefinition["execute"]>) => {
       const ctx = args[4];
       const current = await session(ctx);
-      if (hostExecutionBelongsToAnotherSession(ctx.sessionManager.getSessionId(), args[0])) {
-        throw new Error("host-execution:approval-binding-invalidated");
+      if (current.snapshot.config.mode === "full-access" || !current.snapshot.config.experimental.sandboxEnabled) {
+        return fullAccessBuiltin!.execute(...args);
       }
-      const hostBinding = takeHostExecution(ctx.sessionManager.getSessionId(), args[0]);
-      if (hostBinding !== undefined) return executeHostEscalation(hostBinding, args);
-      if (hostExecutionWasIssued(ctx.sessionManager.getSessionId(), args[0])) {
-        throw new Error("host-execution:approval-unavailable");
-      }
-      if (current.snapshot.config.mode === "full-access") return fullAccessBuiltin!.execute(...args);
       const target = current.adapter.definitions.find(tool => tool.name === original.name);
       if (!target || !owns(original.name)) throw new Error("sandbox-unmanaged-tool: owned builtin registration was replaced");
       return target.execute(...args);
@@ -432,14 +417,6 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     });
     const registered = builtin ? controlled : { ...controlled, execute: async (...args: Parameters<AnyToolDefinition["execute"]>) => {
       await session(args[4]);
-      if (hostExecutionBelongsToAnotherSession(args[4].sessionManager.getSessionId(), args[0])) {
-        throw new Error("host-execution:approval-binding-invalidated");
-      }
-      const hostBinding = takeHostExecution(args[4].sessionManager.getSessionId(), args[0]);
-      if (hostBinding !== undefined) return executeHostEscalation(hostBinding, args);
-      if (hostExecutionWasIssued(args[4].sessionManager.getSessionId(), args[0])) {
-        throw new Error("host-execution:approval-unavailable");
-      }
       if (!owns(original.name)) throw new Error("sandbox-unmanaged-tool: MCP registration was replaced");
       return controlled.execute(...args);
     } };
@@ -460,134 +437,6 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
 
   function hostExecutionKey(sessionId: string, toolCallId: string): string {
     return JSON.stringify([sessionId, toolCallId]);
-  }
-
-  function takeHostExecution(sessionId: string, toolCallId: string): PendingHostExecution | undefined {
-    const key = hostExecutionKey(sessionId, toolCallId);
-    const binding = pendingHostExecutions.get(key);
-    if (binding !== undefined) pendingHostExecutions.delete(key);
-    return binding;
-  }
-
-  function hostExecutionWasIssued(sessionId: string, toolCallId: string): boolean {
-    return issuedHostExecutions.get(sessionId)?.has(toolCallId) === true;
-  }
-
-  function hostExecutionBelongsToAnotherSession(sessionId: string, toolCallId: string): boolean {
-    const owner = hostExecutionOwners.get(toolCallId);
-    return owner !== undefined && owner !== sessionId;
-  }
-
-  function clearPendingHostExecutions(
-    sessionId: string,
-    code = "approval-invalidated",
-  ): void {
-    for (const [key, binding] of pendingHostExecutions) {
-      if (binding.invocation.requester.sessionId !== sessionId) continue;
-      pendingHostExecutions.delete(key);
-      recordHostExecution(binding.invocation, {
-        started: false,
-        impact: "none",
-        state: "failed",
-        code,
-      });
-    }
-  }
-
-  function recordHostExecution(
-    invocation: ToolInvocationFacts,
-    input: { readonly started: boolean | "unknown"; readonly impact: "known" | "unknown" | "none"; readonly state: "completed" | "failed"; readonly code?: string },
-  ): void {
-    try {
-      api.appendEntry("permission:execution", {
-        ...recordIdentity(invocation),
-        executionMode: "host",
-        ...input,
-      });
-    } catch {
-      return;
-    }
-  }
-
-  async function executeHostEscalation(
-    binding: PendingHostExecution | undefined,
-    args: Parameters<AnyToolDefinition["execute"]>,
-  ): Promise<Awaited<ReturnType<AnyToolDefinition["execute"]>>> {
-    const [toolCallId, params, signal, onUpdate, ctx] = args;
-    if (binding === undefined) throw new Error("host-execution:approval-unavailable");
-    const approved = binding.invocation;
-    const sessionId = ctx.sessionManager.getSessionId();
-    const reject = (code: string): never => {
-      recordHostExecution(approved, { started: false, impact: "none", state: "failed", code });
-      throw new Error(`host-execution:${code}`);
-    };
-    if (
-      sessionId !== approved.requester.sessionId ||
-      toolCallId !== approved.action.toolCallId ||
-      approved.action.tool.name !== binding.executor.name ||
-      hostExecutors.get(binding.executor.name) !== binding.executor ||
-      !owns(binding.executor.name) ||
-      snapshot(ctx).config.mode === "read-only" ||
-      revision(snapshot(ctx)) !== binding.policyRevision
-    ) {
-      return reject("approval-binding-invalidated");
-    }
-
-    let captured: ToolInvocationFacts | undefined;
-    try {
-      const seed = captureToolInvocationSeed({
-        event: {
-          type: "tool_call",
-          toolName: approved.action.tool.name,
-          toolCallId,
-          ...(approved.action.parentToolCallId === undefined
-            ? {}
-            : { parentToolCallId: approved.action.parentToolCallId }),
-          input: params,
-        },
-        registeredTools: api.getAllTools(),
-        cwd: ctx.cwd,
-        requester: host.readRequester(ctx),
-        environment: executionEnvironment(ctx),
-      });
-      if (!seed.ok) return reject("action-facts-unavailable");
-      const current = finalizeToolInvocation(seed.seed, {
-        requestId: approved.action.requestId,
-        scopes: approved.action.scopes,
-        executionBinding: approved.executionBinding,
-      });
-      if (!current.ok) return reject("action-facts-invalid");
-      captured = current.invocation;
-    } catch {
-      return reject("action-facts-unavailable");
-    }
-    if (captured.digest !== approved.digest) return reject("action-changed-before-execution");
-    if (signal?.aborted || ctx.signal?.aborted) return reject("cancelled-before-execution");
-
-    try {
-      const result = await binding.executor.execute(
-        toolCallId,
-        approved.action.effectiveArguments as never,
-        signal,
-        onUpdate,
-        ctx,
-      );
-      recordHostExecution(approved, {
-        started: true,
-        impact: "known",
-        state: result.isError === true ? "failed" : "completed",
-        ...(result.isError === true ? { code: "execution-failed" } : {}),
-      });
-      return result;
-    } catch (error) {
-      recordHostExecution(approved, {
-        started: "unknown",
-        impact: "unknown",
-        state: "failed",
-        code: "execution-failed",
-      });
-      throw error;
-    }
   }
 
   /** Persist the rule decision that admitted or refused one call (design §5.4). */
@@ -618,7 +467,6 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     void cancelManagedSession(id).catch(() => undefined);
     egress.closeSession(id);
     bindings.clearSession(id);
-    clearPendingHostExecutions(id);
     clearElevations(id);
     epochs.set(id, (epochs.get(id) ?? 0) + 1);
     const previous = sessions.get(id);
@@ -629,55 +477,137 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
   }
 
   function clearElevations(sessionId: string): void {
-    for (const key of elevationDenials.keys()) if (key.startsWith(`${sessionId}:`)) elevationDenials.delete(key);
     for (const key of defaultCalls.keys()) if (key.startsWith(`${sessionId}:`)) defaultCalls.delete(key);
   }
 
-  function elevationKey(name: string, args: unknown, ctx: ExtensionContext): string {
-    return `${ctx.sessionManager.getSessionId()}:${jsonDigest({ name, args, cwd: ctx.cwd, revision: revision(snapshot(ctx)) })}`;
-  }
-
-  function elevationRegistration(name: string): string {
-    return jsonDigest(api.getAllTools().filter(tool => tool.name === name).map(tool => ({
-      parameters: tool.parameters, path: tool.sourceInfo.path, exposure: tool.exposure ?? "direct",
-    })));
-  }
-
-  function fileElevation(name: string, args: Record<string, unknown>, ctx: ExtensionContext): ToolElevation | undefined {
+  function fileTarget(name: string, args: Record<string, unknown>, ctx: ExtensionContext):
+    { readonly path: string; readonly accesses: readonly ("read" | "write")[] } | null | undefined {
     if (!["read", "write", "edit", "grep", "find", "ls"].includes(name)) return undefined;
     const pathValue = args.path ?? ".";
-    if (typeof pathValue !== "string") return undefined;
-    const target = resolveHostPathIdentity(builtinToolPath(name as import("./types").BuiltinToolName, pathValue, ctx.cwd));
+    if (typeof pathValue !== "string") return null;
+    let target: string | null;
+    try {
+      target = resolveHostPathIdentity(builtinToolPath(name as import("./types").BuiltinToolName, pathValue, ctx.cwd));
+    } catch {
+      return null;
+    }
+    if (target === null) return null;
+    const accesses = name === "write" ? ["write"] as const
+      : name === "edit" ? ["read", "write"] as const
+        : ["read"] as const;
+    return { path: target, accesses };
+  }
+
+  function missingFileAccesses(
+    target: NonNullable<ReturnType<typeof fileTarget>>,
+    ctx: ExtensionContext,
+  ): readonly ("read" | "write")[] | null {
+    const baseline = baselineFilesystem(ctx, snapshot(ctx).config.mode).map(grant => ({
+      ...grant,
+      path: resolveHostPathIdentity(grant.path),
+    }));
+    if (baseline.some(grant => grant.path === null)) return null;
+    return target.accesses.filter(access => !baseline.some(grant => grant.access === access &&
+      isPathWithin(grant.path!, target.path)));
+  }
+
+  function readOnlySessionWorkspaceWrite(target: NonNullable<ReturnType<typeof fileTarget>>, ctx: ExtensionContext): boolean {
+    if (snapshot(ctx).config.mode !== "read-only" || !target.accesses.includes("write")) return false;
+    const workspace = resolveHostPathIdentity(sessionWorkspace(ctx));
+    return workspace !== null && isPathWithin(workspace, target.path);
+  }
+
+  function defaultWriteScope(ctx: ExtensionContext): ToolElevation["scope"] | null {
+    const project = resolveHostPathIdentity(ctx.cwd);
+    const workspace = resolveHostPathIdentity(sessionWorkspace(ctx));
+    if (project === null || workspace === null) return null;
+    return [{ path: project, access: "write" }, { path: workspace, access: "write" }];
+  }
+
+  function fileElevation(
+    name: string,
+    args: Record<string, unknown>,
+    tier: ToolElevation["tier"],
+    ctx: ExtensionContext,
+  ): ToolElevation | undefined {
+    const target = fileTarget(name, args, ctx);
+    if (target === undefined || target === null || findProtectedControlRoot(target.path) !== null) return undefined;
+    const accesses = missingFileAccesses(target, ctx);
+    if (accesses === null || accesses.length === 0) return undefined;
+    if (tier === "default") {
+      const scope = defaultWriteScope(ctx);
+      if (scope === null || !scope.some(grant => isPathWithin(grant.path, target.path))) return undefined;
+      return { tier, scope };
+    }
+    return { tier, scope: accesses.map(access => ({ path: target.path, access })) };
+  }
+  function ordinaryFileScopeBlock(name: string, args: Record<string, unknown>, ctx: ExtensionContext): Block | undefined {
+    const current = snapshot(ctx);
+    if (current.config.mode === "full-access" || !current.config.experimental.sandboxEnabled) return undefined;
+    const target = fileTarget(name, args, ctx);
+    if (target === undefined) return undefined;
+    if (target === null) return { block: true, reason: `permission:path-unverifiable:${String(args.path ?? ".")}` };
+    if (findProtectedControlRoot(target.path) !== null) {
+      return { block: true, reason: `permission:protected-control-path:${target.path}` };
+    }
+    if (readOnlySessionWorkspaceWrite(target, ctx)) {
+      return { block: true, reason: `permission:mode:read-only:session-workspace-write-forbidden:${target.path}` };
+    }
+    const accesses = missingFileAccesses(target, ctx);
+    if (accesses === null) return { block: true, reason: "permission:baseline-path-unverifiable" };
+    if (accesses.length === 0) return undefined;
     const workspace = resolveHostPathIdentity(ctx.cwd);
-    if (target === null || workspace === null || findProtectedControlRoot(target) !== null) return undefined;
-    const access = name === "write" || name === "edit" ? "write" as const : "read" as const;
-    const baseline = baselineFilesystem(ctx, snapshot(ctx).config.mode);
-    if (baseline.some(grant => grant.access === access && isPathWithin(grant.path, target))) return undefined;
-    return { tier: isPathWithin(workspace, target) ? "default" : "host", scope: [{ path: target, access }] };
+    if (workspace === null) return { block: true, reason: "permission:workspace-path-unverifiable" };
+    const tier = isPathWithin(workspace, target.path) ? "default" : "host";
+    return {
+      block: true,
+      reason: `permission:elevation-required:${accesses.join("+")} ${target.path}; call request_tool_elevation with toolName "${name}", unchanged complete arguments, a reason, and tier "${tier}"`,
+    };
   }
 
   return {
-    takeElevation(name: string, args: JsonObject, ctx: ExtensionToolContext): ToolElevation | undefined {
-      const key = elevationKey(name, args, ctx);
-      const denied = elevationDenials.get(key);
-      elevationDenials.delete(key);
-      if (denied === undefined || !owns(name) || hostExecutors.get(name) !== denied.executor ||
-        denied.executor.execute !== denied.execute || elevationRegistration(name) !== denied.registration ||
-        snapshot(ctx).config.mode === "full-access") return undefined;
-      const current = fileElevation(name, args, ctx);
-      return current !== undefined && jsonDigest(current) === jsonDigest(denied.elevation) ? current : undefined;
+    sessionWorkspace(ctx: ExtensionContext): string { return sessionWorkspace(ctx); },
+    prepareElevation(name: string, args: JsonObject, tier: ToolElevation["tier"], ctx: ExtensionToolContext): ToolElevation | Block {
+      const current = snapshot(ctx);
+      if (current.config.mode === "full-access" || !current.config.experimental.sandboxEnabled) {
+        return { block: true, reason: "sandbox-bypass:elevation-not-available" };
+      }
+      if (!owns(name) || hostExecutors.get(name) === undefined) {
+        return { block: true, reason: `sandbox-bypass:target-executor-unavailable:${name}` };
+      }
+      const target = fileTarget(name, args, ctx);
+      if (target === undefined) return { block: true, reason: `sandbox-bypass:unsupported-target-tool:${name}` };
+      if (target === null) return { block: true, reason: `sandbox-bypass:target-path-unverifiable:${String(args.path ?? ".")}` };
+      if (findProtectedControlRoot(target.path) !== null) {
+        return { block: true, reason: `sandbox-bypass:protected-target:${target.path}` };
+      }
+      const accesses = missingFileAccesses(target, ctx);
+      if (accesses === null) return { block: true, reason: "sandbox-bypass:baseline-path-unverifiable" };
+      if (accesses.length === 0) return { block: true, reason: `sandbox-bypass:elevation-not-needed:${target.path}` };
+      const scope = tier === "default" ? defaultWriteScope(ctx) : null;
+      if (tier === "default" && scope === null) {
+        return { block: true, reason: "sandbox-bypass:default-scope-unverifiable" };
+      }
+      if (scope !== null && !scope.some(grant => isPathWithin(grant.path, target.path))) {
+        return { block: true, reason: `sandbox-bypass:default-scope-exceeds-project-and-session-workspace:${target.path}; request tier host for this target` };
+      }
+      return { tier, scope: scope ?? accesses.map(access => ({ path: target.path, access })) };
     },
     validateElevation(name: string, args: JsonObject, elevation: ToolElevation, ctx: ExtensionToolContext): boolean {
-      const current = fileElevation(name, args, ctx);
+      const current = fileElevation(name, args, elevation.tier, ctx);
       return !closedSessions.has(ctx.sessionManager.getSessionId()) && owns(name) &&
+        snapshot(ctx).config.mode !== "full-access" && snapshot(ctx).config.experimental.sandboxEnabled &&
         current !== undefined && jsonDigest(current) === jsonDigest(elevation);
     },
     async executeDefault(input: SandboxBypassReviewInput, signal: AbortSignal | undefined,
       onUpdate: Parameters<AnyToolDefinition["execute"]>[3], ctx: ExtensionToolContext) {
       const current = await session(ctx);
+      if (current.snapshot.config.mode === "full-access" || !current.snapshot.config.experimental.sandboxEnabled) {
+        throw new Error("elevation:default-sandbox-unavailable");
+      }
       const args = input.arguments as JsonObject;
-      const expected = fileElevation(input.targetToolName, args, ctx);
-      if (input.elevation?.tier !== "default" || expected?.tier !== "default" ||
+      const expected = fileElevation(input.targetToolName, args, "default", ctx);
+      if (input.elevation.tier !== "default" || expected?.tier !== "default" ||
         jsonDigest(expected) !== jsonDigest(input.elevation) || !owns(input.targetToolName)) {
         throw new Error("elevation:default-scope-invalidated");
       }
@@ -695,7 +625,7 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       const target = current.adapter.definitions.find(tool => tool.name === input.targetToolName);
       if (target === undefined) throw new Error("elevation:controlled-executor-unavailable");
       const key = hostExecutionKey(ctx.sessionManager.getSessionId(), input.toolCallId);
-      defaultCalls.set(key, { filesystem: baselineFilesystem(ctx, "default"), network: { kind: "none" } });
+      defaultCalls.set(key, { filesystem: baselineFilesystem(ctx, current.snapshot.config.mode), network: { kind: "none" } });
       try {
         return await target.execute(input.toolCallId, args, signal, onUpdate, ctx);
       } finally {
@@ -711,11 +641,6 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
         epochs.set(id, (epochs.get(id) ?? 0) + 1);
         bindings.clearSession(id);
         clearElevations(id);
-        clearPendingHostExecutions(id, "sandbox-disabled");
-        issuedHostExecutions.delete(id);
-        for (const [toolCallId, owner] of hostExecutionOwners) {
-          if (owner === id) hostExecutionOwners.delete(toolCallId);
-        }
         egress.closeSession(id);
         const cancelling = cancelManagedSession(id);
         const previous = sessions.get(id);
@@ -811,28 +736,18 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
         return current.snapshot.config.mode === "full-access"
           ? review() : { block: true, reason: `sandbox-unmanaged-tool: ${event.toolName}` };
       }
+      const scopeBlock = ordinaryFileScopeBlock(event.toolName, event.input as Record<string, unknown>, ctx);
+      if (scopeBlock !== undefined) return scopeBlock;
       const seed = captureToolInvocationSeed({ event, registeredTools: api.getAllTools(), cwd: ctx.cwd,
         requester: host.readRequester(ctx as ExtensionToolContext), environment: executionEnvironment(ctx) });
       if (!seed.ok) return { block: true, reason: `sandbox-binding: ${seed.reason}` };
       const answer = allowedByRule || hasApprovedCodemodeScope(ctx.sessionManager.getSessionId())
         ? undefined
         : await review({ ask: true });
-      const escalation = answer !== undefined && "kind" in answer && answer.kind === "host-execution"
-        ? answer
-        : undefined;
-      if (answer !== undefined && escalation === undefined) {
-        if ("block" in answer && answer.permissionDenied === true && !ctx.signal?.aborted &&
-          sessions.get(ctx.sessionManager.getSessionId()) === current && current.revision === revision(snapshot(ctx))) {
-          const elevation = fileElevation(event.toolName, event.input as Record<string, unknown>, ctx);
-          const executor = hostExecutors.get(event.toolName);
-          if (elevation !== undefined && executor !== undefined) {
-            if (elevationDenials.size >= 128) elevationDenials.delete(elevationDenials.keys().next().value!);
-            elevationDenials.set(elevationKey(event.toolName, event.input, ctx), {
-              elevation, executor, execute: executor.execute, registration: elevationRegistration(event.toolName),
-            });
-          }
-        }
-        return answer;
+      if (answer !== undefined) {
+        return "kind" in answer && answer.kind === "host-execution"
+          ? { block: true, reason: "permission:ordinary-host-execution-forbidden; use request_tool_elevation for a supported file tool" }
+          : answer;
       }
       if (sessions.get(ctx.sessionManager.getSessionId()) !== current || current.revision !== revision(snapshot(ctx)) || !owns(event.toolName)) return { block: true, reason: "plan-invalidated: execution policy or tool changed during approval" };
       if (ctx.signal?.aborted) return { block: true, reason: "host-execution:cancelled-before-start" };
@@ -869,26 +784,6 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       const captured = finalizeToolInvocation(seed.seed, { requestId: `${ctx.sessionManager.getSessionId()}:${event.toolCallId}`,
         scopes, executionBinding: { status: "bound", toolName: name, owner: OWNER, bindingId: BINDING, revision: seed.seed.tool.revision } });
       if (!captured.ok) return { block: true, reason: "sandbox-binding: authorization could not be bound" };
-      if (escalation !== undefined) {
-        const sessionId = ctx.sessionManager.getSessionId();
-        if (current.snapshot.config.mode === "read-only") return { block: true, reason: "host-execution:forbidden-in-read-only" };
-        const executor = hostExecutors.get(name);
-        if (executor === undefined || executor.name !== name) return { block: true, reason: "host-execution:target-unavailable" };
-        const issued = issuedHostExecutions.get(sessionId) ?? new Set<string>();
-        const owner = hostExecutionOwners.get(event.toolCallId);
-        if (issued.has(event.toolCallId) || (owner !== undefined && owner !== sessionId)) {
-          return { block: true, reason: "host-execution:already-issued" };
-        }
-        issued.add(event.toolCallId);
-        issuedHostExecutions.set(sessionId, issued);
-        hostExecutionOwners.set(event.toolCallId, sessionId);
-        pendingHostExecutions.set(hostExecutionKey(sessionId, event.toolCallId), {
-          invocation: captured.invocation,
-          policyRevision: current.revision,
-          executor,
-        });
-        return undefined;
-      }
       if (!bindings.authorize(captured.invocation, current.revision)) return { block: true, reason: "sandbox-binding: authorization could not be bound" };
       return undefined;
     },
@@ -907,21 +802,9 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
         closedSessions.add(id);
         epochs.set(id, (epochs.get(id) ?? 0) + 1);
         bindings.clearSession(id);
-        clearPendingHostExecutions(id, "session-disposed");
-        issuedHostExecutions.delete(id);
-        for (const [toolCallId, owner] of hostExecutionOwners) {
-          if (owner === id) hostExecutionOwners.delete(toolCallId);
-        }
         const previous = sessions.get(id); sessions.delete(id);
         await Promise.all([cancelling, previous?.adapter.dispose(), retiring.get(id), pendingSessions.get(id)?.catch(() => undefined), mcp.close()]);
         egress.closeSession(id);
-        const scratch = scratchDirectories.get(id);
-        if (scratch !== undefined) {
-          const target = realpathSync(scratch);
-          if (dirname(target) !== realpathSync(tmpdir()) || !basename(target).startsWith("pi-sandbox-exec-")) throw new Error("refusing to remove an unowned execution directory");
-          rmSync(target, { recursive: true, force: true });
-          scratchDirectories.delete(id);
-        }
       });
       pi.on("session_before_switch", async (_event, ctx) => {
         await cancelManagedSession(ctx.sessionManager.getSessionId());

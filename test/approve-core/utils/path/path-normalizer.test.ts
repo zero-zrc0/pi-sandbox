@@ -6,6 +6,7 @@ interface Deps {
   realpathMap?: Record<string, string>;
   existing?: readonly string[];
   entries?: Record<string, unknown>;
+  additionalLocalPaths?: readonly string[];
 }
 
 function makeNormalizer(flavor: typeof POSIX, cwd: string, deps: Deps = {}) {
@@ -13,6 +14,7 @@ function makeNormalizer(flavor: typeof POSIX, cwd: string, deps: Deps = {}) {
   const existing = new Set(deps.existing ?? []);
   return new PathNormalizer(flavor, cwd, {
     home: "/home/user",
+    additionalLocalPaths: deps.additionalLocalPaths,
     realpathSync: (p) => {
       if (p in realpathMap) return realpathMap[p];
       const error = new Error("missing") as Error & { code: string };
@@ -157,6 +159,15 @@ describe("out-of-cwd judgment", () => {
     expect(n.isOutside("/elsewhere/x")).toBe(true);
     expect(n.isOutside("/dev/null")).toBe(false);
     expect(n.isOutside("/dev/other")).toBe(true);
+  });
+
+  it("treats the session workspace as local alongside the project cwd", () => {
+    const n = makeNormalizer(POSIX, "/work", {
+      additionalLocalPaths: ["/session-workspace"],
+      realpathMap: { "/work": "/real/work", "/session-workspace": "/agent/workspaces/session" },
+    });
+    expect(n.isOutside("/session-workspace/scripts/task.sh")).toBe(false);
+    expect(n.isOutside("/outside/secret.txt")).toBe(true);
   });
 
   it("is not external when the location cannot be proven", () => {

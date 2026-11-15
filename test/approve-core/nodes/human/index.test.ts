@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { ExecutionRequest } from "../../../../src/elevation";
 import type { HumanRequest, HumanResponse } from "#approve-core/runtime";
 import {
   DEFAULT_HUMAN_REASON_PREFIX,
@@ -28,7 +29,7 @@ interface RequestOverrides {
   readonly arguments?: Record<string, unknown>;
   readonly askFor?: "allow" | "escalate";
   readonly reasons?: readonly string[];
-  readonly hostExecutionRequest?: { readonly reason: string };
+  readonly hostExecutionRequest?: ExecutionRequest;
   readonly signal?: AbortSignal;
   readonly stepKey?: string;
   readonly toolCallId?: string;
@@ -145,25 +146,29 @@ describe("describeHumanRequest", () => {
     expect(describeHumanRequest(makeRequest({ reasons: [] })).reason).toBe("no reason was recorded");
   });
 
-  it("labels an escalation request with the host execution reason", () => {
+  it("labels an ordinary escalation as unavailable for Host execution", () => {
     const facts = describeHumanRequest(makeRequest({ askFor: "escalate" }));
     expect(facts.escalation).toBe(true);
     expect(facts.askFor).toBe("escalate");
-    expect(facts.title).toContain("Host execution request for write");
+    expect(facts.title).toContain("Ordinary write call cannot receive Host execution");
     expect(facts.title).toContain("Reason: outside the workspace");
   });
 
   it("escalates when the call carries a host execution request", () => {
     const facts = describeHumanRequest(
-      makeRequest({ hostExecutionRequest: { reason: "sandbox blocked it" } }),
+      makeRequest({ hostExecutionRequest: {
+        reason: "sandbox blocked it",
+        elevation: { tier: "host", scope: [{ path: "/outside/target", access: "write" }] },
+      } }),
     );
     expect(facts.escalation).toBe(true);
     expect(facts.askFor).toBe("escalate");
+    expect(facts.title).toContain("Host execution request for write (outside the OS sandbox)");
   });
 
-  it("uses the host execution fallback reason for an escalation without reasons", () => {
+  it("uses the ordinary Host denial reason when no tier was requested", () => {
     const facts = describeHumanRequest(makeRequest({ askFor: "escalate", reasons: [] }));
-    expect(facts.reason).toBe("one-time host execution was requested");
+    expect(facts.reason).toBe("ordinary approvals cannot grant Host execution");
   });
 
   it("never disguises a normal request as an escalation", () => {

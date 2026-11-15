@@ -29,7 +29,6 @@ function tool(
 function setup(options: {
   mode?: "read-only" | "default" | "auto-review" | "full-access";
   controlled?: boolean;
-  denied?: boolean;
   tier?: "default" | "host";
   exposure?: "direct" | "hidden";
 } = {}) {
@@ -56,7 +55,6 @@ function setup(options: {
     appendEntry: vi.fn(),
   } as unknown as ExtensionAPI;
   const recorded = vi.fn();
-  let denied = options.denied !== false;
   const defaultExecute = vi.fn(async () => result);
   const validateElevation = vi.fn(() => true);
   const bypass = createSandboxBypass({
@@ -67,11 +65,10 @@ function setup(options: {
         ? targetDefinition
         : undefined,
     recordExecution: recorded,
-    prepareElevation: () => {
-      if (!denied) return undefined;
-      denied = false;
-      return { tier: options.tier ?? "host", scope: [{ path: "C:/workspace/target.txt", access: "write" }] };
-    },
+    prepareElevation: (_name, _args, tier) => ({
+      tier,
+      scope: [{ path: "C:/workspace/target.txt", access: "write" }],
+    }),
     executeDefault: defaultExecute,
     validateElevation,
   });
@@ -91,6 +88,7 @@ function setup(options: {
     reason: "Need the plugin host capability for this one call.",
     toolName: TARGET,
     arguments: argumentsValue,
+    tier: options.tier ?? "host",
   });
   const execute = (toolCallId = "bypass-call", signal?: AbortSignal, input = requestInput()) => bypass.tool.execute(
     toolCallId,
@@ -120,10 +118,27 @@ function setup(options: {
 afterEach(() => vi.restoreAllMocks());
 
 describe("one-time sandbox bypass tool", () => {
+  it("accepts an explicit Default request without a prior permission denial", async () => {
+    const test = setup({ tier: "default" });
+    test.bypass.setReviewer(async (input) => {
+      expect(input.elevation?.tier).toBe("default");
+      return undefined;
+    });
+
+    await expect(test.execute("first-request", undefined, {
+      ...test.requestInput(),
+      tier: "default",
+    })).resolves.toBe(result);
+
+    expect(test.defaultExecute).toHaveBeenCalledTimes(1);
+    expect(test.targetExecute).not.toHaveBeenCalled();
+  });
+
   it("validates, freezes and executes a registered plugin once after review", async () => {
     const test = setup();
     expect(test.bypass.tool.name).toBe("request_tool_elevation");
-    expect(test.bypass.tool.description).toContain("blocked for insufficient permissions");
+    expect(test.bypass.tool.description).toContain("one-time elevation");
+    expect(test.bypass.tool.parameters.properties).toHaveProperty("tier");
     const original = test.requestInput();
     test.bypass.setReviewer(async (input) => {
       expect(input.targetToolName).toBe(TARGET);
@@ -151,12 +166,7 @@ describe("one-time sandbox bypass tool", () => {
     }));
   });
 
-  it("requires a matching permission denial before review", async () => {
-    const explicit = setup({ denied: false });
-    explicit.bypass.setReviewer(async () => undefined);
-    await expect(explicit.execute()).rejects.toThrow("no-matching-permission-denial");
-    expect(explicit.targetExecute).not.toHaveBeenCalled();
-
+  it("rejects unregistered targets and binds changed arguments", async () => {
     const untrusted = setup({ controlled: false });
     const reviewer = vi.fn(async () => undefined);
     untrusted.bypass.setReviewer(reviewer);
@@ -174,12 +184,17 @@ describe("one-time sandbox bypass tool", () => {
 
   it("rejects unknown, self-targeted, and schema-invalid requests before review", async () => {
     const test = setup();
+    await expect(test.execute("missing-tier-call", undefined, {
+      ...test.requestInput(),
+      tier: undefined,
+    } as never)).rejects.toThrow("sandbox-bypass:invalid-request");
     await expect(test.execute("unknown-call", undefined, { ...test.requestInput(), toolName: "missing-tool" }))
       .rejects.toThrow("sandbox-bypass:unknown-tool");
     await expect(test.execute("self-call", undefined, {
       reason: "self",
       toolName: SANDBOX_BYPASS_TOOL_NAME,
       arguments: {},
+      tier: "host",
     })).rejects.toThrow("sandbox-bypass:self-target-forbidden");
     await expect(test.execute("schema-call", undefined, test.requestInput({ marker: 42 })))
       .rejects.toThrow("sandbox-bypass:arguments-do-not-match");
@@ -273,6 +288,15 @@ describe("one-time sandbox bypass tool", () => {
     expect(test.targetExecute).not.toHaveBeenCalled();
     test.bypass.syncMode("default");
     test.setMode("default");
+    expect(test.getActiveTools()).toContain(SANDBOX_BYPASS_TOOL_NAME);
+  });
+
+  it("resyncs elevation-tool visibility when Sandbox changes in the same mode", () => {
+    const test = setup();
+    test.bypass.syncMode("default", "bypass-session", false);
+    expect(test.getActiveTools()).not.toContain(SANDBOX_BYPASS_TOOL_NAME);
+
+    test.bypass.syncMode("default", "bypass-session", true);
     expect(test.getActiveTools()).toContain(SANDBOX_BYPASS_TOOL_NAME);
   });
 

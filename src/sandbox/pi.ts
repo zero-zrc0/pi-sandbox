@@ -19,6 +19,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 import type { PermissionMode } from "../contracts";
+import { formatPiSandboxError } from "../error-format";
 import { freezeJson, jsonDigest, type JsonObject } from "../json";
 import { builtinToolPath } from "./builtin-path";
 import {
@@ -1061,7 +1062,7 @@ export function createPiExecutionAdapter(
         }
         if (!outcome.dataBase64) throw new ControlledOperationError("sandbox-protocol-error", "builtin result is missing");
         const envelope = JSON.parse(Buffer.from(outcome.dataBase64, "base64").toString("utf8"));
-        if (typeof envelope.error === "string") throw new Error(envelope.error);
+        if (typeof envelope.error === "string") throw new Error(formatPiSandboxError(envelope.error));
         if (!envelope.result || !Array.isArray(envelope.result.content)) throw new ControlledOperationError("sandbox-protocol-error", "builtin result is invalid");
         if (outcome.state !== "completed" && envelope.result.isError !== true) throw new ControlledOperationError(outcome.code, outcome.reason);
         return envelope.result;
@@ -1124,7 +1125,7 @@ export function createPiExecutionAdapter(
         }
         if (!outcome.dataBase64) throw new ControlledOperationError("sandbox-protocol-error", "sandbox tool result is missing");
         const envelope = JSON.parse(Buffer.from(outcome.dataBase64, "base64").toString("utf8"));
-        if (typeof envelope.error === "string") throw new Error(envelope.error);
+        if (typeof envelope.error === "string") throw new Error(formatPiSandboxError(envelope.error));
         if (!envelope.result || !Array.isArray(envelope.result.content)) {
           throw new ControlledOperationError("sandbox-protocol-error", "sandbox tool result is invalid");
         }

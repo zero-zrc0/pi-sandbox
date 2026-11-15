@@ -1,6 +1,6 @@
 import { realpathSync } from "node:fs";
 import { join } from "node:path";
-import type { RuntimeCatalog } from "./runtime-catalog";
+import type { RuntimeCatalog, RuntimeResourceEntry } from "./runtime-catalog";
 import { installRuntimeEntry } from "./runtime-installation";
 import { scanInstalledRuntimes, validateInstalledRuntime, type ResolvedRuntimeFiles } from "./runtime-store";
 import { compareRuntimeVersions, selectRuntime } from "./runtime-selection";
@@ -56,6 +56,7 @@ export class SandboxRuntimeManager {
   prepare(input: {
     readonly workspaceRoot: string;
     readonly signal?: AbortSignal;
+    readonly confirmDownload?: (release: RuntimeResourceEntry) => Promise<boolean>;
     readonly onProgress?: (progress: RuntimeDownloadProgress) => void;
   }): Promise<SandboxRuntimeState> {
     if (this.pending) return this.pending;
@@ -115,6 +116,9 @@ export class SandboxRuntimeManager {
         if (selected.kind === "installed") {
           runtime = await validateInstalledRuntime(selected.runtime);
         } else {
+          if (input.confirmDownload && !(await input.confirmDownload(selected.release))) {
+            throw new Error("runtime download was not confirmed");
+          }
           runtime = await installRuntimeEntry({
             pluginRoot,
             entry: selected.release,

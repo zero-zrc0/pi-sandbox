@@ -60,13 +60,20 @@ export interface HumanRequestFacts extends HumanPromptView {
 /** Default describer: names the tool, the recorded reasons and the options. */
 export function describeHumanRequest(request: HumanRequest): HumanRequestFacts {
   const facts = requestAuditFacts(request, 0);
+  const tier = request.call.hostExecutionRequest?.elevation.tier;
   const reason = summarizeReasons(
     request.summary,
-    facts.escalation ? "one-time host execution was requested" : "no reason was recorded",
+    facts.escalation
+      ? tier === undefined ? "ordinary approvals cannot grant Host execution" : `one-time ${tier} elevation was requested`
+      : "no reason was recorded",
   );
-  const title = facts.escalation
-    ? `Host execution request for ${facts.toolName}. Reason: ${reason}`
-    : `Approve ${facts.toolName} call? Reason: ${reason}`;
+  const title = tier === "host"
+    ? `Host execution request for ${facts.toolName} (outside the OS sandbox). Reason: ${reason}`
+    : tier === "default"
+      ? `Default sandbox elevation request for ${facts.toolName}. Reason: ${reason}`
+      : facts.escalation
+        ? `Ordinary ${facts.toolName} call cannot receive Host execution. Reason: ${reason}`
+        : `Approve ${facts.toolName} call? Reason: ${reason}`;
   return Object.freeze({
     escalation: facts.escalation,
     askFor: facts.askFor,

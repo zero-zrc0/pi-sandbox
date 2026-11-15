@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { ExecutionRequest } from "../../../../src/elevation";
 import type {
   ApprovalContext,
   ChainCallFacts,
@@ -63,7 +64,7 @@ function makeContext(
     readonly mode?: ApprovalContext["mode"];
     readonly channel?: ApprovalContext["channel"];
     readonly accumulated?: Verdict;
-    readonly hostExecutionRequest?: { readonly reason: string };
+    readonly hostExecutionRequest?: ExecutionRequest;
   } = {},
 ): ApprovalContext {
   const unit = makeUnit(options.unit);
@@ -688,7 +689,10 @@ describe("sandbox-default-run stays silent", () => {
   });
 
   it("passes on a host execution request", async () => {
-    const context = makeContext({ hostExecutionRequest: { reason: "bypass" } });
+    const context = makeContext({ hostExecutionRequest: {
+      reason: "bypass",
+      elevation: { tier: "host", scope: [{ path: "/outside/target", access: "write" }] },
+    } });
     expect(await opinion(context)).toEqual({ action: "pass" });
   });
 
