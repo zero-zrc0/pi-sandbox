@@ -246,6 +246,8 @@ export function analyzeBashProgramCalls(input: {
   return { operations, invocations, cwd };
 }
 
+export type BashProgramAnalysis = ReturnType<typeof analyzeBashProgramCalls>;
+
 function languageOperations(view: PowerShellProgramFactsView | undefined): readonly ShellOperationFact[] {
   return view?.analysis.operations ?? [];
 }
@@ -257,12 +259,13 @@ export function shellPolicyUnitDecisions(input: {
   readonly context: StepContext;
   readonly view: PowerShellProgramFactsView | undefined;
   readonly bashView: BashProgramFactsView | undefined;
+  readonly bashAnalysis?: BashProgramAnalysis;
   readonly options: ShellPolicyNodeOptions;
 }): readonly UnitDecision[] {
   if (input.call.units.some((unit) => unit.decision === "deny")) return [];
   const owner = input.node === "builtin/powershell" ? "powershell" : "external-command";
   const bash = input.node === "builtin/external-command" && input.view === undefined
-    ? analyzeBashProgramCalls({ call: input.call, view: input.bashView, platform: input.options.platform })
+    ? input.bashAnalysis ?? analyzeBashProgramCalls({ call: input.call, view: input.bashView, platform: input.options.platform })
     : undefined;
   const operations = (input.view === undefined ? bash?.operations ?? [] : languageOperations(input.view))
     .filter((operation) => operation.owner === owner);

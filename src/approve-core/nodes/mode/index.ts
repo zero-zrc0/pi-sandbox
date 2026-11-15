@@ -20,7 +20,7 @@ import { evaluateShellPolicySubject } from "#approve-core/policy/shell-policy/ev
 import type { ShellEffect, ShellOperationFact } from "#approve-core/policy/shell-policy/facts";
 import type { ShellExecutionPermissions } from "#config/execution-source-schema";
 import type { ProgramInvocation } from "#approve-core/policy/shell-policy/facts";
-import { analyzeBashProgramCalls } from "#approve-core/nodes/shell-policy";
+import { analyzeBashProgramCalls, type BashProgramAnalysis } from "#approve-core/nodes/shell-policy";
 
 /**
  * Access facts for the responsibility chain (chain/facts/shell.ts).
@@ -428,8 +428,9 @@ export async function bashAccessFactsForView(
   call: CallState,
   view: BashProgramFactsView | undefined,
   options: ModeNodeOptions,
+  precomputed?: BashProgramAnalysis,
 ): Promise<ReadonlyMap<string, readonly AccessFact[]> | undefined> {
-  const facts = await bashFactsForView(call, view, options);
+  const facts = await bashFactsForView(call, view, options, precomputed);
   return facts?.byUnit;
 }
 
@@ -437,10 +438,11 @@ async function bashFactsForView(
   call: CallState,
   view: BashProgramFactsView | undefined,
   options: ModeNodeOptions,
+  precomputed?: BashProgramAnalysis,
 ): Promise<ShellModeFacts | undefined> {
   const command = call.arguments.command;
   if (view === undefined || typeof command !== "string" || view.commandText !== command) return undefined;
-  const analysis = analyzeBashProgramCalls({ call, view, platform: options.platform });
+  const analysis = precomputed ?? analyzeBashProgramCalls({ call, view, platform: options.platform });
   const facts = shellAccessFacts(call, {
     shell: "bash",
     cwd: analysis.cwd,

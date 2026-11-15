@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   applyNodeResult,
   captureStep,
@@ -16,6 +16,8 @@ import { PathNormalizer } from "#approve-core/utils/path/path-normalizer";
 import { POSIX_PATH_FLAVOR as POSIX } from "#approve-core/utils/path/path-flavor";
 import type { Rule } from "#approve-core/policy/rule";
 import { jsonDigest } from "../../../src/json";
+import * as shellPolicyModule from "#approve-core/nodes/shell-policy";
+import * as shellFactsModule from "#approve-core/chain/facts/shell";
 
 const CWD = "/work/project";
 
@@ -31,6 +33,7 @@ interface RunOptions {
   readonly defaultPolicy?: "ask" | "sandbox-run";
   readonly sandboxRun?: SandboxRunCapability;
   readonly additionalLocalPaths?: readonly string[];
+  readonly enabledShellNodes?: readonly string[];
 }
 
 /**
@@ -87,6 +90,7 @@ async function decide(command: string, options: RunOptions = {}): Promise<CallSu
     ...(options.sessionReviews === undefined ? {} : { sessionReviews: options.sessionReviews }),
     ...(options.sandboxRun === undefined ? {} : { sandboxRun: options.sandboxRun }),
     ...(options.additionalLocalPaths === undefined ? {} : { additionalLocalPaths: options.additionalLocalPaths }),
+    ...(options.enabledShellNodes === undefined ? {} : { enabledShellNodes: options.enabledShellNodes }),
     ...(options.defaultPolicy === undefined
       ? {}
       : { shellPolicy: { version: 1 as const, rules: [], modes: { default: { defaultPolicy: options.defaultPolicy }, "auto-review": { defaultPolicy: options.defaultPolicy } } } }),
@@ -124,6 +128,25 @@ function rule(overrides: Partial<Rule> & Pick<Rule, "pattern" | "action">): Rule
 }
 
 describe("decision node: default mode", () => {
+  it("projects Bash operations once for access, danger, and shell-policy checks", async () => {
+    const analyze = vi.spyOn(shellPolicyModule, "analyzeBashProgramCalls");
+    const evaluatePolicy = vi.spyOn(shellPolicyModule, "shellPolicyUnitDecisions");
+    const project = vi.spyOn(shellFactsModule, "projectShellFacts");
+    try {
+      await decide("echo hi > out.txt", { enabledShellNodes: ["builtin/external-command"] });
+
+      expect(evaluatePolicy).toHaveBeenCalledTimes(1);
+      expect(analyze).toHaveBeenCalledTimes(1);
+      expect(evaluatePolicy.mock.calls[0]?.[0].bashAnalysis).toBe(
+        (await project.mock.results[0]?.value)?.bashAnalysis,
+      );
+    } finally {
+      project.mockRestore();
+      evaluatePolicy.mockRestore();
+      analyze.mockRestore();
+    }
+  });
+
   it.each([
     "ls",
     "cat README.md",

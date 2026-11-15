@@ -23,6 +23,7 @@ import type { RuntimeFileEntry, RuntimeFileRole } from "#sandbox/runtime-catalog
 import type { ResolvedRuntimeFiles } from "#sandbox/runtime-store";
 import { runWithApprovedCodemode } from "#sandbox/codemode/approval-scope";
 import type { AnyToolDefinition } from "#sandbox/pi";
+import type { ExecutionOutcome, ExecutionRecord } from "#sandbox/types";
 import { createTestLayout, makeController, removeTestLayout, waitFor, waitForProcessGone } from "./fixtures/harness";
 import { PROTECTED_CONTROL_DIRECTORY_NAMES } from "#sandbox/path";
 import { prepareWindowsRuntimeExecutable } from "#sandbox/runtime-windows-integrity";
@@ -1483,6 +1484,109 @@ describe("sandbox-hosted tools through the controlled executor (design §6)", ()
   function textOf(result: { content: readonly { type: string; text?: string }[] }): string {
     return result.content.filter((item) => item.type === "text").map((item) => item.text ?? "").join("");
   }
+
+  function workerOutcome(envelope: unknown, state: "completed" | "failed" = "completed"): ExecutionOutcome {
+    const base = {
+      stdout: "",
+      stderr: "",
+      truncated: false,
+      record: {} as ExecutionRecord,
+      dataBase64: Buffer.from(JSON.stringify(envelope), "utf8").toString("base64"),
+    };
+    return state === "completed"
+      ? { ...base, state, started: true, exitCode: 0 }
+      : { ...base, state, started: true, code: "execution-failed", reason: "worker reported failure", impact: "none" };
+  }
+
+  it("shares update framing and result envelope decoding between both tool adapters", async () => {
+    const rig = setup();
+    const finalResult = { content: [{ type: "text", text: "final result" }], details: { source: "worker" }, isError: false };
+    const execute = vi.spyOn(ExecutionController.prototype, "execute").mockImplementation(async input => {
+      input.onOutput?.({ stream: "stderr", data: "{\"ignored\":true}\n" });
+      input.onOutput?.({ stream: "stdout", data: "{\"type\":\"update\",\"value\":" });
+      input.onOutput?.({ stream: "stdout", data: "1}\n\n{\"type\":\"update\",\"value\":2}\n" });
+      return workerOutcome({ result: finalResult });
+    });
+
+    try {
+      writeFileSync(join(rig.layout.workspace, "worker-update.txt"), "seed", "utf8");
+      const builtinCall = { type: "tool_call" as const, toolName: "read", toolCallId: "updates-builtin", input: { path: "worker-update.txt" } };
+      expect(await rig.execution.guard(builtinCall, rig.ctx, async () => undefined)).toBeUndefined();
+      const builtinUpdates: unknown[] = [];
+      const builtinResult = await rig.definitions.get("read")!.execute(
+        builtinCall.toolCallId,
+        builtinCall.input,
+        undefined,
+        update => { builtinUpdates.push(update); },
+        rig.ctx,
+      );
+
+      writeFileSync(join(rig.layout.workspace, "update-tool.mjs"), "export async function execute() { return { content: [] }; }\n", "utf8");
+      configureSandboxRules(rig, [{
+        id: "allow-update-tool",
+        match: { tool: "update_tool" },
+        decision: "allow",
+        sandbox: { path: "./update-tool.mjs" },
+      }]);
+      await rig.emit("session_start", rig.ctx, { type: "session_start", reason: "startup" });
+      const sandboxCall = { type: "tool_call" as const, toolName: "update_tool", toolCallId: "updates-sandbox-tool", input: {} };
+      expect(await rig.execution.guard(sandboxCall, rig.ctx, async () => undefined)).toBeUndefined();
+      const sandboxUpdates: unknown[] = [];
+      const sandboxResult = await rig.definitions.get("update_tool")!.execute(
+        sandboxCall.toolCallId,
+        sandboxCall.input,
+        undefined,
+        update => { sandboxUpdates.push(update); },
+        rig.ctx,
+      );
+
+      expect(builtinUpdates).toEqual([{ type: "update", value: 1 }, { type: "update", value: 2 }]);
+      expect(sandboxUpdates).toEqual(builtinUpdates);
+      expect(builtinResult).toEqual(finalResult);
+      expect(sandboxResult).toEqual(finalResult);
+    } finally {
+      execute.mockRestore();
+    }
+  });
+
+  it("preserves the built-in and declared-tool failed-result acceptance difference", async () => {
+    const rig = setup();
+    const acceptedResult = { content: [{ type: "text", text: "failed result" }], isError: true };
+    const unmarkedResult = { content: [{ type: "text", text: "unmarked" }], isError: false };
+    const outcomes = [
+      workerOutcome({ result: acceptedResult }, "failed"),
+      workerOutcome({ result: unmarkedResult }, "failed"),
+      workerOutcome({ result: unmarkedResult }, "failed"),
+    ];
+    const execute = vi.spyOn(ExecutionController.prototype, "execute").mockImplementation(async () => outcomes.shift()!);
+
+    try {
+      writeFileSync(join(rig.layout.workspace, "worker-failure.txt"), "seed", "utf8");
+      const firstBuiltin = { type: "tool_call" as const, toolName: "read", toolCallId: "failed-builtin-marked", input: { path: "worker-failure.txt" } };
+      expect(await rig.execution.guard(firstBuiltin, rig.ctx, async () => undefined)).toBeUndefined();
+      expect(await rig.definitions.get("read")!.execute(firstBuiltin.toolCallId, firstBuiltin.input, undefined, undefined, rig.ctx)).toEqual(acceptedResult);
+
+      const secondBuiltin = { ...firstBuiltin, toolCallId: "failed-builtin-unmarked" };
+      expect(await rig.execution.guard(secondBuiltin, rig.ctx, async () => undefined)).toBeUndefined();
+      await expect(rig.definitions.get("read")!.execute(secondBuiltin.toolCallId, secondBuiltin.input, undefined, undefined, rig.ctx))
+        .rejects.toThrow("worker reported failure");
+
+      writeFileSync(join(rig.layout.workspace, "unmarked-tool.mjs"), "export async function execute() { return { content: [] }; }\n", "utf8");
+      configureSandboxRules(rig, [{
+        id: "allow-unmarked-tool",
+        match: { tool: "unmarked_tool" },
+        decision: "allow",
+        sandbox: { path: "./unmarked-tool.mjs" },
+      }]);
+      await rig.emit("session_start", rig.ctx, { type: "session_start", reason: "startup" });
+      const sandboxCall = { type: "tool_call" as const, toolName: "unmarked_tool", toolCallId: "failed-sandbox-unmarked", input: {} };
+      expect(await rig.execution.guard(sandboxCall, rig.ctx, async () => undefined)).toBeUndefined();
+      expect(await rig.definitions.get("unmarked_tool")!.execute(sandboxCall.toolCallId, sandboxCall.input, undefined, undefined, rig.ctx))
+        .toEqual(unmarkedResult);
+    } finally {
+      execute.mockRestore();
+    }
+  });
 
   it("runs a declared tool in the helper and keeps its state across calls", async () => {
     const rig = setup();

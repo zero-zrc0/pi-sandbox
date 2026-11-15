@@ -554,8 +554,8 @@ describe("default mode decision table", () => {
 
 describe("one-time host execution request", () => {
   it("escalates to a human in default mode", async () => {
-    const result = await decideUnit(unit({ access: [] }), {
-      hostExecution: "request_sandbox_bypass",
+    const result = await decideUnit(unit({ access: [{ kind: "write", path: "/outside/target", external: true }] }), {
+      hostExecution: "write the requested external file",
     });
 
     expect(result.verdict.state).toBe("ask");
@@ -566,34 +566,33 @@ describe("one-time host execution request", () => {
     expect(result.verdict.reason).toMatch(/^mode:/);
   });
 
-  it("is denied in read-only mode", async () => {
-    const result = await decideUnit(unit({ access: [{ kind: "write" }] }), {
+  it("asks for explicit Host execution in read-only mode", async () => {
+    const result = await decideUnit(unit({ access: [{ kind: "write", path: "/outside/target", external: true }] }), {
       mode: "read-only",
-      hostExecution: "request_sandbox_bypass",
+      hostExecution: "write the requested external file",
     });
 
-    expect(result.verdict.state).toBe("deny");
-    expect(result.verdict.reason).toBe("mode:read-only:host-execution-forbidden");
-    expect(result.units[0].steps.map((step) => step.handlerId)).toEqual([
-      "builtin/mode-base",
-    ]);
+    expect(result.verdict.state).toBe("ask");
+    expect(result.verdict.askFor).toBe("escalate");
+    expect(result.verdict.reason).toBe("mode:read-only:one-time-host-execution");
+    expect(result.units[0].steps.map((step) => step.handlerId)).toEqual(defaultStepIds);
   });
 
-  it("is allowed in full-access mode", async () => {
-    const result = await decideUnit(unit({ access: [] }), {
+  it("asks to approve explicit Host execution in full-access mode", async () => {
+    const result = await decideUnit(unit({ access: [{ kind: "write", path: "/outside/target", external: true }] }), {
       mode: "full-access",
-      hostExecution: "request_sandbox_bypass",
+      hostExecution: "write the requested external file",
     });
 
-    expect(result.verdict.state).toBe("allow");
-    expect(result.verdict.reason).toBe("mode:full-access:host-execution-allow");
-    expect(isResolverEligible(result.verdict)).toBe(false);
+    expect(result.verdict.state).toBe("ask");
+    expect(result.verdict.askFor).toBe("escalate");
+    expect(result.verdict.reason).toBe("mode:full-access:one-time-host-execution");
   });
 
   it("cannot be upgraded by an explicit allow rule", async () => {
     const result = await decideUnit(
-      unit({ access: [], rule: rule("allow", "*") }),
-      { hostExecution: "request_sandbox_bypass" },
+      unit({ access: [{ kind: "write", path: "/outside/target", external: true }], rule: rule("allow", "*") }),
+      { hostExecution: "write the requested external file" },
     );
 
     expect(result.verdict.state).toBe("ask");

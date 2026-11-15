@@ -58,6 +58,7 @@ import {
 } from "#sandbox/validity";
 import {
   ControlledOperationError,
+  type OperationOutputChunk,
   type OperationRunOptions,
 } from "#sandbox/operations";
 import { isPathWithin, isSamePath, normalizeHostPath } from "#sandbox/path";
@@ -195,6 +196,35 @@ export interface PiExecutionAdapter {
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type AnyToolDefinition = ToolDefinition<any, any, any>;
+
+function createWorkerResultReceiver(
+  kind: "builtin" | "sandbox-tool",
+  onUpdate: Parameters<AnyToolDefinition["execute"]>[3],
+) {
+  let pending = "";
+  const label = kind === "builtin" ? "builtin result" : "sandbox tool result";
+  return {
+    onOutput(chunk: OperationOutputChunk): void {
+      if (chunk.stream !== "stdout") return;
+      pending += chunk.data;
+      let end: number;
+      while ((end = pending.indexOf("\n")) >= 0) {
+        const line = pending.slice(0, end);
+        pending = pending.slice(end + 1);
+        if (line) onUpdate?.(JSON.parse(line));
+      }
+    },
+    decode(dataBase64: string | undefined) {
+      if (!dataBase64) throw new ControlledOperationError("sandbox-protocol-error", `${label} is missing`);
+      const envelope = JSON.parse(Buffer.from(dataBase64, "base64").toString("utf8"));
+      if (typeof envelope.error === "string") throw new Error(formatPiSandboxError(envelope.error));
+      if (!envelope.result || !Array.isArray(envelope.result.content)) {
+        throw new ControlledOperationError("sandbox-protocol-error", `${label} is invalid`);
+      }
+      return envelope.result;
+    },
+  };
+}
 
 /**
  * One live claim on a session's identity.
@@ -1032,7 +1062,7 @@ export function createPiExecutionAdapter(
       const run = async () => {
         const call = callStorage.getStore();
         if (!call) throw new ControlledOperationError("approved-action-unavailable", "builtin ran outside a bound call");
-        let pending = "";
+        const receiver = createWorkerResultReceiver("builtin", onUpdate);
         const context = freezeJson({
           sessionId: ctx.sessionManager.getSessionId(),
           ...(options.plan.backendId === "windows-mxc" && (name === "write" || name === "edit")
@@ -1048,24 +1078,15 @@ export function createPiExecutionAdapter(
             typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0
             ? { timeoutMs: Math.ceil(timeout * 1000) } : {}),
           onOutput: chunk => {
-            if (chunk.stream !== "stdout") return;
-            pending += chunk.data;
-            let end: number;
-            while ((end = pending.indexOf("\n")) >= 0) {
-              const line = pending.slice(0, end); pending = pending.slice(end + 1);
-              if (line) onUpdate?.(JSON.parse(line));
-            }
+            receiver.onOutput(chunk);
           },
         });
         if (outcome.state !== "completed" && !(outcome.code === "execution-failed" && outcome.dataBase64)) {
           throw new ControlledOperationError(outcome.code, outcome.reason);
         }
-        if (!outcome.dataBase64) throw new ControlledOperationError("sandbox-protocol-error", "builtin result is missing");
-        const envelope = JSON.parse(Buffer.from(outcome.dataBase64, "base64").toString("utf8"));
-        if (typeof envelope.error === "string") throw new Error(formatPiSandboxError(envelope.error));
-        if (!envelope.result || !Array.isArray(envelope.result.content)) throw new ControlledOperationError("sandbox-protocol-error", "builtin result is invalid");
-        if (outcome.state !== "completed" && envelope.result.isError !== true) throw new ControlledOperationError(outcome.code, outcome.reason);
-        return envelope.result;
+        const result = receiver.decode(outcome.dataBase64);
+        if (outcome.state !== "completed" && result.isError !== true) throw new ControlledOperationError(outcome.code, outcome.reason);
+        return result;
       };
       if (name === "write" || name === "edit") {
         const path = resolveHostPathIdentity(builtinToolPath(name, (args as { path: string }).path, ctx.cwd));
@@ -1093,7 +1114,7 @@ export function createPiExecutionAdapter(
       ) => {
         const call = callStorage.getStore();
         if (!call) throw new ControlledOperationError("approved-action-unavailable", "sandbox tool ran outside a bound call");
-        let pending = "";
+        const receiver = createWorkerResultReceiver("sandbox-tool", onUpdate);
         const outcome = await runOperation(call, {
           kind: "sandbox-tool",
           name: spec.name,
@@ -1110,26 +1131,13 @@ export function createPiExecutionAdapter(
           cwd: ctx.cwd,
           timeoutMs: SANDBOX_TOOL_TIMEOUT_MS,
           onOutput: chunk => {
-            if (chunk.stream !== "stdout") return;
-            pending += chunk.data;
-            let end: number;
-            while ((end = pending.indexOf("\n")) >= 0) {
-              const line = pending.slice(0, end);
-              pending = pending.slice(end + 1);
-              if (line) onUpdate?.(JSON.parse(line));
-            }
+            receiver.onOutput(chunk);
           },
         });
         if (outcome.state !== "completed" && !(outcome.code === "execution-failed" && outcome.dataBase64)) {
           throw new ControlledOperationError(outcome.code, sandboxToolFailureReason(outcome));
         }
-        if (!outcome.dataBase64) throw new ControlledOperationError("sandbox-protocol-error", "sandbox tool result is missing");
-        const envelope = JSON.parse(Buffer.from(outcome.dataBase64, "base64").toString("utf8"));
-        if (typeof envelope.error === "string") throw new Error(formatPiSandboxError(envelope.error));
-        if (!envelope.result || !Array.isArray(envelope.result.content)) {
-          throw new ControlledOperationError("sandbox-protocol-error", "sandbox tool result is invalid");
-        }
-        return envelope.result;
+        return receiver.decode(outcome.dataBase64);
       },
     } as unknown as Parameters<typeof controlledDefinition>[0]) as AnyToolDefinition;
   }

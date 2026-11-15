@@ -42,7 +42,7 @@ import {
   type AccessFact,
   type ModeNodeOptions,
 } from "#approve-core/nodes/mode";
-import { analyzeBashProgramCalls } from "#approve-core/nodes/shell-policy";
+import { analyzeBashProgramCalls, type BashProgramAnalysis } from "#approve-core/nodes/shell-policy";
 import type { ShellPolicyPathVariables } from "#approve-core/policy/shell-policy/evaluate";
 import type { PowerShellProgramFactsView } from "#approve-core/utils/access-intent/powershell/analysis";
 import type { ShellExecutionPermissions } from "#config/execution-source-schema";
@@ -70,6 +70,7 @@ export interface ShellFactsOptions {
 export interface ShellFactsProjection {
   readonly cwd: string;
   readonly shell: "bash" | "powershell";
+  readonly bashAnalysis?: BashProgramAnalysis;
   readonly access: ReadonlyMap<string, readonly UnitAccessFact[]>;
   readonly dangers: readonly DangerHit[];
 }
@@ -129,10 +130,11 @@ async function projectBashFacts(
   const platform = options.platform ?? process.platform;
   const analysis = analyzeBashProgramCalls({ call, view, platform });
   const cwd = effectiveCwd(analysis.cwd, options.cwd);
-  const access = await bashAccessFactsForView(call, view, modeNodeOptions(options, cwd));
+  const access = await bashAccessFactsForView(call, view, modeNodeOptions(options, cwd), analysis);
   return freezeProjection({
     cwd,
     shell: "bash",
+    bashAnalysis: analysis,
     access: coverUnits(call, access),
     dangers: detectDangers({
       shell: "bash",

@@ -524,6 +524,24 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     return [{ path: project, access: "write" }, { path: workspace, access: "write" }];
   }
 
+  function elevationScope(
+    target: NonNullable<ReturnType<typeof fileTarget>>,
+    accesses: readonly ("read" | "write")[],
+    tier: ToolElevation["tier"],
+    ctx: ExtensionContext,
+  ):
+    | { readonly ok: true; readonly elevation: ToolElevation }
+    | { readonly ok: false; readonly reason: "default-scope-unverifiable" | "default-scope-exceeds-project-and-session-workspace" } {
+    const scope = tier === "default"
+      ? defaultWriteScope(ctx)
+      : accesses.map(access => ({ path: target.path, access }));
+    if (scope === null) return { ok: false, reason: "default-scope-unverifiable" };
+    if (tier === "default" && !scope.some(grant => isPathWithin(grant.path, target.path))) {
+      return { ok: false, reason: "default-scope-exceeds-project-and-session-workspace" };
+    }
+    return { ok: true, elevation: { tier, scope } };
+  }
+
   function fileElevation(
     name: string,
     args: Record<string, unknown>,
@@ -534,12 +552,8 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     if (target === undefined || target === null || findProtectedControlRoot(target.path) !== null) return undefined;
     const accesses = missingFileAccesses(target, ctx);
     if (accesses === null || accesses.length === 0) return undefined;
-    if (tier === "default") {
-      const scope = defaultWriteScope(ctx);
-      if (scope === null || !scope.some(grant => isPathWithin(grant.path, target.path))) return undefined;
-      return { tier, scope };
-    }
-    return { tier, scope: accesses.map(access => ({ path: target.path, access })) };
+    const scope = elevationScope(target, accesses, tier, ctx);
+    return scope.ok ? scope.elevation : undefined;
   }
   function ordinaryFileScopeBlock(name: string, args: Record<string, unknown>, ctx: ExtensionContext): Block | undefined {
     const current = snapshot(ctx);
@@ -559,6 +573,8 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     const workspace = resolveHostPathIdentity(ctx.cwd);
     if (workspace === null) return { block: true, reason: "permission:workspace-path-unverifiable" };
     const tier = isPathWithin(workspace, target.path) ? "default" : "host";
+    const scope = elevationScope(target, accesses, tier, ctx);
+    if (!scope.ok) return { block: true, reason: `permission:${scope.reason}:${target.path}` };
     return {
       block: true,
       reason: `permission:elevation-required:${accesses.join("+")} ${target.path}; call request_tool_elevation with toolName "${name}", unchanged complete arguments, a reason, and tier "${tier}"`,
@@ -584,14 +600,14 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       const accesses = missingFileAccesses(target, ctx);
       if (accesses === null) return { block: true, reason: "sandbox-bypass:baseline-path-unverifiable" };
       if (accesses.length === 0) return { block: true, reason: `sandbox-bypass:elevation-not-needed:${target.path}` };
-      const scope = tier === "default" ? defaultWriteScope(ctx) : null;
-      if (tier === "default" && scope === null) {
-        return { block: true, reason: "sandbox-bypass:default-scope-unverifiable" };
-      }
-      if (scope !== null && !scope.some(grant => isPathWithin(grant.path, target.path))) {
+      const scope = elevationScope(target, accesses, tier, ctx);
+      if (!scope.ok) {
+        if (scope.reason === "default-scope-unverifiable") {
+          return { block: true, reason: "sandbox-bypass:default-scope-unverifiable" };
+        }
         return { block: true, reason: `sandbox-bypass:default-scope-exceeds-project-and-session-workspace:${target.path}; request tier host for this target` };
       }
-      return { tier, scope: scope ?? accesses.map(access => ({ path: target.path, access })) };
+      return scope.elevation;
     },
     validateElevation(name: string, args: JsonObject, elevation: ToolElevation, ctx: ExtensionToolContext): boolean {
       const current = fileElevation(name, args, elevation.tier, ctx);

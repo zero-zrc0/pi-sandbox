@@ -38,7 +38,7 @@ import type { PathFlavor } from "#approve-core/utils/path/path-flavor";
 import type { BashProgramProvider } from "#approve-core/nodes/analysis";
 import type { AssessmentResolver } from "#approve-core/nodes/assessment";
 import { deriveAccessFacts } from "#approve-core/nodes/mode";
-import { shellPolicyUnitDecisions } from "#approve-core/nodes/shell-policy";
+import { shellPolicyUnitDecisions, type BashProgramAnalysis } from "#approve-core/nodes/shell-policy";
 import { decideCall } from "#approve-core/chain/decide";
 import { createDefaultChainHandlers } from "#approve-core/chain/defaults";
 import { createFallbackHandler } from "#approve-core/chain/handlers/fallback";
@@ -318,7 +318,7 @@ async function decideOneCall(
       : { hostExecutionRequest: call.hostExecutionRequest }),
   };
 
-  const policyOpinions = shellPolicyOpinions(call, context, options, derived.platform);
+  const policyOpinions = shellPolicyOpinions(call, context, options, derived.platform, shell?.bashAnalysis);
   const modeOverrides = modeOverrideOpinions(options.mode, units, policyOpinions, options);
   const channel: ChainChannel = call.hostExecutionRequest === undefined ? "normal" : "elevation";
   const assessment = await assessmentOpinions(call, context, options);
@@ -405,6 +405,7 @@ function shellPolicyOpinions(
   context: StepContext,
   options: DecisionNodeOptions,
   platform: NodeJS.Platform,
+  bashAnalysis?: BashProgramAnalysis,
 ): ReadonlyMap<string, UnitOpinion> {
   const enabled = options.enabledShellNodes ?? [];
   const opinions = new Map<string, UnitOpinion>();
@@ -442,6 +443,7 @@ function shellPolicyOpinions(
       context,
       view: context.powershellPrograms?.[call.toolCallId],
       bashView: context.bashPrograms?.[call.toolCallId],
+      ...(bashAnalysis === undefined ? {} : { bashAnalysis }),
       options: nodeOptions,
     }));
   }
