@@ -54,6 +54,7 @@ export interface ModeNodeOptions {
   readonly commandEffects?: unknown;
   readonly shellPolicy?: ShellPolicy;
   readonly shellPathVariables?: ShellPolicyPathVariables;
+  readonly additionalLocalPaths?: readonly string[];
   readonly enabledShellNodes?: readonly string[];
   readonly shellGrants?: ShellExecutionPermissions;
   /**
@@ -94,9 +95,10 @@ function isExternal(
   path: string,
   cwd: string,
   platform: NodeJS.Platform,
+  additionalLocalPaths: readonly string[] = [],
 ): boolean {
   const candidate = isAbsolute(path) ? path : resolve(cwd, path);
-  return !isWithin(candidate, cwd, platform);
+  return ![cwd, ...additionalLocalPaths].some(root => isWithin(candidate, root, platform));
 }
 
 function shellWriteGrantCovers(
@@ -104,9 +106,11 @@ function shellWriteGrantCovers(
   cwd: string,
   platform: NodeJS.Platform,
   grants: ShellExecutionPermissions | undefined,
+  additionalLocalPaths: readonly string[] = [],
 ): boolean {
-  if (grants === undefined) return false;
   const target = isAbsolute(path) ? path : resolve(cwd, path);
+  if ([cwd, ...additionalLocalPaths].some(root => isWithin(target, root, platform))) return true;
+  if (grants === undefined) return false;
   return grants.filesystem.write.some((grant) => {
     const root = isAbsolute(grant.path) ? grant.path : resolve(cwd, grant.path);
     return grant.granularity === "file"
@@ -123,6 +127,7 @@ async function shellFacts(
   getBashProgram?: BashProgramProvider,
   commandEffects?: unknown,
   shellGrants?: ShellExecutionPermissions,
+  additionalLocalPaths: readonly string[] = [],
 ): Promise<readonly AccessFact[]> {
   const facts: AccessFact[] = [];
   // The step's shared per-call parse when the host injected a
@@ -132,7 +137,7 @@ async function shellFacts(
   const program = provided ??
     await BashProgram.parse(
       command,
-      new PathNormalizer(pathFlavorForPlatform(platform), cwd),
+      new PathNormalizer(pathFlavorForPlatform(platform), cwd, { additionalLocalPaths }),
       { pathFacts: bashPathFacts, commandEffects },
     );
   const commands = program.commands();
@@ -156,7 +161,8 @@ async function shellFacts(
   }
   for (const external of program.externalAccesses()) {
     const externalWrite = external.effect.effect === "write" &&
-      !shellWriteGrantCovers(external.path.value(), cwd, platform, shellGrants);
+      isExternal(external.path.value(), cwd, platform, additionalLocalPaths) &&
+      !shellWriteGrantCovers(external.path.value(), cwd, platform, shellGrants, additionalLocalPaths);
     facts.push({
       kind: external.effect.effect === "read"
         ? "read"
@@ -190,6 +196,7 @@ function pathFact(
   kind: "read" | "write",
   cwd: string,
   platform: NodeJS.Platform,
+  additionalLocalPaths: readonly string[] = [],
 ): readonly AccessFact[] {
   const path = call.arguments.path;
   if (typeof path !== "string" || path.trim().length === 0) {
@@ -198,7 +205,7 @@ function pathFact(
   return [{
     kind,
     path,
-    external: isExternal(path, cwd, platform),
+    external: isExternal(path, cwd, platform, additionalLocalPaths),
   }];
 }
 
@@ -319,11 +326,11 @@ function shellAccessFacts(
             else for (const target of paths) facts.push({
               kind: "write",
               path: target.path,
-              external: isExternal(target.path, operationSet.cwd, options.platform ?? process.platform) &&
+              external: isExternal(target.path, operationSet.cwd, options.platform ?? process.platform, options.additionalLocalPaths) &&
                 (operationSet.shell === "powershell" && effect === "file.delete" ||
-                  !shellWriteGrantCovers(target.path, operationSet.cwd, options.platform ?? process.platform, options.shellGrants)),
+                  !shellWriteGrantCovers(target.path, operationSet.cwd, options.platform ?? process.platform, options.shellGrants, options.additionalLocalPaths)),
               externalDelete: operationSet.shell === "powershell" && effect === "file.delete" &&
-                isExternal(target.path, operationSet.cwd, options.platform ?? process.platform),
+                isExternal(target.path, operationSet.cwd, options.platform ?? process.platform, options.additionalLocalPaths),
             });
           }
         } else if (effect === "file.read") {
@@ -338,7 +345,7 @@ function shellAccessFacts(
               for (const target of paths) facts.push({
                 kind: "read",
                 path: target.path,
-                external: isExternal(target.path, operationSet.cwd, options.platform ?? process.platform),
+                external: isExternal(target.path, operationSet.cwd, options.platform ?? process.platform, options.additionalLocalPaths),
               });
             }
           }
@@ -457,7 +464,7 @@ async function bashFactsForView(
  */
 export async function deriveAccessFacts(
   call: CallState,
-  options: Pick<ModeNodeOptions, "cwd" | "platform" | "getBashProgram" | "commandEffects" | "shellGrants"> = {},
+  options: Pick<ModeNodeOptions, "cwd" | "platform" | "getBashProgram" | "commandEffects" | "shellGrants" | "additionalLocalPaths"> = {},
 ): Promise<readonly AccessFact[]> {
   const cwd = options.cwd ?? process.cwd();
   const platform = options.platform ?? process.platform;
@@ -468,7 +475,7 @@ export async function deriveAccessFacts(
       return [{ kind: "unknown" }];
     }
     try {
-      return await shellFacts(call, command, cwd, platform, options.getBashProgram, options.commandEffects, options.shellGrants);
+      return await shellFacts(call, command, cwd, platform, options.getBashProgram, options.commandEffects, options.shellGrants, options.additionalLocalPaths);
     } catch {
       return [{ kind: "unknown" }];
     }
@@ -476,13 +483,13 @@ export async function deriveAccessFacts(
   if (kind === "path") {
     if (call.toolName === "read" || call.toolName === "grep" ||
         call.toolName === "find" || call.toolName === "ls") {
-      return pathFact(call, "read", cwd, platform);
+      return pathFact(call, "read", cwd, platform, options.additionalLocalPaths);
     }
-    if (call.toolName === "write") return pathFact(call, "write", cwd, platform);
+    if (call.toolName === "write") return pathFact(call, "write", cwd, platform, options.additionalLocalPaths);
     if (call.toolName === "edit") {
       return [
-        ...pathFact(call, "read", cwd, platform),
-        ...pathFact(call, "write", cwd, platform),
+        ...pathFact(call, "read", cwd, platform, options.additionalLocalPaths),
+        ...pathFact(call, "write", cwd, platform, options.additionalLocalPaths),
       ];
     }
   }

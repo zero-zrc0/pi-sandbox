@@ -9,6 +9,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { CodemodeResult, CodemodeTool } from "@earendil-works/pi-codemode";
 import type { Usage } from "@earendil-works/pi-ai";
+import { formatPiSandboxError } from "../../error-format";
 import { parseCodemodeSource } from "@earendil-works/pi-codemode";
 import { renderToolSample, toCodemodeIdentifier } from "@earendil-works/pi-codemode/declarations";
 import { CODEMODE_RUNTIME_LIMITS } from "./limits";
@@ -258,7 +259,7 @@ function formatScriptOutput(
   if (consoleLines.length > 0) {
     formatted.push({ type: "text", text: `<console_output>\n${consoleLines.join("\n")}\n</console_output>` });
   }
-  if (!result.ok) formatted.push({ type: "text", text: `Script error:\n${formatScriptError(result, calls)}` });
+  if (!result.ok) formatted.push({ type: "text", text: formatPiSandboxError(`Script error:\n${formatScriptError(result, calls)}`) });
   if (generatedImages > 0 && !formatted.some(item => item.type === "image")) {
     formatted.push({
       type: "text",
@@ -331,7 +332,7 @@ async function saveImages(items: CodemodeResult["output"]): Promise<CodemodeResu
           const path = await writeOutputFile(extension, bytes);
           return `[Image saved to ${path} (${kind})]`;
         } catch (error) {
-          return `[Image (${kind}) could not be saved: ${errorMessage(error)}]`;
+          return formatPiSandboxError(`Image (${kind}) could not be saved: ${errorMessage(error)}`);
         }
       })();
       labels.set(item.data, label);
@@ -361,7 +362,7 @@ async function truncateOutput(items: CodemodeResult["output"], maxTokens: number
     fullOutputPath = await writeOutputFile(".txt", combined);
     text += `\n\n[Full output: ${fullOutputPath} (read with offset/limit)]`;
   } catch (error) {
-    text += `\n\n[Could not save the full output: ${errorMessage(error)}]`;
+    text += `\n\n${formatPiSandboxError(`Could not save the full output: ${errorMessage(error)}`)}`;
   }
   return {
     items: [{ type: "text", text }, ...items.filter(item => item.type === "image")],
@@ -385,7 +386,7 @@ function formatScriptError(result: Extract<CodemodeResult, { ok: false }>, calls
 }
 
 function toolError(toolName: string, message: string): Error {
-  return new Error(message || `Tool "${toolName}" failed`);
+  return new Error(formatPiSandboxError(message || `Tool "${toolName}" failed`));
 }
 
 function addUsage(current: Usage | undefined, next: Usage): Usage {
@@ -538,7 +539,7 @@ export function createCodemodeHostToolExecutor(
             .filter(block => block.type === "text")
             .map(block => block.text)
             .join("\n");
-          record.error = truncate(text || `Tool "${toolName}" failed`, 500);
+          record.error = formatPiSandboxError(truncate(text || `Tool "${toolName}" failed`, 500));
         } else {
           const modelResult = display && outcome.result.structuredContent &&
             typeof outcome.result.structuredContent === "object"
@@ -549,7 +550,7 @@ export function createCodemodeHostToolExecutor(
             : modelResult?.stopReason === "aborted"
               ? "cancelled"
               : "ok";
-          if (typeof modelResult?.errorMessage === "string") record.error = truncate(modelResult.errorMessage, 500);
+          if (typeof modelResult?.errorMessage === "string") record.error = formatPiSandboxError(truncate(modelResult.errorMessage, 500));
           if (display?.displayName === "models.generateImages" && Array.isArray(modelResult?.output)) {
             generatedImages += modelResult.output.filter(item => isRecord(item) && item.type === "image").length;
           }
@@ -560,7 +561,7 @@ export function createCodemodeHostToolExecutor(
         if (record.status === "running") {
           record.status = callSignal.aborted ? "cancelled" : "error";
           record.durationMs = performance.now() - callStartedAt;
-          record.error = truncate(errorMessage(error), 500);
+          record.error = formatPiSandboxError(truncate(errorMessage(error), 500));
           publish();
         }
         throw error;
@@ -612,7 +613,7 @@ export function createCodemodeHostToolExecutor(
           : modelResult?.stopReason === undefined || modelResult.stopReason === "stop"
             ? "ok"
             : "error";
-        if (typeof modelResult?.errorMessage === "string") record.error = truncate(modelResult.errorMessage, 500);
+        if (typeof modelResult?.errorMessage === "string") record.error = formatPiSandboxError(truncate(modelResult.errorMessage, 500));
         if (modelResult?.usage) {
           record.cost = modelResult.usage.cost.total;
           modelUsage = addUsage(modelUsage, modelResult.usage);
@@ -626,7 +627,7 @@ export function createCodemodeHostToolExecutor(
         if (record.status === "running") {
           record.status = callSignal.aborted ? "cancelled" : "error";
           record.durationMs = performance.now() - callStartedAt;
-          record.error = truncate(errorMessage(error), 500);
+          record.error = formatPiSandboxError(truncate(errorMessage(error), 500));
           publish();
         }
         throw error;

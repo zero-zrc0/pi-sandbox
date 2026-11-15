@@ -11,10 +11,10 @@
  *
  * 1. the mode is `default` or `auto-review` (C2 is not a `read-only` or
  *    `full-access` concept; both modes already decided elsewhere);
- * 2. the channel is `normal` (the elevation channel is a one-time host
- *    execution, never a sandbox run);
+ * 2. the channel is `normal` (an explicit elevation request has its own
+ *    selected tier and never uses this receipt);
  * 3. the accumulated verdict is `unknown`; allow, ask and deny are left intact;
- * 4. the call carries no one-time host execution request;
+ * 4. the call carries no one-time elevation request;
  * 5. the receipt verifies against this call, session, workspace and clock;
  * 6. the unit is clean: no danger hits, no sensitive references, and every
  *    access fact is either local read/write, all-unknown (opaque but clean), or
@@ -70,8 +70,8 @@ function sandboxDefaultRun(
   if (accumulated.state !== "unknown") return PASS;
   if (context.unit.rule?.decision === "ask") return PASS;
 
-  // A host execution request is the elevation channel's subject; a sandbox
-  // receipt must never authorize one, whichever channel carries it.
+  // An explicit elevation request has a separate tier-bound approval; a
+  // sandbox receipt must never authorize it, whichever channel carries it.
   if (context.call.hostExecutionRequest !== undefined) return PASS;
 
   const receipt = options.receipt;

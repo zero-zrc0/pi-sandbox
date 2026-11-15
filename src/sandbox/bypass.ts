@@ -7,6 +7,7 @@ import type {
 import { Type, type Static, type TSchema } from "typebox";
 import { Value } from "typebox/value";
 import { freezeJson, jsonDigest, type JsonObject } from "../json";
+import { formatPiSandboxError } from "../error-format";
 import type { PermissionMode } from "../contracts";
 import type { ToolElevation } from "../elevation";
 import type { SandboxBypassReviewInput } from "#approve-core/host";
@@ -42,7 +43,8 @@ export interface SandboxBypassOptions {
     name: string,
     schema: TSchema,
   ) => HostToolDefinition | undefined;
-  readonly prepareElevation: (name: string, args: JsonObject, ctx: ExtensionToolContext) => ToolElevation | undefined;
+  readonly prepareElevation: (name: string, args: JsonObject, tier: ToolElevation["tier"], ctx: ExtensionToolContext) =>
+    ToolElevation | Block | undefined;
   readonly validateElevation: (name: string, args: JsonObject, elevation: ToolElevation, ctx: ExtensionToolContext) => boolean;
   readonly executeDefault: (input: SandboxBypassReviewInput, signal: AbortSignal | undefined,
     onUpdate: Parameters<HostToolDefinition["execute"]>[3], ctx: ExtensionToolContext) => ReturnType<HostToolDefinition["execute"]>;
@@ -62,6 +64,7 @@ const parameters = Type.Object({
   reason: Type.String(),
   toolName: Type.String(),
   arguments: Type.Record(Type.String(), Type.Any()),
+  tier: Type.Union([Type.Literal("default"), Type.Literal("host")]),
 });
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -107,7 +110,8 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
     const input = isRecord(inputValue) ? inputValue : undefined;
     if (
       input === undefined || typeof input.reason !== "string" || input.reason.trim().length === 0 ||
-      typeof input.toolName !== "string" || input.toolName.trim().length === 0
+      typeof input.toolName !== "string" || input.toolName.trim().length === 0 ||
+      (input.tier !== "default" && input.tier !== "host")
     ) {
       return { block: true, reason: "sandbox-bypass:invalid-request" };
     }
@@ -138,8 +142,11 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
     if (hostTool === undefined) {
       return { block: true, reason: `sandbox-bypass:target-executor-unavailable:${input.toolName}` };
     }
-    const elevation = options.prepareElevation(input.toolName, args, ctx);
-    if (elevation === undefined) return { block: true, reason: "sandbox-bypass:no-matching-permission-denial" };
+    const preparedElevation = options.prepareElevation(input.toolName, args, input.tier, ctx);
+    if (preparedElevation === undefined) {
+      return { block: true, reason: `sandbox-bypass:elevation-unavailable:${input.tier}:${input.toolName}` };
+    }
+    if ("block" in preparedElevation) return preparedElevation;
     const request: PreparedRequest = {
       sessionId,
       targetToolCallId: `${toolCallId}:sandbox-bypass-target`,
@@ -154,7 +161,7 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
       mode,
       policyRevision,
       cwd: ctx.cwd,
-      elevation: freezeJson(elevation) as unknown as ToolElevation,
+      elevation: freezeJson(preparedElevation) as unknown as ToolElevation,
     };
     const sessionCalls = usedCalls.get(sessionId) ?? new Set<string>();
     sessionCalls.add(toolCallId);
@@ -172,12 +179,12 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
     const sessionId = ctx.sessionManager.getSessionId();
     const prepared = prepareRequest(toolCallId, _input, ctx);
     if ("block" in prepared) {
-      throw new Error(prepared.reason);
+      throw new Error(formatPiSandboxError(prepared.reason));
     }
     const request = prepared;
-    if (api === undefined) throw new Error("sandbox-bypass:tool-registry-unavailable");
+    if (api === undefined) throw new Error(formatPiSandboxError("sandbox-bypass:tool-registry-unavailable"));
     if (request.sessionId !== sessionId) {
-      throw new Error("sandbox-bypass:session-changed");
+      throw new Error(formatPiSandboxError("sandbox-bypass:session-changed"));
     }
     const targetInfo = findUniqueTool(api, request.targetToolName);
     if (
@@ -185,15 +192,15 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
       targetInfo.sourceInfo.path !== request.sourcePath || targetInfo.exposure !== request.exposure ||
       !Value.Check(targetInfo.parameters, request.arguments)
     ) {
-      throw new Error("sandbox-bypass:target-registration-changed");
+      throw new Error(formatPiSandboxError("sandbox-bypass:target-registration-changed"));
     }
 
     const hostTool = options.resolveHostTool(request.targetToolName, request.schema);
     if (hostTool !== request.hostTool || hostTool?.execute !== request.hostExecute) {
-      throw new Error(`sandbox-bypass:target-executor-unavailable:${request.targetToolName}`);
+      throw new Error(formatPiSandboxError(`sandbox-bypass:target-executor-unavailable:${request.targetToolName}`));
     }
     if (signal?.aborted) {
-      throw new Error("sandbox-bypass:cancelled-before-review");
+      throw new Error(formatPiSandboxError("sandbox-bypass:cancelled-before-review"));
     }
 
     const reviewInput: SandboxBypassReviewInput = {
@@ -214,15 +221,15 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
       ctx,
     );
 
-    if (reviewer === undefined) throw new Error("sandbox-bypass:reviewer-unavailable");
+    if (reviewer === undefined) throw new Error(formatPiSandboxError("sandbox-bypass:reviewer-unavailable"));
     const review = await reviewer(reviewInput, ctx);
-    if (review !== undefined) throw new Error(review.reason);
+    if (review !== undefined) throw new Error(formatPiSandboxError(review.reason));
     if (
       ctx.cwd !== request.cwd || options.mode(ctx) !== request.mode ||
       options.policyRevision(ctx) !== request.policyRevision ||
       ctx.sessionManager.getSessionId() !== request.sessionId
     ) {
-      throw new Error("sandbox-bypass:approval-invalidated-by-policy-change");
+      throw new Error(formatPiSandboxError("sandbox-bypass:approval-invalidated-by-policy-change"));
     }
     const currentTarget = findUniqueTool(api, request.targetToolName);
     const currentHostTool = options.resolveHostTool(request.targetToolName, request.schema);
@@ -231,11 +238,11 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
       currentTarget.sourceInfo.path !== request.sourcePath || currentTarget.exposure !== request.exposure ||
       currentHostTool !== request.hostTool || currentHostTool?.execute !== request.hostExecute
     ) {
-      throw new Error("sandbox-bypass:target-registration-changed");
+      throw new Error(formatPiSandboxError("sandbox-bypass:target-registration-changed"));
     }
-    if (signal?.aborted || ctx.signal?.aborted) throw new Error("sandbox-bypass:cancelled-before-execution");
+    if (signal?.aborted || ctx.signal?.aborted) throw new Error(formatPiSandboxError("sandbox-bypass:cancelled-before-execution"));
     if (!options.validateElevation(request.targetToolName, request.arguments, request.elevation, ctx)) {
-      throw new Error("sandbox-bypass:target-scope-changed");
+      throw new Error(formatPiSandboxError("sandbox-bypass:target-scope-changed"));
     }
 
     const actionDigest = jsonDigest({
@@ -262,7 +269,7 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
         impact: "unknown",
         code: "execution-failed",
       });
-      throw error;
+      throw new Error(formatPiSandboxError(error));
     }
     recordExecution({
       sessionId: ctx.sessionManager.getSessionId(),
@@ -282,9 +289,9 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
       name: SANDBOX_BYPASS_TOOL_NAME,
       label: "Request one-time tool elevation",
       description:
-        "Request one-time elevation only after the exact registered tool call was blocked for insufficient permissions. " +
-        "Supply unchanged complete arguments and explain why the action is necessary and safe. " +
-        "The host selects the minimum tier: Default sandbox or Host execution. " +
+        "Request one-time elevation for a supported built-in file tool by supplying its exact complete arguments, a reason, and the tier you choose. " +
+        "Choose Default for a one-time sandboxed file access, or Host only when the action needs access outside the sandbox. " +
+        "Default never falls back to Host. Use the least access needed. " +
         "Explicit policy denies, risk denies, and unknown or unverified effects cannot be overridden.",
       parameters,
       executionMode: "sequential" as const,
@@ -300,10 +307,10 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
     clearSession(sessionId: string) {
       usedCalls.delete(sessionId);
     },
-    syncMode(mode: PermissionMode, _sessionId?: string) {
+    syncMode(mode: PermissionMode, _sessionId?: string, sandboxEnabled = true) {
       if (api === undefined) return;
       const active = api.getActiveTools();
-      const next = mode === "full-access"
+      const next = mode === "full-access" || !sandboxEnabled
         ? active.filter((name) => name !== SANDBOX_BYPASS_TOOL_NAME)
         : active.includes(SANDBOX_BYPASS_TOOL_NAME)
           ? active

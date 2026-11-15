@@ -9,6 +9,7 @@ import { ExecutionController } from "#sandbox/lifecycle";
 import { PROTECTED_CONTROL_DIRECTORY_NAMES } from "#sandbox/path";
 import type { ExecutionPlan } from "#sandbox/types";
 import { compileTestPlan, makeInvocation } from "../../fixtures/harness";
+import { installLinuxTestRuntime } from "../../fixtures/runtime";
 import {
   COUNTER_MODULE,
   errorTextOf,
@@ -58,6 +59,7 @@ function createLinuxLayout(prefix: string): LinuxLayout {
   }
   execFileSync("bash", [join(backendSource, "build.sh"), join(helperDir, "linux-sandbox")]);
   copyFileSync(join(backendSource, "helper.mjs"), join(helperDir, "helper.mjs"));
+  installLinuxTestRuntime(helperDir);
   copyFileSync(workerSource, join(installRoot, "src", "sandbox", "sandbox-tool-worker.mjs"));
   return { root, installRoot, helperDir, helperCwd, workspace, modules, stateDirectory, outside };
 }
@@ -83,7 +85,8 @@ describe.skipIf(process.platform !== "linux")("native Linux sandbox tool", () =>
       },
       helperCwd: layout.helperCwd,
       workspace: layout.workspace,
-      helperEnvironment: { HOME: "/nonexistent", LANG: "C.UTF-8", PATH: "/usr/bin:/bin" },
+      helperEnvironment: { HOME: "/nonexistent", LANG: "C.UTF-8", PATH: "/usr/bin:/bin",
+        PI_SANDBOX_RUNTIME_DIR: layout.helperDir, PI_SANDBOX_WORKSPACE_ROOT: layout.workspace },
       startTimeoutMs: 5_000,
       cancelGraceMs: 250,
     });

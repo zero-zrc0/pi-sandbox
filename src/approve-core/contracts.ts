@@ -210,14 +210,14 @@ export function captureStep(input: StepCaptureInput): CaptureStepResult {
       const reason = nonEmptyString(candidate.hostExecutionRequest.reason);
       if (!reason) return { ok: false, reason: "invalid-call-facts" };
       const elevation = candidate.hostExecutionRequest.elevation;
-      if (elevation !== undefined && (!isRecord(elevation) ||
+      if (elevation === undefined || !isRecord(elevation) ||
         (elevation.tier !== "default" && elevation.tier !== "host") ||
         !Array.isArray(elevation.scope) || elevation.scope.length === 0 ||
         elevation.scope.some((entry) => !isRecord(entry) || !nonEmptyString(entry.path) ||
-          (entry.access !== "read" && entry.access !== "write")))) {
+          (entry.access !== "read" && entry.access !== "write"))) {
         return { ok: false, reason: "invalid-call-facts" };
       }
-      facts.hostExecutionRequest = { reason, ...(elevation === undefined ? {} : { elevation: elevation as JsonValue }) };
+      facts.hostExecutionRequest = { reason, elevation: elevation as JsonValue };
     } else if (candidate.hostExecutionRequest !== undefined) {
       return { ok: false, reason: "invalid-call-facts" };
     }

@@ -96,7 +96,7 @@ export function denyVerdict(reason: string, source: string): Verdict {
 }
 
 /**
- * The stricter of two ask targets: an ask that needs a host execution stays an
+ * The stricter of two ask targets: an explicit elevation request stays an
  * escalation ask even when another link only wanted an approval.
  */
 export function strongerAskTarget(

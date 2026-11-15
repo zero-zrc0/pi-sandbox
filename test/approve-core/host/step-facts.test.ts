@@ -32,6 +32,7 @@ const LS_DIGEST = reviewDigest(LS_ARGS);
 const READ_ARGS = { path: "/tmp/x" };
 const READ_DIGEST = reviewDigest(READ_ARGS);
 const PWD_ARGS = { command: "pwd" };
+const HOST_REQUEST = { reason: "needs root", elevation: { tier: "host" as const, scope: [{ path: "/outside/target", access: "write" as const }] } };
 
 const WORKED_CAPTURE: StepCapture = {
   stepKey: "step-7",
@@ -99,7 +100,7 @@ describe("createStepFacts manifest path", () => {
     const resolver = createStepFacts({ capture: recording.port });
 
     const result = resolver.capture({
-      event: directEvent({ input: LS_ARGS, hostExecutionRequest: { reason: "needs root" } }),
+      event: directEvent({ input: LS_ARGS, hostExecutionRequest: HOST_REQUEST }),
       manifest: buildManifest(),
       registeredTools: ["bash", "read"],
     });
@@ -118,7 +119,7 @@ describe("createStepFacts manifest path", () => {
           toolName: "bash",
           arguments: LS_ARGS,
           argumentsDigest: LS_DIGEST,
-          hostExecutionRequest: { reason: "needs root" },
+          hostExecutionRequest: HOST_REQUEST,
         },
         {
           toolCallId: "call-read",
@@ -340,11 +341,11 @@ describe("createStepFacts per-call path", () => {
         toolCallId: "call-new",
         toolName: "bash",
         input: PWD_ARGS,
-        hostExecutionRequest: { reason: "elevated" },
+        hostExecutionRequest: HOST_REQUEST,
       },
     });
 
-    expect(recording.inputs[0]!.directCalls[0]!.hostExecutionRequest).toStrictEqual({ reason: "elevated" });
+    expect(recording.inputs[0]!.directCalls[0]!.hostExecutionRequest).toStrictEqual(HOST_REQUEST);
   });
 });
 

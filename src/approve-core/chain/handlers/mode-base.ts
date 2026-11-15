@@ -12,8 +12,8 @@
  * `unknown`, never `allow`: a unit whose effect nobody can state is exactly what
  * the fallback, the model resolver and C2 exist for.
  *
- * A one-time elevation is an `escalate` ask, so later grants cannot replace
- * the human approval required for either Default sandbox or Host execution.
+ * An explicit one-time elevation is an `escalate` ask, so later grants cannot
+ * replace approval of its selected tier.
  */
 import type { PermissionMode } from "../../../contracts";
 import type { ApprovalContext, UnitAccessFact } from "../facts";
@@ -39,17 +39,14 @@ function baseOpinion(context: ApprovalContext, strictApproval: boolean): Handler
   const { call, unit, mode } = context;
   if (call.hostExecutionRequest !== undefined) {
     const elevation = call.hostExecutionRequest.elevation;
-    if (elevation !== undefined) {
-      const facts = provenAccess(unit.access);
-      if (facts.some(fact => fact.kind === "unknown" || fact.kind === "network" || fact.kind === "review")) {
-        return { action: "deny", reason: "mode:elevation:effects-unproven-or-unsafe" };
-      }
-      if (elevation.tier === "default" && facts.some(fact => fact.external === true || fact.externalDelete === true)) {
-        return { action: "deny", reason: "mode:elevation:scope-exceeds-default" };
-      }
-      return { action: "ask", askFor: "escalate", reason: `mode:${mode}:one-time-${elevation.tier}-execution` };
+    const facts = provenAccess(unit.access);
+    if (facts.some(fact => fact.kind === "unknown" || fact.kind === "network" || fact.kind === "review")) {
+      return { action: "deny", reason: "mode:elevation:effects-unproven-or-unsafe" };
     }
-    return hostExecutionOpinion(mode);
+    if (elevation.tier === "default" && facts.some(fact => fact.external === true || fact.externalDelete === true)) {
+      return { action: "deny", reason: "mode:elevation:scope-exceeds-default" };
+    }
+    return { action: "ask", askFor: "escalate", reason: `mode:${mode}:one-time-${elevation.tier}-execution` };
   }
   if (mode === "full-access") {
     return { action: "allow", reason: "mode:full-access:bypass-remaining-ask" };
@@ -73,21 +70,6 @@ function baseOpinion(context: ApprovalContext, strictApproval: boolean): Handler
 /** No proven access is `unknown`, not "nothing to see". */
 function provenAccess(facts: readonly UnitAccessFact[]): readonly UnitAccessFact[] {
   return facts.length === 0 ? [{ kind: "unknown" }] : facts;
-}
-
-/** A one-time host execution request outranks the mode's ordinary baseline. */
-function hostExecutionOpinion(mode: PermissionMode): HandlerResult {
-  if (mode === "read-only") {
-    return { action: "deny", reason: "mode:read-only:host-execution-forbidden" };
-  }
-  if (mode === "full-access") {
-    return { action: "allow", reason: "mode:full-access:host-execution-allow" };
-  }
-  return {
-    action: "ask",
-    askFor: "escalate",
-    reason: `mode:${mode}:one-time-host-execution`,
-  };
 }
 
 function readOnlyOpinion(facts: readonly UnitAccessFact[]): HandlerResult {

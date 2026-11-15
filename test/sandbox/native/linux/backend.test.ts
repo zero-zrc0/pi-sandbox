@@ -17,6 +17,7 @@ import {
   compileTestPlan,
   makeInvocation,
 } from "../../fixtures/harness";
+import { installLinuxTestRuntime } from "../../fixtures/runtime";
 
 const backendId = "linux-bwrap-landlock-seccomp";
 const backendVersion = "1.1.0";
@@ -29,6 +30,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
   let installRoot: string;
   let helperCwd: string;
   let workspace: string;
+  let sessionWorkspace: string;
   let outside: string;
   let nativeBinary: string;
   let processSpawnProbe: string;
@@ -39,10 +41,12 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     installRoot = join(root, "trusted-install");
     helperCwd = join(root, "helper-cwd");
     workspace = join(root, "workspace");
+    sessionWorkspace = join(root, "agent", "workspaces", "pi-sandbox", "session-hash");
     outside = join(root, "outside.txt");
     mkdirSync(installRoot, { recursive: true });
     mkdirSync(helperCwd, { recursive: true });
     mkdirSync(workspace, { recursive: true });
+    mkdirSync(join(sessionWorkspace, "tmp"), { recursive: true });
     for (const name of PROTECTED_CONTROL_DIRECTORY_NAMES) {
       mkdirSync(join(workspace, name), { recursive: true });
     }
@@ -52,6 +56,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     execFileSync("cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread",
       fileURLToPath(new URL("./process-spawn-probe.c", import.meta.url)), "-o", processSpawnProbe]);
     copyFileSync(join(backendSource, "helper.mjs"), join(installRoot, "helper.mjs"));
+    installLinuxTestRuntime(installRoot);
     const installation: TrustedHelperInstallation = {
       installRoot,
       executable: process.execPath,
@@ -67,6 +72,8 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
         HOME: "/nonexistent",
         LANG: "C.UTF-8",
         PATH: "/usr/bin:/bin",
+        PI_SANDBOX_RUNTIME_DIR: installRoot,
+        PI_SANDBOX_WORKSPACE_ROOT: workspace,
       },
       startTimeoutMs: 5_000,
       cancelGraceMs: 250,
@@ -227,6 +234,95 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     expect(existsSync(outside)).toBe(false);
   });
 
+  it("uses a session workspace grant while keeping host /tmp outside default access", async () => {
+    const artifact = join(sessionWorkspace, "artifacts", "result.txt");
+    const environmentFile = join(sessionWorkspace, "tmp", "environment.txt");
+    const inaccessibleCopy = join(sessionWorkspace, "tmp", "host-temp-copy.txt");
+    mkdirSync(join(sessionWorkspace, "artifacts"), { recursive: true });
+    writeFileSync(outside, "host temp secret");
+    const command = [
+      `printf allowed > '${artifact}'`,
+      `printf '%s\\n' "$PI_SANDBOX_WORK_DIR" "$TEMP" "$TMP" "$TMPDIR" > '${environmentFile}'`,
+      `cat '${outside}' > '${inaccessibleCopy}'`,
+    ].join("; ");
+    const result = await getController().execute({
+      plan: compileTestPlan({
+        invocation: makeInvocation({ cwd: workspace, toolName: "bash", args: { command } }),
+        operation: { kind: "shell", command, shell: "/bin/sh" },
+        workspace,
+        baselineFilesystem: [
+          { path: workspace, access: "read", granularity: "directory" },
+          { path: sessionWorkspace, access: "read", granularity: "directory" },
+          { path: sessionWorkspace, access: "write", granularity: "directory" },
+        ],
+        environment: {
+          PI_SANDBOX_WORK_DIR: sessionWorkspace,
+          TEMP: join(sessionWorkspace, "tmp"),
+          TMP: join(sessionWorkspace, "tmp"),
+          TMPDIR: join(sessionWorkspace, "tmp"),
+          PATH: "/usr/bin:/bin",
+        },
+        backendId,
+        shell: "/bin/sh",
+      }),
+    });
+
+    expect(result.state, JSON.stringify(result)).toBe("completed");
+    expect(result.state === "completed" ? result.exitCode : undefined).not.toBe(0);
+    expect(readFileSync(artifact, "utf8")).toBe("allowed");
+    expect(readFileSync(environmentFile, "utf8").trim().split(/[\r\n]+/)).toEqual([
+      sessionWorkspace,
+      join(sessionWorkspace, "tmp"),
+      join(sessionWorkspace, "tmp"),
+      join(sessionWorkspace, "tmp"),
+    ]);
+    expect(readFileSync(inaccessibleCopy, "utf8")).not.toContain("host temp secret");
+    rmSync(outside, { force: true });
+  });
+
+  it("keeps project and session writes, including host /tmp, outside read-only access", async () => {
+    const projectTarget = join(workspace, "readonly-project.txt");
+    const sessionTarget = join(sessionWorkspace, "tmp", "readonly-session.txt");
+    const hostTempTarget = join(tmpdir(), `pi-sandbox-readonly-host-temp-${process.pid}-${Date.now()}.txt`);
+    const command = [
+      `printf denied > '${projectTarget}'`,
+      `printf denied > '${sessionTarget}'`,
+      `printf denied > '${hostTempTarget}'`,
+    ].join("; ");
+    try {
+      const result = await getController().execute({
+        plan: compileTestPlan({
+          invocation: makeInvocation({ cwd: workspace, toolName: "bash", args: { command } }),
+          operation: { kind: "shell", command, shell: "/bin/sh" },
+          workspace,
+          mode: "read-only",
+          baselineFilesystem: [
+            { path: workspace, access: "read", granularity: "directory" },
+            { path: sessionWorkspace, access: "read", granularity: "directory" },
+          ],
+          environment: {
+            PI_SANDBOX_WORK_DIR: sessionWorkspace,
+            TEMP: join(sessionWorkspace, "tmp"),
+            TMP: join(sessionWorkspace, "tmp"),
+            TMPDIR: join(sessionWorkspace, "tmp"),
+            PATH: "/usr/bin:/bin",
+          },
+          backendId,
+          shell: "/bin/sh",
+        }),
+      });
+
+      expect(result.state, JSON.stringify(result)).toBe("completed");
+      expect(existsSync(projectTarget)).toBe(false);
+      expect(existsSync(sessionTarget)).toBe(false);
+      expect(existsSync(hostTempTarget)).toBe(false);
+    } finally {
+      rmSync(projectTarget, { force: true });
+      rmSync(sessionTarget, { force: true });
+      rmSync(hostTempTarget, { force: true });
+    }
+  });
+
   it("reads approved file bytes through the native sandbox", async () => {
     const target = join(workspace, "read-bytes.bin");
     const content = Buffer.from([0x00, 0x80, 0xff, 0x41]);
@@ -281,23 +377,22 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     expect(existsSync(protectedFile)).toBe(false);
   });
 
-  it("fails closed before start when a protected control directory is missing", async () => {
+  it("allows unrelated workspace writes when a protected control directory is missing", async () => {
     const missing = join(workspace, PROTECTED_CONTROL_DIRECTORY_NAMES[0]);
-    const marker = join(workspace, "missing-protection-started.txt");
+    const marker = join(workspace, "missing-protection-unrelated-write.txt");
     rmSync(missing, { recursive: true, force: true });
     try {
       const result = await getController().execute({
         plan: shellPlan(`printf started > '${marker}'`),
       });
 
-      expect(result.state).toBe("failed");
-      expect(result.started).toBe(false);
-      expect(result.state === "failed" ? result.code : undefined).toBe(
-        "sandbox-path-missing",
-      );
-      expect(existsSync(marker)).toBe(false);
+      expect(result.state, JSON.stringify(result)).toBe("completed");
+      expect(result.state === "completed" ? result.exitCode : undefined).toBe(0);
+      expect(readFileSync(marker, "utf8")).toBe("started");
+      expect(existsSync(missing)).toBe(false);
     } finally {
       mkdirSync(missing, { recursive: true });
+      rmSync(marker, { force: true });
     }
   });
 
@@ -576,7 +671,8 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
         },
         helperCwd,
         workspace,
-        helperEnvironment: { HOME: "/nonexistent", LANG: "C.UTF-8", PATH: "/usr/bin:/bin" },
+        helperEnvironment: { HOME: "/nonexistent", LANG: "C.UTF-8", PATH: "/usr/bin:/bin",
+          PI_SANDBOX_RUNTIME_DIR: installRoot, PI_SANDBOX_WORKSPACE_ROOT: workspace },
         startTimeoutMs: 5_000,
         cancelGraceMs: 250,
         egress: provider,

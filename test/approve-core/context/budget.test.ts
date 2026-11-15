@@ -601,4 +601,54 @@ describe("selectBudgetedEvidence", () => {
       }
     }
   });
+
+  it("shows the selected elevation tier and Host sandbox boundary to decision reviewers", () => {
+    const hostExecutionRequest = {
+      reason: "write outside the project",
+      elevation: { tier: "host" as const, scope: [{ path: "/tmp/output.txt", access: "write" as const }] },
+    };
+    const call = {
+      toolCallId: "call-elevation",
+      toolName: "write",
+      arguments: { path: "/tmp/output.txt", content: "x" },
+      argumentsDigest: "digest",
+      digest: "digest",
+      units: [],
+      askFor: "escalate" as const,
+    };
+    const material = prepareDecisionMaterial({
+      selection: { authorization: [], mode: "full" },
+      call: {
+        ...call,
+        hostExecutionRequest,
+      },
+      guidance: { included: [] },
+      historyEvidence: [],
+      historyOmitted: false,
+    });
+
+    expect(material).toContain("REVIEW TARGET: ELEVATION (host)");
+    expect(material).toContain("outside the OS sandbox");
+    expect(material).toContain("/tmp/output.txt");
+
+    const llmMaterial = renderMaterial({
+      owner: "owner",
+      historyVersion: 1,
+      captureSeq: 2,
+      revision: 3,
+      representation: "full",
+      mode: "read-only",
+      authorization: [],
+      guidance: [],
+      historyEvidence: [],
+      historyOmitted: false,
+      calls: [{
+        ...call,
+        pendingUnitIds: [],
+        hostExecutionRequest,
+      } as never],
+    });
+    expect(llmMaterial).toContain("WARNING: ELEVATION host");
+    expect(llmMaterial).toContain("Host runs once with host permissions outside the OS sandbox");
+  });
 });

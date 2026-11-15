@@ -5,5 +5,5 @@ export interface ToolElevation {
 
 export interface ExecutionRequest {
   readonly reason: string;
-  readonly elevation?: ToolElevation;
+  readonly elevation: ToolElevation;
 }

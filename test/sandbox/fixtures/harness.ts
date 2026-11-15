@@ -196,6 +196,11 @@ export interface CompileTestPlanOptions {
   readonly invocation: ToolInvocationFacts;
   readonly operation: ExecutionOperation;
   readonly workspace: string;
+  readonly baselineFilesystem?: readonly {
+    readonly path: string;
+    readonly access: "read" | "write";
+    readonly granularity: "file" | "directory";
+  }[];
   readonly network?: NetworkScope;
   readonly approved?: {
     readonly filesystem?: readonly {
@@ -223,10 +228,12 @@ export function compileTestPlan(options: CompileTestPlanOptions): ExecutionPlan 
     path: string;
     access: "read" | "write";
     granularity: "file" | "directory";
-  }[] = [
-    { path: options.workspace, access: "read", granularity: "directory" },
-    { path: options.workspace, access: "write", granularity: "directory" },
-  ];
+  }[] = options.baselineFilesystem === undefined
+    ? [
+      { path: options.workspace, access: "read", granularity: "directory" },
+      { path: options.workspace, access: "write", granularity: "directory" },
+    ]
+    : [...options.baselineFilesystem];
   const compiled = compileExecutionPlan({
     invocation: options.invocation,
     operation: options.operation,

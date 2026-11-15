@@ -74,6 +74,7 @@ export interface DecisionNodeOptions {
   readonly resolveAssessment?: AssessmentResolver;
   readonly shellPolicy?: ShellPolicy;
   readonly shellPathVariables?: ShellPolicyPathVariables;
+  readonly additionalLocalPaths?: readonly string[];
   readonly enabledShellNodes?: readonly string[];
   readonly shellGrants?: ShellExecutionPermissions;
   readonly getBashProgram?: BashProgramProvider;
@@ -259,6 +260,9 @@ async function decideOneCall(
       ...(options.shellPathVariables === undefined
         ? {}
         : { shellPathVariables: options.shellPathVariables }),
+      ...(options.additionalLocalPaths === undefined
+        ? {}
+        : { additionalLocalPaths: options.additionalLocalPaths }),
       ...(options.enabledShellNodes === undefined
         ? {}
         : { enabledShellNodes: options.enabledShellNodes }),
@@ -390,6 +394,7 @@ async function legacyAccessByUnit(
     platform: derived.platform,
     ...(options.getBashProgram === undefined ? {} : { getBashProgram: options.getBashProgram }),
     ...(options.shellGrants === undefined ? {} : { shellGrants: options.shellGrants }),
+    ...(options.additionalLocalPaths === undefined ? {} : { additionalLocalPaths: options.additionalLocalPaths }),
   });
   return new Map(call.units.map((unit) => [unit.unitId, facts]));
 }
