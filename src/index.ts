@@ -54,6 +54,8 @@ import { normalizeToolTargets } from "#approve-core/utils/access-intent/input-no
 import { createControlledExecution } from "#sandbox/production";
 import { EXECUTION_INSTALL_ROOT } from "#sandbox/platform";
 import { parseRuntimeCatalog } from "#sandbox/runtime-catalog";
+import type { RuntimeResourceEntry } from "#sandbox/runtime-catalog";
+import type { RuntimeDownloadProgress } from "#sandbox/runtime-download";
 import { SandboxRuntimeManager } from "#sandbox/runtime-manager";
 import { probeSandboxRuntime } from "#sandbox/runtime-probe";
 import { HELPER_PROTOCOL_VERSION } from "#sandbox/types";
@@ -122,20 +124,129 @@ function notify(ctx: ExtensionContext, message: string, level: "info" | "warning
   }
 }
 
+function formatRuntimeBytes(bytes: number): string {
+  const units = ["B", "KB", "MB", "GB"] as const;
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${unit === 0 ? Math.floor(value) : value.toFixed(1)} ${units[unit]}`;
+}
+
+interface RuntimeDownloadProgressDialog {
+  readonly closed: Promise<void>;
+  update(progress: RuntimeDownloadProgress): void;
+  finish(ready: boolean): void;
+}
+
+function showRuntimeDownloadProgress(
+  ctx: ExtensionContext,
+  release: RuntimeResourceEntry,
+): RuntimeDownloadProgressDialog {
+  let updateProgress: (progress: RuntimeDownloadProgress) => void = () => undefined;
+  let finishProgress: (ready: boolean) => void = () => undefined;
+  let resolveClosed: () => void = () => undefined;
+  const closed = new Promise<void>(resolve => { resolveClosed = resolve; });
+  const custom = ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+    let progress: RuntimeDownloadProgress = { receivedBytes: 0, totalBytes: release.archiveSizeBytes };
+    class RuntimeDownloadProgressView extends Container {
+      private percent = 0;
+      private completed = false;
+      private message = "Downloading from GitHub";
+
+      constructor() {
+        super();
+        this.renderProgress();
+      }
+
+      update(next: RuntimeDownloadProgress): void {
+        progress = next;
+        const percent = Math.min(100, Math.floor(next.receivedBytes * 100 / next.totalBytes));
+        if (percent === this.percent) return;
+        this.percent = percent;
+        if (percent === 100) this.message = "Verifying and installing runtime";
+        this.renderProgress();
+      }
+
+      finish(ready: boolean): void {
+        if (this.completed) return;
+        this.completed = true;
+        if (ready) {
+          progress = { receivedBytes: release.archiveSizeBytes, totalBytes: release.archiveSizeBytes };
+          this.percent = 100;
+          this.message = "OS Sandbox runtime ready";
+        } else {
+          this.message = "Runtime installation failed";
+        }
+        this.renderProgress();
+        setTimeout(() => {
+          done();
+          resolveClosed();
+        }, 500);
+      }
+
+      handleInput(_keyData: string): void {}
+
+      private renderProgress(): void {
+        const width = 20;
+        const filled = Math.floor(this.percent * width / 100);
+        const bar = `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
+        this.clear();
+        this.addChild(new DynamicBorder());
+        this.addChild(new Spacer(1));
+        this.addChild(new Text(theme.fg("text", "OS Sandbox runtime"), 1, 0));
+        this.addChild(new Text(theme.fg("muted", `${release.platform}/${release.arch} · ${release.version}`), 1, 0));
+        this.addChild(new Spacer(1));
+        this.addChild(new Text(theme.fg("text", this.message), 1, 0));
+        this.addChild(new Text(theme.fg("accent", `${bar} ${this.percent}%`), 1, 0));
+        this.addChild(new Text(theme.fg("muted", `${formatRuntimeBytes(progress.receivedBytes)} / ${formatRuntimeBytes(progress.totalBytes)}`), 1, 0));
+        this.addChild(new Spacer(1));
+        this.addChild(new DynamicBorder());
+        this.invalidate();
+        tui.requestRender();
+      }
+    }
+    const view = new RuntimeDownloadProgressView();
+    updateProgress = progress => view.update(progress);
+    finishProgress = ready => view.finish(ready);
+    return view;
+  });
+  void custom.then(resolveClosed, resolveClosed);
+  return {
+    closed,
+    update: progress => updateProgress(progress),
+    finish: ready => finishProgress(ready),
+  };
+}
+
 async function prepareSandboxRuntime(manager: SandboxRuntimeManager, ctx: ExtensionContext) {
   notify(ctx, "Preparing OS Sandbox runtime.", "info");
-  let lastProgress = -1;
+  let progressDialog: RuntimeDownloadProgressDialog | undefined;
   const state = await manager.prepare({
     workspaceRoot: ctx.cwd,
-    onProgress: progress => {
-      const percent = Math.floor(progress.receivedBytes * 100 / progress.totalBytes);
-      const step = Math.floor(percent / 10) * 10;
-      if (step > lastProgress && step > 0) {
-        lastProgress = step;
-        notify(ctx, `Sandbox runtime download: ${step}%`, "info");
-      }
+    confirmDownload: async release => {
+      if (!ctx.hasUI || ctx.mode !== "tui") return false;
+      const answer = await selectPermissionOption(
+        ctx,
+        `The local OS Sandbox runtime for ${release.platform}/${release.arch} (${release.version}) is missing. Download it from GitHub?`,
+        [
+          { value: "yes", label: "Yes" },
+          { value: "no", label: "No" },
+        ],
+        ["The archive will be checked against the bundled release catalog."],
+      );
+      if (answer !== "yes") return false;
+      progressDialog = showRuntimeDownloadProgress(ctx, release);
+      return true;
     },
+    onProgress: progress => progressDialog?.update(progress),
   });
+  if (progressDialog !== undefined) {
+    progressDialog.finish(state.status === "ready");
+    await progressDialog.closed;
+  }
   if (state.status !== "ready") {
     notify(ctx, `OS Sandbox unavailable: ${state.status === "unavailable" ? state.reason : "preparation was interrupted"}`, "warning");
   }

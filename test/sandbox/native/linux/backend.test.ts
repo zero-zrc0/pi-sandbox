@@ -251,7 +251,6 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
         operation: { kind: "shell", command, shell: "/bin/sh" },
         workspace,
         baselineFilesystem: [
-          { path: workspace, access: "read", granularity: "directory" },
           { path: sessionWorkspace, access: "read", granularity: "directory" },
           { path: sessionWorkspace, access: "write", granularity: "directory" },
         ],
@@ -377,22 +376,23 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     expect(existsSync(protectedFile)).toBe(false);
   });
 
-  it("allows unrelated workspace writes when a protected control directory is missing", async () => {
+  it("fails closed before start when a protected control directory is missing", async () => {
     const missing = join(workspace, PROTECTED_CONTROL_DIRECTORY_NAMES[0]);
-    const marker = join(workspace, "missing-protection-unrelated-write.txt");
+    const marker = join(workspace, "missing-protection-started.txt");
     rmSync(missing, { recursive: true, force: true });
     try {
       const result = await getController().execute({
         plan: shellPlan(`printf started > '${marker}'`),
       });
 
-      expect(result.state, JSON.stringify(result)).toBe("completed");
-      expect(result.state === "completed" ? result.exitCode : undefined).toBe(0);
-      expect(readFileSync(marker, "utf8")).toBe("started");
-      expect(existsSync(missing)).toBe(false);
+      expect(result.state).toBe("failed");
+      expect(result.started).toBe(false);
+      expect(result.state === "failed" ? result.code : undefined).toBe(
+        "sandbox-path-missing",
+      );
+      expect(existsSync(marker)).toBe(false);
     } finally {
       mkdirSync(missing, { recursive: true });
-      rmSync(marker, { force: true });
     }
   });
 
