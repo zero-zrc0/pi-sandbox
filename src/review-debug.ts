@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, renameSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { homedir } from "node:os";
 import type { AuditEvent, AuditSinkPort } from "#approve-core/host/pi-extension";
 import { BUILTIN_REVIEW_DEBUG_NODE } from "#approve-core/node-ids";
@@ -39,6 +39,20 @@ function auditRecord(event: AuditEvent): Record<string, unknown> | undefined {
       return { event: "approval_chain", kind: event.kind, sessionId: event.sessionId,
         toolCallId: event.toolCallId, askFor: event.askFor, decision: event.decision,
         escalation: event.escalation };
+    case "publication":
+      return { event: "approval_chain", kind: event.kind, sessionId: event.sessionId,
+        generation: event.generation, mode: event.mode };
+    case "invalidate":
+      return { event: "approval_chain", kind: event.kind, sessionId: event.sessionId, reason: event.reason };
+    case "execution":
+      return { event: "approval_chain", kind: event.kind, sessionId: event.sessionId,
+        phase: event.phase, toolCallId: event.toolCallId, toolName: event.toolName,
+        ...(event.parentToolCallId === undefined ? {} : { parentToolCallId: event.parentToolCallId }),
+        ...(event.isError === undefined ? {} : { isError: event.isError }) };
+    case "session-decision":
+      return { event: "approval_chain", kind: event.kind, sessionId: event.sessionId,
+        toolCallId: event.toolCallId, toolName: event.toolName, decision: event.decision,
+        requestId: event.requestId };
     case "error":
       return { event: "approval_chain", kind: event.kind, sessionId: event.sessionId, area: event.area };
     default:
@@ -59,15 +73,20 @@ export function createReviewDebugAuditObserver(
   };
 }
 
-export function writeReviewDebug(event: Record<string, unknown>, directory = join(homedir(), ".pi", "agents", "pi-sandbox")): void {
-  const file = join(directory, "debug.txt");
+/** Append one JSONL line. Hosts pass `paths.debugLogFile`; the argument defaults to the legacy location. */
+export function writeReviewDebug(
+  event: Record<string, unknown>,
+  file = join(homedir(), ".pi", "agents", "pi-sandbox", "debug.txt"),
+): void {
   let line = `${JSON.stringify({ time: new Date().toISOString(), ...event })}\n`;
   if (Buffer.byteLength(line) > MAX_LOG_BYTES) {
     line = `${JSON.stringify({ time: new Date().toISOString(), event: "log-entry-too-large" })}\n`;
   }
-  mkdirSync(dirname(file), { recursive: true });
+  const directory = dirname(file);
+  mkdirSync(directory, { recursive: true });
   if (existsSync(file) && statSync(file).size + Buffer.byteLength(line) > MAX_LOG_BYTES) {
-    renameSync(file, join(directory, `debug-${Date.now()}-${randomUUID()}.txt`));
+    const extension = extname(file);
+    renameSync(file, join(directory, `${basename(file, extension)}-${Date.now()}-${randomUUID()}${extension}`));
   }
   appendFileSync(file, line);
 }

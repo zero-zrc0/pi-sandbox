@@ -1,4 +1,3 @@
-import { isAbsolute, relative, resolve } from "node:path";
 import { BashProgram } from "#approve-core/utils/access-intent/bash/program";
 import { bashPathFacts } from "#approve-core/utils/access-intent/bash/bash-path-resolver";
 import {
@@ -81,14 +80,14 @@ function headWord(text: string): string {
 }
 
 function isWithin(candidate: string, root: string, platform: NodeJS.Platform): boolean {
+  const flavor = pathFlavorForPlatform(platform);
   const normalize = (value: string): string => {
-    const absolute = resolve(value);
-    return platform === "win32" ? absolute.toLowerCase() : absolute;
+    return flavor.fold(flavor.resolve(value));
   };
   const rootPath = normalize(root);
   const candidatePath = normalize(candidate);
-  const rel = relative(rootPath, candidatePath);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  const rel = flavor.relative(rootPath, candidatePath);
+  return rel === "" || (!rel.startsWith("..") && !flavor.isAbsolute(rel));
 }
 
 function isExternal(
@@ -97,7 +96,8 @@ function isExternal(
   platform: NodeJS.Platform,
   additionalLocalPaths: readonly string[] = [],
 ): boolean {
-  const candidate = isAbsolute(path) ? path : resolve(cwd, path);
+  const flavor = pathFlavorForPlatform(platform);
+  const candidate = flavor.isAbsolute(path) ? path : flavor.resolve(cwd, path);
   return ![cwd, ...additionalLocalPaths].some(root => isWithin(candidate, root, platform));
 }
 
@@ -108,11 +108,12 @@ function shellWriteGrantCovers(
   grants: ShellExecutionPermissions | undefined,
   additionalLocalPaths: readonly string[] = [],
 ): boolean {
-  const target = isAbsolute(path) ? path : resolve(cwd, path);
+  const flavor = pathFlavorForPlatform(platform);
+  const target = flavor.isAbsolute(path) ? path : flavor.resolve(cwd, path);
   if ([cwd, ...additionalLocalPaths].some(root => isWithin(target, root, platform))) return true;
   if (grants === undefined) return false;
   return grants.filesystem.write.some((grant) => {
-    const root = isAbsolute(grant.path) ? grant.path : resolve(cwd, grant.path);
+    const root = flavor.isAbsolute(grant.path) ? grant.path : flavor.resolve(cwd, grant.path);
     return grant.granularity === "file"
       ? isWithin(target, root, platform) && isWithin(root, target, platform)
       : isWithin(target, root, platform);

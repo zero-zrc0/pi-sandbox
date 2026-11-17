@@ -32,15 +32,16 @@ describe("selectRuntime", () => {
     expect(selected).toEqual({ kind: "installed", runtime: candidate({ version: "1.10.0" }) });
   });
 
-  it("uses a compatible local version without downloading a newer release", () => {
+  it("downloads the newest compatible release when the local version is older", () => {
     const installed = candidate({ version: "1.4.0" });
+    const release = candidate({ version: "1.8.0" });
     const selected = selectRuntime({
       ...request,
       installed: [installed],
-      releases: [candidate({ version: "1.8.0" })],
+      releases: [release],
     });
 
-    expect(selected).toEqual({ kind: "installed", runtime: installed });
+    expect(selected).toEqual({ kind: "download", release });
   });
 
   it("selects the newest trusted stable release when no local version is compatible", () => {

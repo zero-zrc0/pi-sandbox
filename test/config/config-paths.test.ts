@@ -5,6 +5,7 @@ import {
   PI_PROJECT_DIR,
   joinPath,
   resolveConfigPaths,
+  resolveDebugLogFile,
   samePath,
 } from "#config/config-paths";
 
@@ -81,6 +82,11 @@ describe("resolveConfigPaths", () => {
 
   it("resolves the full Windows layout", () => {
     expect(resolveConfigPaths(WINDOWS_ROOTS)).toEqual(WINDOWS_PATHS);
+  });
+
+  it("keeps the standalone debug log helper aligned with the resolved layout", () => {
+    expect(resolveDebugLogFile(POSIX_ROOTS.agentDir)).toBe(POSIX_PATHS.debugLogFile);
+    expect(resolveDebugLogFile(WINDOWS_ROOTS.agentDir)).toBe(WINDOWS_PATHS.debugLogFile);
   });
 
   it("does not double trailing separators on POSIX roots", () => {

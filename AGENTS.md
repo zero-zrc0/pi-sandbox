@@ -2,7 +2,7 @@
 
 ## 项目介绍
 
-`pi-sandbox` 是 Pi coding agent 扩展，为工具调用提供策略审批，并将批准范围绑定到受控执行。它支持 Linux 和 Windows 上的受控工具执行；MCP 工具由宿主 transport 执行。
+`pi-sandbox` 是 Pi coding agent 扩展，为工具调用提供策略审批，并将批准范围绑定到受控执行。它支持 Linux、Windows 和 macOS 上的受控工具执行（macOS 使用系统自带的 `sandbox-exec`，无需下载运行包）；MCP 工具由宿主 transport 执行。
 
 ## 使用
 

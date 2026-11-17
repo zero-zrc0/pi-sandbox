@@ -167,6 +167,8 @@ interface PendingTask {
   timer?: NodeJS.Timeout;
   abortHandler?: () => void;
   cancelled?: ExecutionOutcome;
+  /** Set while the task has left the queue but has not registered as active. */
+  starting?: Promise<void>;
 }
 
 interface ActiveExecution {
@@ -513,6 +515,8 @@ export class ExecutionController {
   private generation = 1;
   private disposed = false;
   private readonly queue: PendingTask[] = [];
+  /** Dequeued tasks that are still acquiring a runtime lease or spawning. */
+  private readonly starting = new Map<string, PendingTask>();
   private readonly active = new Map<string, ActiveExecution>();
   private readonly probes = new Set<HelperTransport>();
   private readonly settling = new Set<Promise<void>>();
@@ -582,7 +586,7 @@ export class ExecutionController {
         reason: "execution controller is disposed",
       };
     }
-    if (this.active.size + this.probes.size >= this.maxConcurrent) {
+    if (this.active.size + this.probes.size + this.starting.size >= this.maxConcurrent) {
       return {
         status: "setup-failed",
         reason: "helper probe limit reached",
@@ -703,7 +707,8 @@ export class ExecutionController {
         "invalid-plan",
       );
     }
-    if (this.queue.length >= this.maxQueue && this.active.size + this.probes.size >= this.maxConcurrent) {
+    if (this.queue.length >= this.maxQueue &&
+        this.active.size + this.probes.size + this.starting.size >= this.maxConcurrent) {
       return this.immediateFailure(
         plan,
         "sandbox-queue-full",
@@ -720,6 +725,7 @@ export class ExecutionController {
     const key = keyFor(plan);
     if (
       this.active.has(key) ||
+      this.starting.has(key) ||
       this.queue.some((task) => keyFor(task.plan) === key)
     ) {
       return this.immediateFailure(
@@ -767,6 +773,9 @@ export class ExecutionController {
   async updateConfiguration(): Promise<void> {
     this.generation += 1;
     this.invalidateQueued("plan-invalidated", "configuration changed");
+    for (const task of this.starting.values()) {
+      this.cancelStarting(task, "plan-invalidated", "configuration changed");
+    }
     for (const active of this.active.values()) {
       this.beginCancel(active, "plan-invalidated", "configuration changed");
     }
@@ -784,6 +793,10 @@ export class ExecutionController {
       (task) => task.plan.sessionId === sessionId,
     );
     const cancelled: Promise<void>[] = [];
+    for (const task of this.starting.values()) {
+      if (task.plan.sessionId !== sessionId) continue;
+      cancelled.push(this.cancelStarting(task, "session-disposed", reason));
+    }
     for (const active of this.active.values()) {
       if (active.task.plan.sessionId !== sessionId) continue;
       cancelled.push(active.task.settled);
@@ -802,6 +815,10 @@ export class ExecutionController {
       (task) => task.plan.requestId === requestId,
     );
     const cancelled: Promise<void>[] = [];
+    for (const task of this.starting.values()) {
+      if (task.plan.requestId !== requestId) continue;
+      cancelled.push(this.cancelStarting(task, "execution-cancelled", reason));
+    }
     for (const active of this.active.values()) {
       if (active.task.plan.requestId !== requestId) continue;
       cancelled.push(active.task.settled);
@@ -818,6 +835,9 @@ export class ExecutionController {
     this.disposed = true;
     this.generation += 1;
     this.invalidateQueued("session-disposed", "controller disposed");
+    for (const task of this.starting.values()) {
+      this.cancelStarting(task, "session-disposed", "controller disposed");
+    }
     for (const active of this.active.values()) {
       this.beginCancel(active, "session-disposed", "controller disposed");
     }
@@ -832,7 +852,7 @@ export class ExecutionController {
   private drain(): void {
     while (
       !this.disposed &&
-      this.active.size + this.probes.size < this.maxConcurrent &&
+      this.active.size + this.probes.size + this.starting.size < this.maxConcurrent &&
       this.queue.length > 0
     ) {
       const task = this.queue.shift()!;
@@ -841,10 +861,25 @@ export class ExecutionController {
         continue;
       }
       this.clearQueued(task);
+      const key = keyFor(task.plan);
+      this.starting.set(key, task);
       const run = this.runTask(task);
+      task.starting = run;
       this.settling.add(run);
-      void run.finally(() => this.settling.delete(run));
+      void run.finally(() => {
+        this.settling.delete(run);
+        if (this.starting.delete(key)) this.drain();
+      });
     }
+  }
+
+  private cancelStarting(
+    task: PendingTask,
+    code: CancellationCode,
+    reason: string,
+  ): Promise<void> {
+    task.cancelled ??= this.queuedCancelled(task, code, reason);
+    return task.starting ?? Promise.resolve();
   }
 
   private removeQueued(task: PendingTask): void {
@@ -1106,6 +1141,10 @@ export class ExecutionController {
   private async runTask(task: PendingTask): Promise<void> {
     const plan = task.plan;
     const generation = task.generation;
+    if (task.cancelled) {
+      task.resolve(task.cancelled);
+      return;
+    }
     if (generation !== this.generation || this.disposed) {
       task.resolve(
         this.queuedCancelled(task, "plan-invalidated", "configuration changed"),
@@ -1161,6 +1200,10 @@ export class ExecutionController {
     try {
       releaseRuntimeUse = await this.runtimeUseLease?.();
     } catch (error) {
+      if (task.cancelled) {
+        task.resolve(task.cancelled);
+        return;
+      }
       task.resolve(this.failureOutcome(
         plan,
         generation,
@@ -1172,6 +1215,18 @@ export class ExecutionController {
           reason: error instanceof Error ? error.message : String(error),
         },
       ));
+      return;
+    }
+    if (task.cancelled) {
+      try { releaseRuntimeUse?.(); } catch { /* Keep the cancellation outcome when lease cleanup fails. */ }
+      task.resolve(task.cancelled);
+      return;
+    }
+    if (generation !== this.generation || this.disposed) {
+      try { releaseRuntimeUse?.(); } catch { /* Keep the cancellation outcome when lease cleanup fails. */ }
+      task.resolve(
+        this.queuedCancelled(task, "plan-invalidated", "configuration changed"),
+      );
       return;
     }
     const releaseUse = () => {
@@ -1226,6 +1281,7 @@ export class ExecutionController {
       egressSettled: false,
     };
     this.active.set(keyFor(plan), active);
+    this.starting.delete(keyFor(plan));
 
     const addTimer = (timer: NodeJS.Timeout): void => {
       timer.unref?.();

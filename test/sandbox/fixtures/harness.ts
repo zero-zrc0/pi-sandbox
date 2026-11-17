@@ -1,4 +1,4 @@
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,7 +32,10 @@ export interface TestLayout {
 }
 
 export function createTestLayout(prefix = "plan11-exec"): TestLayout {
-  const root = mkdtempSync(join(tmpdir(), `${prefix}-`));
+  // macOS exposes the per-user temp directory through the /var symlink while
+  // realpath returns /private/var. Canonicalize once so fixtures that compare
+  // sandbox paths (which the helper canonicalizes) stay aligned.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), `${prefix}-`)));
   const layout = {
     root,
     installRoot: join(root, "helper"),
@@ -88,6 +91,7 @@ export function fixtureEnvironment(
     "ComSpec",
     "TEMP",
     "TMP",
+    "TMPDIR",
     "HOME",
     "USERPROFILE",
   ]) {
@@ -110,6 +114,7 @@ export function runtimeEnvironment(): Readonly<Record<string, string>> {
     "ComSpec",
     "TEMP",
     "TMP",
+    "TMPDIR",
   ]) {
     const value = process.env[name];
     if (typeof value === "string") result[name] = value;

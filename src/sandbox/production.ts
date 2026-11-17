@@ -20,6 +20,7 @@ import { EgressService } from "./egress/index";
 import { createPiExecutionAdapter, type AnyToolDefinition, type PiExecutionAdapter } from "./pi";
 import { selectExecutionEnvironment } from "./plan";
 import { findSystemBubblewrap } from "./backend/linux/bwrap-selection.mjs";
+import { prepareMacOSHelperProcess } from "./backend/macos/index";
 import { toRuntimeNetworkScope } from "./network-scope";
 import { BUILTIN_TOOL_NAMES, type ExecutionRecord, type FilesystemGrantInput } from "./types";
 import { EXECUTION_INSTALL_ROOT } from "./platform";
@@ -29,7 +30,7 @@ import { acquireRuntimeUseLease } from "./runtime-installation";
 import { ManagedMcpTransports } from "./mcp";
 import { resolveHostPathIdentity, findProtectedControlRoot, isPathWithin } from "./path";
 import { ensureSessionWorkspace } from "./session-workspace";
-import { builtinToolPath } from "./builtin-path";
+import { builtinToolPath, resolveTemporaryToolPath } from "./builtin-path";
 import type { ToolElevation } from "../elevation";
 import type { SandboxBypassReviewInput } from "../approve-core/host";
 import { hasApprovedCodemodeScope } from "./codemode/approval-scope";
@@ -54,6 +55,7 @@ type Review = (input?: { readonly ask?: boolean }) => Promise<ReviewOutcome>;
 const factories = [createBashToolDefinition, createPowerShellToolDefinition, createReadToolDefinition,
   createWriteToolDefinition, createEditToolDefinition, createGrepToolDefinition,
   createFindToolDefinition, createLsToolDefinition];
+const FILE_TOOL_NAMES = new Set(["read", "write", "edit", "grep", "find", "ls"]);
 
 export interface ControlledExecutionOptions {
   readonly registrationPath?: string;
@@ -134,6 +136,29 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     return { ...environment(), PI_SANDBOX_WORK_DIR: workspace, TEMP: temporary, TMP: temporary, TMPDIR: temporary };
   };
   const snapshot = (ctx: ExtensionContext) => options.snapshot(ctx);
+
+  /**
+   * A sandboxed session keeps its temporary files in the session workspace,
+   * but file-tool arguments are not shell-expanded: a literal `$TMPDIR`
+   * would name a project entry while the sandboxed shell resolves it to the
+   * workspace. Rewrite that spelling once, before rules, approval, capture
+   * and the tool itself read it, so the read or write targets the temporary
+   * directory the sandbox actually grants.
+   */
+  function mapTemporaryFilePath(event: ToolCallEvent, ctx: ExtensionContext): void {
+    if (!FILE_TOOL_NAMES.has(event.toolName)) return;
+    const input = event.input as Record<string, unknown>;
+    const path = input.path;
+    if (typeof path !== "string") return;
+    const current = snapshot(ctx);
+    if (current.config.mode === "full-access") return;
+    const host = environment();
+    const temporaryRoot = current.config.experimental.sandboxEnabled
+      ? executionEnvironment(ctx).TMPDIR
+      : host.TMPDIR;
+    const mapped = resolveTemporaryToolPath(path, host, temporaryRoot);
+    if (mapped !== undefined) input.path = mapped;
+  }
   const host = {
     getAllTools: () => api.getAllTools(),
     readRequester: (ctx: ExtensionToolContext) => ({ sessionId: ctx.sessionManager.getSessionId(), agentName: getActiveAgentName(ctx) ?? null }),
@@ -202,6 +227,9 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     });
     const runtime = current.config.experimental.sandboxEnabled ? readyRuntime() : undefined;
     const runtimeStorageRoot = runtime?.storageRoot;
+    // The macOS runtime is the system sandbox-exec: it has no storage root,
+    // no use lease and no runtime directory to pass or protect.
+    const macOSSystemRuntime = runtime?.manifest.platform === "darwin";
     const backendId = runtime?.manifest.backendId ?? "unsupported-platform";
     const currentEnvironment = environment();
     const systemBubblewrapPath = process.platform === "linux" && runtime !== undefined
@@ -216,19 +244,20 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
         args: [fileURLToPath(new URL(`./backend/${process.platform === "linux" ? "linux" : process.platform === "darwin" ? "macos" : "windows"}/helper.mjs`, import.meta.url))],
         expectedBackendId: backendId,
       },
-      ...(runtime === undefined ? {} : {
+      ...(runtime === undefined || macOSSystemRuntime ? {} : {
         runtimeUseLease: () => acquireRuntimeUseLease({
           storageRoot: runtime.storageRoot,
           platform: runtime.manifest.platform,
           arch: runtime.manifest.arch,
         }),
       }),
+      ...(process.platform === "darwin" ? { prepareHelperProcess: prepareMacOSHelperProcess } : {}),
       helperCwd: resolve(process.env.TEMP ?? process.env.TMPDIR ?? "/tmp"),
       workspace: ctx.cwd, helperEnvironment: {
         ...currentEnvironment, PI_MXC_AGENT_DIR: agentDirectory,
         PI_SANDBOX_WORKSPACE_ROOT: resolve(ctx.cwd),
         ...(process.env.LOCALAPPDATA ? { LOCALAPPDATA: process.env.LOCALAPPDATA } : {}),
-        ...(runtime === undefined ? {} : {
+        ...(runtime === undefined || macOSSystemRuntime ? {} : {
           PI_SANDBOX_RUNTIME_DIR: runtime.directory,
           PI_SANDBOX_RUNTIME_ROOT: runtimeStorageRoot!,
         }),
@@ -257,7 +286,8 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       plan: {
         mode: current.config.mode, configRevision: key,
         backendId,
-        protectedPaths: [EXECUTION_INSTALL_ROOT, ...(runtime === undefined ? [] : [runtimeStorageRoot!, runtime.directory]),
+        protectedPaths: [EXECUTION_INSTALL_ROOT,
+          ...(runtime === undefined || macOSSystemRuntime ? [] : [runtimeStorageRoot!, runtime.directory]),
           ...(systemBubblewrapPath === undefined ? [] : [systemBubblewrapPath])],
         ...(current.config.execution.shell === undefined ? {} : {
           shellBaseline: {
@@ -722,6 +752,7 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     async guard(event: ToolCallEvent, ctx: ExtensionContext, review: Review): Promise<ReviewOutcome> {
       if (event.toolName === disabledShell) return { block: true, reason: disabledShellReason };
       const current = await session(ctx);
+      mapTemporaryFilePath(event, ctx);
       const ruleMatch = evaluateToolRules(current.snapshot.toolRules, {
         tool: event.toolName,
         args: event.input,

@@ -1,16 +1,18 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseRuntimeCatalog } from "#sandbox/runtime-catalog";
-import { SandboxRuntimeManager } from "#sandbox/runtime-manager";
+import { SandboxRuntimeManager, type SandboxRuntimeManagerOptions } from "#sandbox/runtime-manager";
+import type { ResolvedRuntimeFiles } from "#sandbox/runtime-store";
 
 const temporaryDirectories: string[] = [];
 const sdkRevision = "b21120168d70befe12356411423266bfef168446";
 
 function runtime(pluginRoot: string, version: string): void {
-  const directory = join(pluginRoot, "runtimes", version, "win32-x64");
+  // runtimes use the fixed `<platform>-<arch>` layout; the version lives in runtime.json.
+  const directory = join(pluginRoot, "runtimes", "win32-x64");
   mkdirSync(directory, { recursive: true });
   const executable = Buffer.from(`mxc-${version}`);
   const executableHash = createHash("sha256").update(executable).digest("hex");
@@ -116,6 +118,10 @@ describe("SandboxRuntimeManager", () => {
     const pluginRoot = join(root(), "plugin");
     mkdirSync(pluginRoot);
     runtime(pluginRoot, "1.0.0");
+    // The catalog must describe the exact bytes on disk, otherwise the manual
+    // runtime is not recognized as the cataloged release.
+    const directory = join(pluginRoot, "runtimes", "win32-x64");
+    const sha256 = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
     const catalog = parseRuntimeCatalog({ schemaVersion: 1, runtimes: [{
       version: "1.0.0",
       stable: true,
@@ -130,9 +136,9 @@ describe("SandboxRuntimeManager", () => {
       archiveSizeBytes: 100,
       archiveSha256: "a".repeat(64),
       files: [
-        { role: "runtimeManifest", path: "runtime.json", sha256: "a".repeat(64), executable: false },
-        { role: "windowsExecutable", path: "pi-sandbox-windows-mxc.exe", sha256: "a".repeat(64), executable: true },
-        { role: "mxcManifest", path: "mxc-runtime.json", sha256: "a".repeat(64), executable: false },
+        { role: "runtimeManifest", path: "runtime.json", sha256: sha256(join(directory, "runtime.json")), executable: false },
+        { role: "windowsExecutable", path: "pi-sandbox-windows-mxc.exe", sha256: sha256(join(directory, "pi-sandbox-windows-mxc.exe")), executable: true },
+        { role: "mxcManifest", path: "mxc-runtime.json", sha256: sha256(join(directory, "mxc-runtime.json")), executable: false },
       ],
     }] });
     const manager = new SandboxRuntimeManager({
@@ -196,5 +202,110 @@ describe("SandboxRuntimeManager", () => {
     expect(await manager.disable()).toEqual({ status: "disabled" });
     await preparation;
     expect(manager.state()).toEqual({ status: "disabled" });
+  });
+});
+
+describe("SandboxRuntimeManager macOS system runtime", () => {
+  function macOSManager(pluginRoot: string, probe: SandboxRuntimeManagerOptions["probe"], arch = "arm64") {
+    return new SandboxRuntimeManager({
+      pluginRoot,
+      catalog: { schemaVersion: 1, runtimes: [] },
+      platform: "darwin",
+      arch,
+      pluginVersion: "1.2.0",
+      protocolVersion: 2,
+      probe,
+    });
+  }
+
+  it("prepares a synthetic system runtime without a runtime directory or download", async () => {
+    // The plugin root deliberately does not exist: the system runtime must not
+    // touch storage, scan a catalog, or prompt for a download.
+    const pluginRoot = join(root(), "plugin");
+    let probedRuntime: ResolvedRuntimeFiles | undefined;
+    const probe = vi.fn<SandboxRuntimeManagerOptions["probe"]>(async runtime => {
+      probedRuntime = runtime;
+      return { available: true };
+    });
+    const fetch = vi.fn(async () => { throw new Error("macOS must not download a runtime"); });
+    const manager = new SandboxRuntimeManager({
+      pluginRoot,
+      catalog: { schemaVersion: 1, runtimes: [] },
+      platform: "darwin",
+      arch: "arm64",
+      pluginVersion: "1.2.0",
+      protocolVersion: 2,
+      probe,
+      fetch,
+    });
+    const confirmDownload = vi.fn(async () => true);
+
+    const state = await manager.prepare({ workspaceRoot: workspace(), confirmDownload });
+
+    expect(confirmDownload).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(state.status).toBe("ready");
+    if (state.status === "ready") {
+      expect(state.runtime.manifest).toEqual({
+        schemaVersion: 1,
+        version: "1.2.0",
+        stable: true,
+        platform: "darwin",
+        arch: "arm64",
+        protocolVersion: 2,
+        minPluginVersion: "0.0.0",
+        maxPluginVersionExclusive: "999999.999.999",
+        backendId: "macos-seatbelt",
+        files: [],
+      });
+      expect(state.runtime.directory).toBe(join(pluginRoot, "runtimes", "darwin-arm64"));
+      expect(state.runtime.storageRoot).toBe(pluginRoot);
+      expect(state.runtime.source).toBe("manual");
+      expect(state.runtime.files).toEqual({});
+      expect(probedRuntime).toBe(state.runtime);
+    }
+  });
+
+  it("reports the probe reason when the system runtime is unusable", async () => {
+    const manager = macOSManager(join(root(), "plugin"), async () => ({
+      available: false,
+      reason: "sandbox-exec did not pass the default-deny file probe",
+    }));
+
+    expect(await manager.prepare({ workspaceRoot: workspace() })).toEqual({
+      status: "unavailable",
+      reason: "sandbox-exec did not pass the default-deny file probe",
+    });
+  });
+
+  it("keeps the unsupported-platform error for platforms without a system runtime", async () => {
+    const probe = vi.fn(async () => ({ available: true }));
+    const manager = new SandboxRuntimeManager({
+      pluginRoot: join(root(), "plugin"),
+      catalog: { schemaVersion: 1, runtimes: [] },
+      platform: "freebsd",
+      arch: "x64",
+      pluginVersion: "1.2.0",
+      protocolVersion: 2,
+      probe,
+    });
+
+    expect(await manager.prepare({ workspaceRoot: workspace() })).toEqual({
+      status: "unavailable",
+      reason: "OS sandbox is unsupported on freebsd",
+    });
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unsupported macOS architecture before probing", async () => {
+    const probe = vi.fn(async () => ({ available: true }));
+    const manager = macOSManager(join(root(), "plugin"), probe, "ia32");
+
+    expect(await manager.prepare({ workspaceRoot: workspace() })).toEqual({
+      status: "unavailable",
+      reason: "OS sandbox is unsupported on darwin/ia32",
+    });
+    expect(probe).not.toHaveBeenCalled();
   });
 });

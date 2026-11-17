@@ -2,7 +2,7 @@ import { join } from "node:path";
 
 import {
   realpathSync,
-  rmdirSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -167,7 +167,7 @@ describe("trusted helper resolution", () => {
       if (result.ok) return;
       expect(result.reason).toContain("workspace");
     } finally {
-      rmdirSync(junction);
+      rmSync(junction, { recursive: true, force: true });
       removeTestLayout(layout);
     }
   });
@@ -193,7 +193,7 @@ describe("trusted helper resolution", () => {
       if (result.ok) return;
       expect(result.reason).toContain("install root");
     } finally {
-      rmdirSync(linked);
+      rmSync(linked, { recursive: true, force: true });
       removeTestLayout(layout);
     }
   });

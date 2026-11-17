@@ -205,13 +205,20 @@ describe("PowerShell structure analysis", () => {
 
     const analysis = analyzePowerShellParse({ call, commandText: source, cwd: "C:\\workspace", result, platform: "win32" });
 
+    // Output follows source order. The unresolved location-change itself is
+    // unknown, the read at the same offset uses the context before it, and the
+    // later read is incomplete because the script changed location first.
     expect(analysis.operations[0]).toMatchObject({
-      fileTargets: { status: "unknown", reason: "script-context-changed" },
+      fileTargets: { status: "unknown", reason: "language-operation:location-change" },
       complete: false,
     });
-    expect(analysis.operations[2]).toMatchObject({
+    expect(analysis.operations[1]).toMatchObject({
       fileTargets: { status: "known", value: [{ path: "C:\\workspace\\same-position.txt", effect: "file.read" }] },
       complete: true,
+    });
+    expect(analysis.operations[2]).toMatchObject({
+      fileTargets: { status: "unknown", reason: "script-context-changed" },
+      complete: false,
     });
     expect(analysis.programInvocations[0]?.cwd).toMatchObject({ status: "unknown" });
   });

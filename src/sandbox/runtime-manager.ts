@@ -3,9 +3,13 @@ import { join, relative, resolve } from "node:path";
 import type { RuntimeCatalog, RuntimeResourceEntry } from "./runtime-catalog";
 import { installRuntimeEntry } from "./runtime-installation";
 import { scanInstalledRuntimes, validateInstalledRuntime, type ResolvedRuntimeFiles } from "./runtime-store";
+import type { RuntimeManifest } from "./runtime-manifest";
 import { selectRuntime } from "./runtime-selection";
 import type { RuntimeDownloadProgress } from "./runtime-download";
 import { isPathWithin } from "./path";
+
+const MACOS_BACKEND_ID = "macos-seatbelt";
+const MACOS_PLATFORM = "darwin";
 
 export type SandboxRuntimeState =
   | { readonly status: "disabled" }
@@ -60,6 +64,36 @@ function ensureRuntimeStorageRoot(path: string, agentDir?: string): string {
   return current;
 }
 
+/**
+ * macOS needs no downloaded runtime: `/usr/bin/sandbox-exec` is system-provided.
+ * The ready state therefore carries a synthetic manifest whose backend id
+ * selects the Seatbelt backend and an empty file set.
+ */
+function macOSSystemRuntime(
+  options: SandboxRuntimeManagerOptions,
+  arch: "x64" | "arm64",
+): ResolvedRuntimeFiles {
+  const manifest: RuntimeManifest = {
+    schemaVersion: 1,
+    version: options.pluginVersion,
+    stable: true,
+    platform: MACOS_PLATFORM,
+    arch,
+    protocolVersion: options.protocolVersion,
+    minPluginVersion: "0.0.0",
+    maxPluginVersionExclusive: "999999.999.999",
+    backendId: MACOS_BACKEND_ID,
+    files: [],
+  };
+  return {
+    directory: join(options.pluginRoot, "runtimes", `${MACOS_PLATFORM}-${arch}`),
+    storageRoot: options.pluginRoot,
+    manifest,
+    source: "manual",
+    files: {},
+  };
+}
+
 export class SandboxRuntimeManager {
   private stateValue: SandboxRuntimeState = { status: "disabled" };
   private preparedRuntime: ResolvedRuntimeFiles | undefined;
@@ -105,11 +139,22 @@ export class SandboxRuntimeManager {
     this.stateValue = { status: "preparing" };
     const run = async (): Promise<SandboxRuntimeState> => {
       try {
-        if (this.options.platform !== "linux" && this.options.platform !== "win32") {
+        if (this.options.platform !== "linux" && this.options.platform !== "win32" &&
+            this.options.platform !== MACOS_PLATFORM) {
           throw new Error(`OS sandbox is unsupported on ${this.options.platform}`);
         }
         if (this.options.arch !== "x64" && this.options.arch !== "arm64") {
           throw new Error(`OS sandbox is unsupported on ${this.options.platform}/${this.options.arch}`);
+        }
+        if (this.options.platform === MACOS_PLATFORM) {
+          // System runtime: no storage root, no catalog scan, no download lease.
+          const runtime = macOSSystemRuntime(this.options, this.options.arch === "arm64" ? "arm64" : "x64");
+          const probe = await this.options.probe(runtime, { signal, workspaceRoot: input.workspaceRoot });
+          if (generation !== this.generation || signal.aborted) return this.stateValue;
+          if (!probe.available) throw new Error(probe.reason ?? "runtime capability probe failed");
+          this.preparedRuntime = runtime;
+          this.stateValue = { status: "ready", runtime };
+          return this.stateValue;
         }
         const pluginRoot = ensureRuntimeStorageRoot(this.options.pluginRoot, this.options.agentDir);
         const workspaceRoot = realpathSync(input.workspaceRoot);

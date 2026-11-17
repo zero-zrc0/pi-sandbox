@@ -9,8 +9,21 @@ import type { ExecutionPlan } from "#sandbox/types";
 export const MACOS_SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
 
 const MAX_PROFILE_BYTES = 64 * 1024;
+/*
+ * macOS 26 dyld aborts every child of a deny-default profile unless the volume
+ * root directory itself is readable. A `(subpath "/")` rule would grant the
+ * whole filesystem, so this must stay a literal rule.
+ */
+const VOLUME_ROOT_READ_RULE = '(allow file-read* (literal "/"))';
+/*
+ * Path resolution stats every ancestor directory. Without global metadata
+ * reads an otherwise granted path under a symlinked parent (/tmp, /var) is
+ * reported as EPERM before the grant is ever matched.
+ */
+const METADATA_READ_RULE = '(allow file-read-metadata (subpath "/"))';
 const SYSTEM_READ_PATHS = [
   "/System/Library",
+  "/System/Volumes/Preboot",
   "/bin",
   "/private/var/db/dyld",
   "/sbin",
@@ -51,6 +64,26 @@ const HOME_SECRET_FILES = [
   ".npmrc",
   ".pypirc",
   ".pi/agent/auth.json",
+  "Library/Application Support/com.apple.TCC/TCC.db",
+] as const;
+
+/*
+ * System credential stores: the OS protects most of them with POSIX modes, but
+ * some (DarwinDirectory, System.keychain, TCC) are world-readable, so the
+ * sandbox layer must deny them explicitly instead of relying on DAC. These
+ * rules are emitted last because a later rule overrides an earlier one.
+ */
+const SYSTEM_DENY_PATHS = [
+  { path: "/private/var/db/dslocal", granularity: "directory" },
+  { path: "/private/var/db/DarwinDirectory", granularity: "directory" },
+  { path: "/private/var/db/auth.db", granularity: "file" },
+  { path: "/private/etc/master.passwd", granularity: "file" },
+  { path: "/private/etc/sudoers", granularity: "file" },
+  { path: "/private/etc/sudoers.d", granularity: "directory" },
+  { path: "/private/var/db/sudo", granularity: "directory" },
+  { path: "/private/var/db/SystemPolicyConfiguration", granularity: "directory" },
+  { path: "/Library/Keychains/System.keychain", granularity: "file" },
+  { path: "/Library/Application Support/com.apple.TCC/TCC.db", granularity: "file" },
 ] as const;
 
 export type MacOSSeatbeltProbe =
@@ -151,6 +184,7 @@ function probeMacOSSeatbeltOnce(): MacOSSeatbeltProbe {
   const probeProfile = [
     "(version 1)",
     "(deny default)",
+    VOLUME_ROOT_READ_RULE,
     "(allow process-exec)",
     "(allow file-read* (subpath \"/System/Library\"))",
     "(allow file-read* (subpath \"/bin\"))",
@@ -202,6 +236,8 @@ export function buildSeatbeltProfile(input: {
   const rules = [
     "(version 1)",
     "(deny default)",
+    VOLUME_ROOT_READ_RULE,
+    METADATA_READ_RULE,
     "(allow process-exec)",
     "(allow process-fork)",
     "(allow sysctl-read)",
@@ -220,6 +256,23 @@ export function buildSeatbeltProfile(input: {
   const nullWrite = pathRule("allow", "file-write*", "/dev/null", "file");
   if (!nullWrite.ok) return nullWrite;
   rules.push(nullWrite.value);
+
+  /*
+   * The helper is node itself, and an nvm install lives outside /usr and
+   * /System: dyld needs the canonical binary plus its directory readable.
+   */
+  const nodeExecutable = canonicalPath(process.execPath);
+  if (!nodeExecutable.ok) return nodeExecutable;
+  const nodeFileRead = pathRule("allow", "file-read*", nodeExecutable.path, "file");
+  if (!nodeFileRead.ok) return nodeFileRead;
+  const nodeDirectoryRead = pathRule(
+    "allow",
+    "file-read*",
+    dirname(nodeExecutable.path),
+    "directory",
+  );
+  if (!nodeDirectoryRead.ok) return nodeDirectoryRead;
+  rules.push(nodeFileRead.value, nodeDirectoryRead.value);
 
   const installRoot = canonicalPath(input.installation.installRoot);
   if (!installRoot.ok) return installRoot;
@@ -310,6 +363,23 @@ export function buildSeatbeltProfile(input: {
     const rule = pathRule("deny", "file-write*", path, "directory");
     if (!rule.ok) return rule;
     rules.push(rule.value);
+  }
+
+  for (const entry of SYSTEM_DENY_PATHS) {
+    const target = canonicalPath(entry.path);
+    if (!target.ok) return target;
+    /*
+     * `file-read*` does not cover `file-read-metadata` (verified against
+     * Seatbelt on macOS 26), so the metadata deny has to be explicit, otherwise
+     * the store stays stat-able through the global metadata allow above.
+     */
+    const metadataDeny = pathRule("deny", "file-read-metadata", target.path, entry.granularity);
+    if (!metadataDeny.ok) return metadataDeny;
+    const readDeny = pathRule("deny", "file-read*", target.path, entry.granularity);
+    if (!readDeny.ok) return readDeny;
+    const writeDeny = pathRule("deny", "file-write*", target.path, entry.granularity);
+    if (!writeDeny.ok) return writeDeny;
+    rules.push(metadataDeny.value, readDeny.value, writeDeny.value);
   }
 
   const profile = `${rules.join("\n")}\n`;

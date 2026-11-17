@@ -17,6 +17,11 @@ export function resolveGlobalExtensionConfigDir(agentDir: string): string {
   return joinPath(agentDir, COMPAT_PATH_NAMES.extensionsDirName, EXTENSION_PACKAGE_NAME);
 }
 
+/** The debug log file for one agent directory; the single source for `ConfigPaths.debugLogFile`. */
+export function resolveDebugLogFile(agentDir: string): string {
+  return joinPath(agentDir, COMPAT_PATH_NAMES.logDirName, COMPAT_PATH_NAMES.debugLogFileName);
+}
+
 export interface ConfigPathRoots {
   readonly agentDir: string;
   readonly cwd: string;
@@ -52,7 +57,7 @@ export function resolveConfigPaths(roots: ConfigPathRoots): ConfigPaths {
     projectConfigDir,
     projectConfigFile: joinPath(projectConfigDir, COMPAT_PATH_NAMES.configFileName),
     logDir,
-    debugLogFile: joinPath(logDir, COMPAT_PATH_NAMES.debugLogFileName),
+    debugLogFile: resolveDebugLogFile(roots.agentDir),
     reviewLogFile: joinPath(logDir, COMPAT_PATH_NAMES.reviewLogFileName),
     projectAgentsDir: joinPath(
       roots.cwd,

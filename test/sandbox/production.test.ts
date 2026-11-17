@@ -411,6 +411,62 @@ describe("production controlled execution boundary", () => {
     expect(existsSync(target)).toBe(false);
   });
 
+  it("maps host temporary paths onto the session sandbox temporary directory", async () => {
+    const hostTemp = mkdtempSync(join(tmpdir(), "pi-sandbox-host-temp-"));
+    cleanup.push(async () => rmSync(hostTemp, { recursive: true, force: true }));
+    const previous = process.env.TMPDIR;
+    process.env.TMPDIR = hostTemp;
+    try {
+      const rig = setup();
+      const workspace = rig.execution.sessionWorkspace(rig.ctx);
+      const expected = join(workspace, "tmp", "notes.txt");
+
+      const spelled = { type: "tool_call" as const, toolName: "write", toolCallId: "temp-variable-write",
+        input: { path: "$TMPDIR/notes.txt", content: "sandboxed" } };
+      expect(await rig.execution.guard(spelled, rig.ctx, async () => undefined)).toBeUndefined();
+      expect(spelled.input.path).toBe(expected);
+
+      const expanded = { type: "tool_call" as const, toolName: "read", toolCallId: "temp-host-read",
+        input: { path: join(hostTemp, "notes.txt") } };
+      expect(await rig.execution.guard(expanded, rig.ctx, async () => undefined)).toMatchObject({
+        block: true,
+        reason: expect.stringContaining('tier "host"'),
+      });
+      expect(expanded.input.path).toBe(join(hostTemp, "notes.txt"));
+
+      const braces = { type: "tool_call" as const, toolName: "edit", toolCallId: "temp-braced-write",
+        input: { path: "${TMPDIR}/notes.txt", oldText: "a", newText: "b" } };
+      await rig.execution.guard(braces, rig.ctx, async () => undefined);
+      expect(braces.input.path).toBe(expected);
+    } finally {
+      if (previous === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previous;
+    }
+  });
+
+  it("maps temporary paths to the host temporary directory when the sandbox is off and neither is touched in full-access", async () => {
+    const hostTemp = mkdtempSync(join(tmpdir(), "pi-sandbox-host-temp-"));
+    cleanup.push(async () => rmSync(hostTemp, { recursive: true, force: true }));
+    const previous = process.env.TMPDIR;
+    process.env.TMPDIR = hostTemp;
+    try {
+      const unsandboxed = setup("default", false, "ok", false);
+      const mapped = { type: "tool_call" as const, toolName: "write", toolCallId: "host-temp-write",
+        input: { path: "$TMPDIR/notes.txt", content: "host" } };
+      await unsandboxed.execution.guard(mapped, unsandboxed.ctx, async () => undefined);
+      expect(mapped.input.path).toBe(join(hostTemp, "notes.txt"));
+
+      const fullAccess = setup("full-access");
+      const unchanged = { type: "tool_call" as const, toolName: "write", toolCallId: "full-access-temp",
+        input: { path: "$TMPDIR/notes.txt", content: "host" } };
+      await fullAccess.execution.guard(unchanged, fullAccess.ctx, async () => undefined);
+      expect(unchanged.input.path).toBe("$TMPDIR/notes.txt");
+    } finally {
+      if (previous === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previous;
+    }
+  });
+
   it("executes an external Host file request only after the elevation reviewer approves", async () => {
     const rig = setup("read-only");
     const target = join(rig.layout.agent, "approved-host.txt");
