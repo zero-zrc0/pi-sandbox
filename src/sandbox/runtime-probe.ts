@@ -28,6 +28,7 @@ export async function probeSandboxRuntime(input: {
     helperEnvironment: {
       ...selectExecutionEnvironment(process.env as Record<string, string>),
       PI_SANDBOX_RUNTIME_DIR: input.runtime.directory,
+      PI_SANDBOX_RUNTIME_ROOT: input.runtime.storageRoot,
       PI_SANDBOX_WORKSPACE_ROOT: resolve(input.workspaceRoot),
       ...(process.env.LOCALAPPDATA ? { LOCALAPPDATA: process.env.LOCALAPPDATA } : {}),
     },

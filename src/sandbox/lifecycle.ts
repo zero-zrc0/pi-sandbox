@@ -120,6 +120,7 @@ export interface ExecutionControllerOptions {
   readonly workspace?: string;
   /** Explicitly filtered helper environment; never the controller environment. */
   readonly helperEnvironment: Readonly<Record<string, string>>;
+  readonly runtimeUseLease?: () => Promise<() => void>;
   /** Host-owned hook to apply a platform boundary before the helper starts. */
   readonly prepareHelperProcess?: PrepareHelperProcess;
   readonly startTimeoutMs?: number;
@@ -498,6 +499,7 @@ export class ExecutionController {
   private readonly helperCwd: string;
   private readonly workspace: string | undefined;
   private readonly helperEnvironment: Readonly<Record<string, string>>;
+  private readonly runtimeUseLease: ExecutionControllerOptions["runtimeUseLease"];
   private readonly prepareHelperProcess: PrepareHelperProcess | undefined;
   private readonly startTimeoutMs: number;
   private readonly cancelGraceMs: number;
@@ -521,6 +523,7 @@ export class ExecutionController {
     this.helperCwd = options.helperCwd;
     this.workspace = options.workspace;
     this.helperEnvironment = Object.freeze({ ...options.helperEnvironment });
+    this.runtimeUseLease = options.runtimeUseLease;
     this.prepareHelperProcess = options.prepareHelperProcess;
     this.startTimeoutMs = options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
     this.cancelGraceMs = options.cancelGraceMs ?? DEFAULT_CANCEL_GRACE_MS;
@@ -1154,8 +1157,30 @@ export class ExecutionController {
       return;
     }
 
+    let releaseRuntimeUse: (() => void) | undefined;
+    try {
+      releaseRuntimeUse = await this.runtimeUseLease?.();
+    } catch (error) {
+      task.resolve(this.failureOutcome(
+        plan,
+        generation,
+        "failed",
+        false,
+        "none",
+        {
+          code: "sandbox-unavailable",
+          reason: error instanceof Error ? error.message : String(error),
+        },
+      ));
+      return;
+    }
+    const releaseUse = () => {
+      try { releaseRuntimeUse?.(); } catch { /* Keep the execution outcome when lease cleanup fails. */ }
+    };
+
     const spawned = this.resolveAndSpawn(plan);
     if (!spawned.ok) {
+      releaseUse();
       const outcome = this.failureOutcome(
         plan,
         generation,
@@ -1265,6 +1290,7 @@ export class ExecutionController {
     } catch {
       // The outcome already reflects any transport failure; cleanup continues.
     }
+    releaseUse();
     this.active.delete(keyFor(plan));
     if (!active.validityRefusal) this.recordAsync(outcome);
     task.resolve(outcome);

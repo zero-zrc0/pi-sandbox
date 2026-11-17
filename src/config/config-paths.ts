@@ -13,6 +13,10 @@ export const COMPAT_PATH_NAMES = Object.freeze({
   legacyExtensionConfigFileName: "config.json",
 } as const);
 
+export function resolveGlobalExtensionConfigDir(agentDir: string): string {
+  return joinPath(agentDir, COMPAT_PATH_NAMES.extensionsDirName, EXTENSION_PACKAGE_NAME);
+}
+
 export interface ConfigPathRoots {
   readonly agentDir: string;
   readonly cwd: string;
@@ -34,11 +38,7 @@ export interface ConfigPaths {
 }
 
 export function resolveConfigPaths(roots: ConfigPathRoots): ConfigPaths {
-  const globalConfigDir = joinPath(
-    roots.agentDir,
-    COMPAT_PATH_NAMES.extensionsDirName,
-    EXTENSION_PACKAGE_NAME,
-  );
+  const globalConfigDir = resolveGlobalExtensionConfigDir(roots.agentDir);
   const projectConfigDir = joinPath(
     roots.cwd,
     COMPAT_PATH_NAMES.projectDirName,

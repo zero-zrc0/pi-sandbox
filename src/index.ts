@@ -39,7 +39,7 @@ import {
   type ApprovalChainConfigSnapshot,
 } from "#config/owner";
 import { createPolicyLoader, type PolicyLoader } from "#config/policy-loader";
-import { resolveConfigPaths } from "#config/config-paths";
+import { resolveConfigPaths, resolveGlobalExtensionConfigDir } from "#config/config-paths";
 import { createConfigIssueReporter } from "#config/config-issue-reporter";
 import { createPolicyIssueReporter } from "#config/policy-issue-reporter";
 import {
@@ -944,7 +944,8 @@ export default function registerPermissionExtension(
     readFileSync(fileURLToPath(new URL("./sandbox/runtime-catalog.json", import.meta.url)), "utf8"),
   ) as unknown);
   const sandboxRuntime = new SandboxRuntimeManager({
-    pluginRoot: EXECUTION_INSTALL_ROOT,
+    pluginRoot: resolveGlobalExtensionConfigDir(agentDir),
+    agentDir,
     catalog: runtimeCatalog,
     platform: process.platform,
     arch: process.arch,

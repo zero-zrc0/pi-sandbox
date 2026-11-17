@@ -22,6 +22,7 @@ import {
 import { CODEMODE_RUNTIME_LIMITS } from "./limits";
 import { isPathWithin } from "../path";
 import { EXECUTION_INSTALL_ROOT } from "../platform";
+import { acquireRuntimeUseLease } from "../runtime-installation";
 
 type VmLauncher = ConstructorParameters<typeof CodemodeSandboxBase>[1];
 type VmEvents = Parameters<VmLauncher>[1];
@@ -81,6 +82,7 @@ function resolveRuntimeFiles(runtime: ResolvedRuntimeFiles) {
 function requestFor(input: {
   readonly mxc: string;
   readonly runtimeDirectory: string;
+  readonly runtimeStorageRoot: string;
   readonly mxcManifest: string;
   readonly cwd: string;
   readonly executable: string;
@@ -100,7 +102,7 @@ function requestFor(input: {
       backend: { id: "windows-mxc" },
       cwd: input.cwd,
       filesystem,
-      protectedPaths: [EXECUTION_INSTALL_ROOT, input.runtimeDirectory],
+      protectedPaths: [EXECUTION_INSTALL_ROOT, input.runtimeStorageRoot, input.runtimeDirectory],
       network: { kind: "none" },
       environment: {},
     },
@@ -116,11 +118,42 @@ async function launchWindowsRuntime(
 ): Promise<VmChannel> {
   if (process.platform !== "win32") return Promise.reject(new Error("Codemode restricted Runtime is unavailable on this platform"));
   if (!runtime) return Promise.reject(new Error("sandbox-unavailable: Windows runtime is not ready"));
-  const files = resolveRuntimeFiles(runtime);
-  const cwd = realpathSync.native(mkdtempSync(join(tmpdir(), "pi-codemode-runtime-")));
+  let releaseRuntimeUse: () => void;
+  try {
+    releaseRuntimeUse = await acquireRuntimeUseLease({
+      storageRoot: runtime.storageRoot,
+      platform: runtime.manifest.platform,
+      arch: runtime.manifest.arch,
+    });
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  let files: ReturnType<typeof resolveRuntimeFiles>;
+  let cwd: string;
+  try {
+    files = resolveRuntimeFiles(runtime);
+    cwd = realpathSync.native(mkdtempSync(join(tmpdir(), "pi-codemode-runtime-")));
+  } catch (error) {
+    releaseRuntimeUse();
+    return Promise.reject(error);
+  }
   const generation = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const nativeRequest = requestFor({ ...files, runtimeDirectory: runtime.directory, mxcManifest: runtime.files.mxcManifest!, cwd });
+  let nativeRequest: string;
+  try {
+    nativeRequest = requestFor({
+      ...files,
+      runtimeDirectory: runtime.directory,
+      runtimeStorageRoot: runtime.storageRoot,
+      mxcManifest: runtime.files.mxcManifest!,
+      cwd,
+    });
+  } catch (error) {
+    releaseRuntimeUse();
+    rmSync(cwd, { recursive: true, force: true });
+    return Promise.reject(error);
+  }
   if (Buffer.byteLength(nativeRequest, "utf8") > 24_000) {
+    releaseRuntimeUse();
     rmSync(cwd, { recursive: true, force: true });
     return Promise.reject(new Error("Codemode Runtime grant request exceeds the native limit"));
   }
@@ -136,10 +169,12 @@ async function launchWindowsRuntime(
       wasmBase64: files.wasmBase64,
     }, generation, nextMessageId++);
   } catch (error) {
+    releaseRuntimeUse();
     rmSync(cwd, { recursive: true, force: true });
     return Promise.reject(error);
   }
   if (startSequence.byteLength > CODEMODE_RUNTIME_LIMITS.maxQueuedMessageBytes) {
+    releaseRuntimeUse();
     rmSync(cwd, { recursive: true, force: true });
     return Promise.reject(new Error(`Codemode Runtime IPC input queue exceeds ${CODEMODE_RUNTIME_LIMITS.maxQueuedMessageBytes / 1024 / 1024} MiB`));
   }
@@ -147,6 +182,7 @@ async function launchWindowsRuntime(
   let resolveExit!: () => void;
   const exited = new Promise<void>((resolve) => { resolveExit = resolve; });
   if (lifecycle && !lifecycle.transferRuntime(exited)) {
+    releaseRuntimeUse();
     rmSync(cwd, { recursive: true, force: true });
     return Promise.reject(new Error("Codemode execution finished before its Runtime started"));
   }
@@ -165,6 +201,7 @@ async function launchWindowsRuntime(
     }) as ChildProcessWithoutNullStreams;
   } catch (error) {
     resolveExit();
+    releaseRuntimeUse();
     rmSync(cwd, { recursive: true, force: true });
     return Promise.reject(error);
   }
@@ -191,6 +228,7 @@ async function launchWindowsRuntime(
     closed = true;
     clearTimeout(exitTimer);
     rmSync(cwd, { recursive: true, force: true });
+    releaseRuntimeUse();
     resolveExit();
   };
   const fail = (error: Error) => {

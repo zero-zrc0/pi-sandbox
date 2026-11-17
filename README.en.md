@@ -145,7 +145,7 @@ MCP servers use host stdio and HTTP transports. Their tool calls remain under ap
 
 ## OS sandbox runtime
 
-The OS sandbox is disabled by default. Installing or loading the extension and opening Settings do not download or start a native sandbox. Open `/permission settings` → `Experiments` and enable **OS Sandbox**. The extension then checks the fixed runtime directory and installs a matching resource. Automatic downloads accept only Release entries in the catalog shipped with the extension. Manually placed resources are trusted by the user; the extension still checks the fixed path, file layout, platform, architecture, protocol, and system capabilities.
+The OS sandbox is disabled by default. Installing or loading the extension and opening Settings do not download or start a native sandbox. Open `/permission settings` → `Experiments` and enable **OS Sandbox**. The extension checks the fixed runtime directory and selects the newest compatible entry in its bundled catalog. It asks before downloading a missing runtime. It updates an installed runtime in the background after validating and probing the staged files. Manually placed resources are checked for their fixed path, file layout, platform, architecture, protocol, and system capabilities. If a compatible catalog entry exists, its file hashes must also match before a manual runtime is reused.
 
 ```json
 {
@@ -155,7 +155,7 @@ The OS sandbox is disabled by default. Installing or loading the extension and o
 }
 ```
 
-Place runtime files under `<plugin-root>/runtimes/<runtime-version>/<platform>-<arch>/`. Linux x64 and ARM64 runtime packages use musl static native files and include `bwrap` as a fallback. The helper prefers a compatible system `bwrap` found on `PATH` outside the workspace and falls back to the packaged binary when needed. The kernel must still allow user namespaces and provide the required Landlock and seccomp capabilities. If the extension catalog has no resource for the current platform, the status is unavailable and automatic download is not available.
+Runtime files share the global approval-chain configuration directory: `<agentDir>/extensions/pi-sandbox/runtimes/<platform>-<arch>/`. Only one runtime directory is kept per platform and architecture; `runtime.json` records its semantic version. The default `agentDir` is `~/.pi/agent`; set `PI_CODING_AGENT_DIR` to use a custom agent directory. Place manually downloaded runtime files here, outside the npm package and project configuration directory. When Sandbox is enabled, the extension checks its bundled trusted catalog for a compatible target. A missing runtime still requires download confirmation. An installed runtime update is staged, validated, and probed before replacement. If no compatible runtime is installed and the catalog has no compatible entry, the status is unavailable. Linux x64 and ARM64 runtime packages use musl static native files and include `bwrap` as a fallback. The helper prefers a compatible system `bwrap` found on `PATH` outside the workspace and falls back to the packaged binary when needed. The kernel must still allow user namespaces and provide the required Landlock and seccomp capabilities.
 
 
 ## License

@@ -21,6 +21,7 @@ interface RuntimeSelectionInput<TInstalled extends RuntimeCandidate, TRelease ex
   readonly protocolVersion: number;
   readonly installed: readonly TInstalled[];
   readonly releases: readonly TRelease[];
+  readonly matchesRelease?: (installed: TInstalled, release: TRelease) => boolean;
 }
 
 function stableVersion(value: string): readonly [number, number, number] | undefined {
@@ -39,7 +40,10 @@ export function compareRuntimeVersions(left: string, right: string): number | un
   return 0;
 }
 
-function compatible(candidate: RuntimeCandidate, input: RuntimeSelectionInput<RuntimeCandidate, RuntimeCandidate>): boolean {
+type CompatibilityInput = Pick<RuntimeSelectionInput<RuntimeCandidate, RuntimeCandidate>,
+  "platform" | "arch" | "pluginVersion" | "protocolVersion">;
+
+function compatible(candidate: RuntimeCandidate, input: CompatibilityInput): boolean {
   if (
     !candidate.stable ||
     candidate.platform !== input.platform ||
@@ -69,11 +73,17 @@ function newest<T extends RuntimeCandidate>(candidates: readonly T[]): T | undef
 export function selectRuntime<TInstalled extends RuntimeCandidate, TRelease extends RuntimeCandidate>(
   input: RuntimeSelectionInput<TInstalled, TRelease>,
 ): RuntimeSelection<TInstalled, TRelease> {
+  const release = newest(input.releases.filter(candidate => compatible(candidate, input)));
+  if (release) {
+    const installed = input.installed.find(candidate => compatible(candidate, input) &&
+      (input.matchesRelease?.(candidate, release) ?? candidate.version === release.version));
+    return installed
+      ? { kind: "installed", runtime: installed }
+      : { kind: "download", release };
+  }
+
   const local = newest(input.installed.filter(candidate => compatible(candidate, input)));
   if (local) return { kind: "installed", runtime: local };
-
-  const release = newest(input.releases.filter(candidate => compatible(candidate, input)));
-  if (release) return { kind: "download", release };
 
   return {
     kind: "unavailable",

@@ -50,10 +50,13 @@ function loadRuntimeFiles() {
   try {
     const configured = process.env.PI_SANDBOX_RUNTIME_DIR;
     if (!configured || !isAbsolute(configured)) throw new Error("runtime directory was not supplied by the host");
-    const installRoot = realpathSync(fileURLToPath(new URL("../../../../", import.meta.url)));
+    const configuredRoot = process.env.PI_SANDBOX_RUNTIME_ROOT;
+    if (configuredRoot && !isAbsolute(configuredRoot)) throw new Error("runtime storage root is not absolute");
+    const runtimeStorageRoot = realpathSync(configuredRoot ?? fileURLToPath(new URL("../../../../", import.meta.url)));
+    if (configuredRoot && runtimeStorageRoot !== configuredRoot) throw new Error("runtime storage root is not canonical");
     const runtimeDirectory = realpathSync(configured);
-    if (runtimeDirectory !== configured || !pathWithin(installRoot, runtimeDirectory)) {
-      throw new Error("runtime directory is not canonical or is outside the plugin root");
+    if (runtimeDirectory !== configured || !pathWithin(runtimeStorageRoot, runtimeDirectory)) {
+      throw new Error("runtime directory is not canonical or is outside the trusted runtime root");
     }
     const manifestPath = join(runtimeDirectory, "runtime.json");
     const manifestStat = lstatSync(manifestPath);

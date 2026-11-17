@@ -9,11 +9,13 @@ import { prepareWindowsRuntimeExecutable } from "#sandbox/runtime-windows-integr
 export function windowsRuntimeFiles(): ResolvedRuntimeFiles {
   const executable = fileURLToPath(new URL("../../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url));
   const directory = dirname(executable);
+  const storageRoot = fileURLToPath(new URL("../../../", import.meta.url));
   const mxcManifest = join(directory, "mxc-runtime.json");
   const executableHash = createHash("sha256").update(readFileSync(executable)).digest("hex");
   const manifestHash = createHash("sha256").update(readFileSync(mxcManifest)).digest("hex");
   return {
     directory,
+    storageRoot,
     source: "manual",
     manifest: {
       schemaVersion: 1,
@@ -50,7 +52,7 @@ export function installWindowsTestRuntime(): ResolvedRuntimeFiles {
   writeFileSync(manifestPath, JSON.stringify(source.manifest));
   files.runtimeManifest = manifestPath;
   prepareWindowsRuntimeExecutable(files.windowsExecutable!);
-  return { ...source, directory, files };
+  return { ...source, directory, storageRoot: packageRoot, files };
 }
 
 export function installLinuxTestRuntime(directory: string): void {

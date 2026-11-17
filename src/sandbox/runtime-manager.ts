@@ -1,12 +1,11 @@
-import { realpathSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 import type { RuntimeCatalog, RuntimeResourceEntry } from "./runtime-catalog";
 import { installRuntimeEntry } from "./runtime-installation";
 import { scanInstalledRuntimes, validateInstalledRuntime, type ResolvedRuntimeFiles } from "./runtime-store";
-import { compareRuntimeVersions, selectRuntime } from "./runtime-selection";
+import { selectRuntime } from "./runtime-selection";
 import type { RuntimeDownloadProgress } from "./runtime-download";
 import { isPathWithin } from "./path";
-import { basename, dirname } from "node:path";
 
 export type SandboxRuntimeState =
   | { readonly status: "disabled" }
@@ -21,6 +20,7 @@ export interface RuntimeProbeResult {
 
 export interface SandboxRuntimeManagerOptions {
   readonly pluginRoot: string;
+  readonly agentDir?: string;
   readonly catalog: RuntimeCatalog;
   readonly platform: string;
   readonly arch: string;
@@ -30,8 +30,39 @@ export interface SandboxRuntimeManagerOptions {
   readonly fetch?: typeof fetch;
 }
 
+function ensureRuntimeStorageRoot(path: string, agentDir?: string): string {
+  if (agentDir === undefined) {
+    const metadata = lstatSync(path);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error("runtime storage root must be a real directory");
+    return realpathSync(path);
+  }
+
+  mkdirSync(agentDir, { recursive: true });
+  const agentRoot = realpathSync(agentDir);
+  const configuredAgentDir = resolve(agentDir);
+  const configuredRoot = resolve(path);
+  const relativeRoot = relative(configuredAgentDir, configuredRoot);
+  if (!relativeRoot || !isPathWithin(configuredAgentDir, configuredRoot)) {
+    throw new Error("runtime storage root is outside the configured agent directory");
+  }
+  let current = agentRoot;
+  for (const part of relativeRoot.split(/[\\/]/u).filter(Boolean)) {
+    current = join(current, part);
+    if (!existsSync(current)) {
+      try { mkdirSync(current); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    }
+    const metadata = lstatSync(current);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error("runtime storage path contains a non-directory or link");
+    current = realpathSync(current);
+    if (!isPathWithin(agentRoot, current)) throw new Error("runtime storage root is outside the configured agent directory");
+  }
+  return current;
+}
+
 export class SandboxRuntimeManager {
   private stateValue: SandboxRuntimeState = { status: "disabled" };
+  private preparedRuntime: ResolvedRuntimeFiles | undefined;
   private generation = 0;
   private controller: AbortController | undefined;
   private pending: Promise<SandboxRuntimeState> | undefined;
@@ -60,6 +91,11 @@ export class SandboxRuntimeManager {
     readonly onProgress?: (progress: RuntimeDownloadProgress) => void;
   }): Promise<SandboxRuntimeState> {
     if (this.pending) return this.pending;
+    if (this.preparedRuntime) {
+      this.stateValue = { status: "ready", runtime: this.preparedRuntime };
+      return Promise.resolve(this.stateValue);
+    }
+    if (this.stateValue.status === "ready") return Promise.resolve(this.stateValue);
     const generation = ++this.generation;
     const controller = new AbortController();
     this.controller = controller;
@@ -75,10 +111,10 @@ export class SandboxRuntimeManager {
         if (this.options.arch !== "x64" && this.options.arch !== "arm64") {
           throw new Error(`OS sandbox is unsupported on ${this.options.platform}/${this.options.arch}`);
         }
-        const pluginRoot = realpathSync(this.options.pluginRoot);
+        const pluginRoot = ensureRuntimeStorageRoot(this.options.pluginRoot, this.options.agentDir);
         const workspaceRoot = realpathSync(input.workspaceRoot);
-        if (isPathWithin(workspaceRoot, pluginRoot)) {
-          throw new Error("trusted runtime installation is inside the restricted workspace");
+        if (isPathWithin(workspaceRoot, pluginRoot) || isPathWithin(pluginRoot, workspaceRoot)) {
+          throw new Error("runtime storage root overlaps the restricted workspace");
         }
         const scan = scanInstalledRuntimes({
           pluginRoot,
@@ -86,37 +122,34 @@ export class SandboxRuntimeManager {
           arch: this.options.arch,
           catalog: this.options.catalog,
         });
-        const selected = selectRuntime({
+        let selected = selectRuntime({
           platform: this.options.platform,
           arch: this.options.arch,
           pluginVersion: this.options.pluginVersion,
           protocolVersion: this.options.protocolVersion,
           installed: scan.candidates,
           releases: this.options.catalog.runtimes,
+          matchesRelease: (installed, release) => installed.catalogEntry?.version === release.version &&
+            installed.catalogEntry.archiveSha256 === release.archiveSha256,
         });
-        let runtime: ResolvedRuntimeFiles;
+        let runtime: ResolvedRuntimeFiles | undefined;
         if (selected.kind === "unavailable") {
           const problem = scan.problems[0];
           throw new Error(problem
             ? `runtime directory ${problem.directory} is invalid: ${problem.reason}`
-            : `${selected.reason}; manual runtime directory: ${join(pluginRoot, "runtimes", "<runtime-version>", `${this.options.platform}-${this.options.arch}`)}`);
-        }
-        const selectedVersion = selected.kind === "installed" ? selected.runtime.version : selected.release.version;
-        const invalidNewerDirectory = scan.problems.find(problem => {
-          const name = basename(problem.directory);
-          const version = name === `${this.options.platform}-${this.options.arch}`
-            ? basename(dirname(problem.directory))
-            : name;
-          const order = compareRuntimeVersions(version, selectedVersion);
-          return order === undefined || order >= 0;
-        });
-        if (invalidNewerDirectory) {
-          throw new Error(`runtime directory ${invalidNewerDirectory.directory} is invalid: ${invalidNewerDirectory.reason}`);
+            : `${selected.reason}; manual runtime directory: ${join(pluginRoot, "runtimes", `${this.options.platform}-${this.options.arch}`)}`);
         }
         if (selected.kind === "installed") {
-          runtime = await validateInstalledRuntime(selected.runtime);
-        } else {
-          if (input.confirmDownload && !(await input.confirmDownload(selected.release))) {
+          try {
+            runtime = await validateInstalledRuntime(selected.runtime);
+          } catch (error) {
+            if (!selected.runtime.catalogEntry) throw error;
+            selected = { kind: "download", release: selected.runtime.catalogEntry };
+          }
+        }
+        if (selected.kind === "download") {
+          if (scan.candidates.length === 0 && scan.problems.length === 0 && input.confirmDownload &&
+              !(await input.confirmDownload(selected.release))) {
             throw new Error("runtime download was not confirmed");
           }
           runtime = await installRuntimeEntry({
@@ -124,6 +157,11 @@ export class SandboxRuntimeManager {
             entry: selected.release,
             ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
             signal,
+            beforeCommit: async candidate => {
+              const probe = await this.options.probe(candidate, { signal, workspaceRoot: input.workspaceRoot });
+              if (!probe.available) throw new Error(probe.reason ?? "runtime capability probe failed");
+              if (generation !== this.generation || signal.aborted) throw new Error("runtime preparation was cancelled");
+            },
             onProgress: progress => {
               if (generation !== this.generation) return;
               this.stateValue = { status: "preparing", progress };
@@ -131,10 +169,14 @@ export class SandboxRuntimeManager {
             },
           });
         }
+        if (!runtime) throw new Error("runtime preparation did not produce validated files");
         if (generation !== this.generation || signal.aborted) return this.stateValue;
-        const probe = await this.options.probe(runtime, { signal, workspaceRoot: input.workspaceRoot });
-        if (generation !== this.generation || signal.aborted) return this.stateValue;
-        if (!probe.available) throw new Error(probe.reason ?? "runtime capability probe failed");
+        if (selected.kind === "installed") {
+          const probe = await this.options.probe(runtime, { signal, workspaceRoot: input.workspaceRoot });
+          if (generation !== this.generation || signal.aborted) return this.stateValue;
+          if (!probe.available) throw new Error(probe.reason ?? "runtime capability probe failed");
+        }
+        this.preparedRuntime = runtime;
         this.stateValue = { status: "ready", runtime };
       } catch (error) {
         if (generation !== this.generation) return this.stateValue;

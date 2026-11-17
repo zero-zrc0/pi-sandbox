@@ -1,6 +1,6 @@
-import { createReadStream, existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { createReadStream, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { basename, dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { isPathWithin } from "./path";
 import type { RuntimeCatalog, RuntimeFileEntry, RuntimeFileRole, RuntimeResourceEntry } from "./runtime-catalog";
 import { parseRuntimeManifest, type RuntimeManifest } from "./runtime-manifest";
@@ -9,15 +9,23 @@ import type { RuntimeCandidate } from "./runtime-selection";
 
 const MANAGED_MARKER = ".runtime-install.json";
 
+function pathExists(path: string): boolean {
+  try { lstatSync(path); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+}
+
 export interface InstalledRuntimeCandidate extends RuntimeCandidate {
   readonly directory: string;
+  readonly storageRoot: string;
   readonly source: "manual" | "managed";
+  readonly archiveSha256?: string;
   readonly manifest: RuntimeManifest;
   readonly catalogEntry?: RuntimeResourceEntry;
 }
 
 export interface ResolvedRuntimeFiles {
   readonly directory: string;
+  readonly storageRoot: string;
   readonly manifest: RuntimeManifest;
   readonly source: "manual" | "managed";
   readonly files: Readonly<Partial<Record<RuntimeFileRole, string>>>;
@@ -32,7 +40,7 @@ function canonicalDirectory(root: string, path: string, label: string): string {
   const metadata = lstatSync(path);
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error(`${label} must be a real directory`);
   const actual = realpathSync(path);
-  if (!isPathWithin(root, actual)) throw new Error(`${label} resolves outside the plugin root`);
+  if (!isPathWithin(root, actual)) throw new Error(`${label} resolves outside the trusted runtime root`);
   return actual;
 }
 
@@ -45,29 +53,26 @@ function candidateFor(
 ): InstalledRuntimeCandidate {
   const root = realpathSync(pluginRoot);
   const runtimeRoot = canonicalDirectory(root, join(root, "runtimes"), "runtime root");
-  const versionDirectory = canonicalDirectory(runtimeRoot, dirname(directory), "runtime version directory");
-  const runtimeDirectory = canonicalDirectory(versionDirectory, directory, "runtime directory");
-  const runtimeParent = resolve(dirname(runtimeDirectory));
-  const expectedParent = resolve(versionDirectory);
-  if ((process.platform === "win32" ? runtimeParent.toLowerCase() : runtimeParent) !==
-      (process.platform === "win32" ? expectedParent.toLowerCase() : expectedParent) ||
-      basename(runtimeDirectory) !== `${platform}-${arch}`) {
+  const runtimeDirectory = canonicalDirectory(runtimeRoot, directory, "runtime directory");
+  const expectedDirectory = resolve(runtimeRoot, `${platform}-${arch}`);
+  const normalize = (path: string) => process.platform === "win32" ? resolve(path).toLowerCase() : resolve(path);
+  if (normalize(runtimeDirectory) !== normalize(expectedDirectory)) {
     throw new Error("runtime directory does not match the fixed platform layout");
   }
-  if (!/^\d+\.\d+\.\d+$/u.test(basename(versionDirectory))) throw new Error("runtime directory version is invalid");
   const manifestPath = join(runtimeDirectory, "runtime.json");
   const manifestStat = lstatSync(manifestPath);
   if (manifestStat.isSymbolicLink() || !manifestStat.isFile() || manifestStat.nlink > 1) {
     throw new Error("runtime manifest must be a regular file inside the runtime directory");
   }
   const manifest = parseRuntimeManifest(JSON.parse(readFileSync(manifestPath, "utf8")) as unknown);
-  if (manifest.version !== basename(versionDirectory) || manifest.platform !== platform || manifest.arch !== arch) {
+  if (manifest.platform !== platform || manifest.arch !== arch) {
     throw new Error("runtime manifest does not match its fixed directory");
   }
   let catalogEntry: RuntimeResourceEntry | undefined;
   let source: "manual" | "managed" = "manual";
+  let archiveSha256: string | undefined;
   const markerPath = join(runtimeDirectory, MANAGED_MARKER);
-  if (existsSync(markerPath)) {
+  if (pathExists(markerPath)) {
     const markerStat = lstatSync(markerPath);
     if (markerStat.isSymbolicLink() || !markerStat.isFile() || markerStat.nlink > 1) {
       throw new Error("managed runtime marker is not a regular file");
@@ -81,17 +86,34 @@ function candidateFor(
         typeof marker.archiveSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(marker.archiveSha256)) {
       throw new Error("managed runtime marker does not match its runtime directory");
     }
+    archiveSha256 = marker.archiveSha256;
     catalogEntry = catalog.runtimes.find(entry =>
       entry.platform === platform && entry.arch === arch && entry.version === manifest.version &&
       entry.archiveSha256 === marker.archiveSha256,
     );
     if (!catalogEntry) throw new Error("managed runtime is not present in the current trusted catalog");
     source = "managed";
+  } else {
+    const runtimeManifestHash = createHash("sha256").update(readFileSync(manifestPath)).digest("hex");
+    catalogEntry = catalog.runtimes.find(entry => {
+      if (entry.platform !== platform || entry.arch !== arch || entry.version !== manifest.version ||
+          entry.files.find(file => file.role === "runtimeManifest")?.sha256 !== runtimeManifestHash ||
+          entry.protocolVersion !== manifest.protocolVersion || entry.backendId !== manifest.backendId ||
+          entry.minPluginVersion !== manifest.minPluginVersion ||
+          entry.maxPluginVersionExclusive !== manifest.maxPluginVersionExclusive || !entry.stable ||
+          manifest.stable !== entry.stable) return false;
+      const catalogFiles = new Map(entry.files.filter(file => file.role !== "runtimeManifest").map(file => [file.role, file]));
+      return catalogFiles.size === manifest.files.length && manifest.files.every(file => {
+        const expected = catalogFiles.get(file.role);
+        return expected?.path === file.path && expected.sha256 === file.sha256 && expected.executable === file.executable;
+      });
+    });
   }
   if (catalogEntry) {
     if (catalogEntry.protocolVersion !== manifest.protocolVersion || catalogEntry.backendId !== manifest.backendId ||
         catalogEntry.minPluginVersion !== manifest.minPluginVersion ||
-        catalogEntry.maxPluginVersionExclusive !== manifest.maxPluginVersionExclusive || !catalogEntry.stable) {
+        catalogEntry.maxPluginVersionExclusive !== manifest.maxPluginVersionExclusive ||
+        catalogEntry.stable !== manifest.stable || !catalogEntry.stable) {
       throw new Error("runtime manifest metadata differs from its trusted resource entry");
     }
     const catalogFiles = new Map(catalogEntry.files.filter(file => file.role !== "runtimeManifest").map(file => [file.role, file]));
@@ -109,8 +131,10 @@ function candidateFor(
     minPluginVersion: manifest.minPluginVersion,
     maxPluginVersionExclusive: manifest.maxPluginVersionExclusive,
     directory: runtimeDirectory,
+    storageRoot: root,
     source,
     manifest,
+    ...(archiveSha256 === undefined ? {} : { archiveSha256 }),
     ...(catalogEntry === undefined ? {} : { catalogEntry }),
   };
 }
@@ -123,31 +147,21 @@ export function scanInstalledRuntimes(input: {
 }): InstalledRuntimeScan {
   const root = realpathSync(input.pluginRoot);
   const runtimeRootPath = join(root, "runtimes");
-  if (!existsSync(runtimeRootPath)) return { candidates: [], problems: [] };
+  if (!pathExists(runtimeRootPath)) return { candidates: [], problems: [] };
   const runtimeRoot = canonicalDirectory(root, runtimeRootPath, "runtime root");
-  const candidates: InstalledRuntimeCandidate[] = [];
-  const problems: { directory: string; reason: string }[] = [];
-  for (const item of readdirSync(runtimeRoot, { withFileTypes: true })) {
-    if (item.name === ".staging") {
-      if (item.isSymbolicLink() || !item.isDirectory()) {
-        problems.push({ directory: join(runtimeRoot, item.name), reason: "runtime staging directory must not be a link or file" });
-      }
-      continue;
-    }
-    if (item.isSymbolicLink()) {
-      problems.push({ directory: join(runtimeRoot, item.name), reason: "runtime version directory must not be a link" });
-      continue;
-    }
-    if (!item.isDirectory() || !/^\d+\.\d+\.\d+$/u.test(item.name)) continue;
-    const directory = join(runtimeRoot, item.name, `${input.platform}-${input.arch}`);
-    if (!existsSync(directory)) continue;
-    try {
-      candidates.push(candidateFor(root, directory, input.catalog, input.platform, input.arch));
-    } catch (error) {
-      problems.push({ directory, reason: error instanceof Error ? error.message : String(error) });
-    }
+  const directory = join(runtimeRoot, `${input.platform}-${input.arch}`);
+  if (!pathExists(directory)) return { candidates: [], problems: [] };
+  try {
+    return {
+      candidates: [candidateFor(root, directory, input.catalog, input.platform, input.arch)],
+      problems: [],
+    };
+  } catch (error) {
+    return {
+      candidates: [],
+      problems: [{ directory, reason: error instanceof Error ? error.message : String(error) }],
+    };
   }
-  return { candidates, problems };
 }
 
 async function sha256File(path: string): Promise<string> {
@@ -167,12 +181,12 @@ export function verifyMxcManifest(path: string, executableHash: string): void {
 }
 
 function expectedFileEntries(candidate: InstalledRuntimeCandidate): readonly RuntimeFileEntry[] {
-  if (candidate.source === "managed") return candidate.catalogEntry!.files;
+  if (candidate.catalogEntry) return candidate.catalogEntry.files;
   return candidate.manifest.files;
 }
 
 export async function validateInstalledRuntime(candidate: InstalledRuntimeCandidate): Promise<ResolvedRuntimeFiles> {
-  const root = realpathSync(resolve(candidate.directory, "..", "..", ".."));
+  const root = realpathSync(candidate.storageRoot);
   const directory = canonicalDirectory(root, candidate.directory, "runtime directory");
   const manifestPath = join(directory, "runtime.json");
   const manifestStat = lstatSync(manifestPath);
@@ -191,7 +205,7 @@ export async function validateInstalledRuntime(candidate: InstalledRuntimeCandid
     }
     const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<string, unknown>;
     if (marker.schemaVersion !== 1 || marker.platform !== candidate.platform || marker.arch !== candidate.arch ||
-        marker.version !== candidate.version || marker.archiveSha256 !== candidate.catalogEntry?.archiveSha256) {
+        marker.version !== candidate.version || marker.archiveSha256 !== candidate.archiveSha256) {
       throw new Error("managed runtime marker changed after version selection");
     }
   }
@@ -227,6 +241,7 @@ export async function validateInstalledRuntime(candidate: InstalledRuntimeCandid
   }
   return {
     directory,
+    storageRoot: root,
     manifest: currentManifest,
     source: candidate.source,
     files: Object.freeze(resolved),

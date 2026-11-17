@@ -25,6 +25,7 @@ import { BUILTIN_TOOL_NAMES, type ExecutionRecord, type FilesystemGrantInput } f
 import { EXECUTION_INSTALL_ROOT } from "./platform";
 import type { SandboxRuntimeState } from "./runtime-manager";
 import type { ResolvedRuntimeFiles } from "./runtime-store";
+import { acquireRuntimeUseLease } from "./runtime-installation";
 import { ManagedMcpTransports } from "./mcp";
 import { resolveHostPathIdentity, findProtectedControlRoot, isPathWithin } from "./path";
 import { ensureSessionWorkspace } from "./session-workspace";
@@ -200,6 +201,7 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       ...record,
     });
     const runtime = current.config.experimental.sandboxEnabled ? readyRuntime() : undefined;
+    const runtimeStorageRoot = runtime?.storageRoot;
     const backendId = runtime?.manifest.backendId ?? "unsupported-platform";
     const currentEnvironment = environment();
     const systemBubblewrapPath = process.platform === "linux" && runtime !== undefined
@@ -214,12 +216,22 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
         args: [fileURLToPath(new URL(`./backend/${process.platform === "linux" ? "linux" : process.platform === "darwin" ? "macos" : "windows"}/helper.mjs`, import.meta.url))],
         expectedBackendId: backendId,
       },
+      ...(runtime === undefined ? {} : {
+        runtimeUseLease: () => acquireRuntimeUseLease({
+          storageRoot: runtime.storageRoot,
+          platform: runtime.manifest.platform,
+          arch: runtime.manifest.arch,
+        }),
+      }),
       helperCwd: resolve(process.env.TEMP ?? process.env.TMPDIR ?? "/tmp"),
       workspace: ctx.cwd, helperEnvironment: {
         ...currentEnvironment, PI_MXC_AGENT_DIR: agentDirectory,
         PI_SANDBOX_WORKSPACE_ROOT: resolve(ctx.cwd),
         ...(process.env.LOCALAPPDATA ? { LOCALAPPDATA: process.env.LOCALAPPDATA } : {}),
-        ...(runtime === undefined ? {} : { PI_SANDBOX_RUNTIME_DIR: runtime.directory }),
+        ...(runtime === undefined ? {} : {
+          PI_SANDBOX_RUNTIME_DIR: runtime.directory,
+          PI_SANDBOX_RUNTIME_ROOT: runtimeStorageRoot!,
+        }),
         ...(systemBubblewrapPath === undefined ? {} : { PI_SANDBOX_SYSTEM_BWRAP_PATH: systemBubblewrapPath }),
       }, onRecord: record,
       egress: {
@@ -245,7 +257,7 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       plan: {
         mode: current.config.mode, configRevision: key,
         backendId,
-        protectedPaths: [EXECUTION_INSTALL_ROOT, ...(runtime === undefined ? [] : [runtime.directory]),
+        protectedPaths: [EXECUTION_INSTALL_ROOT, ...(runtime === undefined ? [] : [runtimeStorageRoot!, runtime.directory]),
           ...(systemBubblewrapPath === undefined ? [] : [systemBubblewrapPath])],
         ...(current.config.execution.shell === undefined ? {} : {
           shellBaseline: {
