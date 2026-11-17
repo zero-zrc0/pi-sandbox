@@ -18,3 +18,5 @@
 - 前缀表示工作类型，例如 `feat`、`fix`、`debug`、`refactor`、`docs`、`test`、`chore`。
 - 修改内容简洁描述本分支的工作；日期使用分支创建日，格式为四位年、两位月、两位日。
 - 示例：`feat/runtime-catalog-20261117`、`debug/windows-launch-20261117`、`docs/git-branch-rules-20261117`。
+
+提交或推送 `docs/`、`specs/` 下的文件时，只纳入用户在当前任务明确指定的路径；未指定的文件不纳入提交或推送。

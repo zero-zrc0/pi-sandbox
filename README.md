@@ -41,7 +41,7 @@ JSON 配置存放在项目级 `.pi/extensions/pi-sandbox/config.json` 或全局 
 |---|---|---|---|
 | `PI_CODEMODE_MAX_WORKERS` | 否 | `2` | 正整数；大于 `8` 时按 `8` 处理；未设置或值无效时使用 `2`。 |
 
-完整字段、默认值、范围和加载规则见 [配置模型规格](specs/config-schema.md)、[配置加载规格](specs/config-loading.md) 和 [JSON Schema](schemas/permissions.schema.json)。
+完整配置字段和默认值见 [JSON Schema](schemas/permissions.schema.json)。
 
 ## OS 沙箱运行文件
 
@@ -64,7 +64,6 @@ OS 沙箱默认关闭。安装、加载扩展和打开设置不会下载或启�
 - `src/index.ts`：注册 Pi 扩展与 `/permission` 命令。
 - `src/approve-core/runtime.ts`：运行审批链。
 - `src/sandbox/production.ts`：接管工具并绑定受控执行。
-- `specs/config-schema.md`：配置字段和取值规则。
 
 ## 贡献方式与 License
 

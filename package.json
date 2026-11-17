@@ -42,7 +42,6 @@
     "dist",
     "config",
     "schemas",
-    "docs",
     "licenses",
     "scripts/build-windows-mxc.ps1",
     "scripts/build-linux-runtime.sh",
