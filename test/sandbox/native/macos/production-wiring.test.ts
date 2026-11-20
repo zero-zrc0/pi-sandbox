@@ -51,7 +51,7 @@ afterEach(() => {
 });
 
 describe.skipIf(process.platform !== "darwin")("darwin production controller wiring", () => {
-  it("passes the Seatbelt wrapper and the system-runtime backend id to the controller", async () => {
+  it("passes the host-native Seatbelt backend and the system-runtime id to the controller", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-sandbox-darwin-wiring-"));
     cleanup.push(() => rmSync(root, { recursive: true, force: true }));
     const agentDir = join(root, "agent");
@@ -82,7 +82,7 @@ describe.skipIf(process.platform !== "darwin")("darwin production controller wir
         stable: true as const,
         platform: "darwin",
         arch: process.arch === "arm64" ? "arm64" : "x64",
-        protocolVersion: 2,
+        protocolVersion: 3,
         minPluginVersion: "0.0.0",
         maxPluginVersionExclusive: "999999.999.999",
         backendId: "macos-seatbelt",
@@ -127,16 +127,11 @@ describe.skipIf(process.platform !== "darwin")("darwin production controller wir
 
     const options = harness.capture.controllerOptions;
     if (options === undefined) throw new Error("the production controller was not constructed");
-    expect(options.installation.expectedBackendId).toBe("macos-seatbelt");
-    expect(options.installation.args?.[0]).toMatch(/\/src\/sandbox\/backend\/macos\/helper\.mjs$/u);
-    expect(options.prepareHelperProcess).toBeTypeOf("function");
+    expect(options.directBackend).toMatchObject({ id: "macos-seatbelt", version: "1.0.0" });
     expect(options.runtimeUseLease).toBeUndefined();
-    expect(options.helperEnvironment).not.toHaveProperty("PI_SANDBOX_RUNTIME_DIR");
-    expect(options.helperEnvironment).not.toHaveProperty("PI_SANDBOX_RUNTIME_ROOT");
-    expect(options.helperEnvironment).toMatchObject({ PI_SANDBOX_WORKSPACE_ROOT: workspace });
 
     const plan = (harness.capture as WiringCapture).adapterPlan;
     expect(plan?.backendId).toBe("macos-seatbelt");
-    expect(plan?.protectedPaths).toEqual([EXECUTION_INSTALL_ROOT]);
+    expect(plan?.protectedPaths).toContain(EXECUTION_INSTALL_ROOT);
   });
 });

@@ -8,7 +8,7 @@ import { createInvalidationHarness, outcomeText, useInvalidationCleanup } from "
 useInvalidationCleanup();
 
 describe("complete SDK builtin calls", () => {
-  it("serializes two edits of the same file before either reaches a helper", async () => {
+  it("serializes two edits of the same file before either reaches a native process", async () => {
     const harness = await createInvalidationHarness();
     const target = join(harness.layout.workspace, "shared.txt");
     writeFileSync(target, "alpha beta");

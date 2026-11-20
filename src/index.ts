@@ -58,12 +58,12 @@ import type { RuntimeResourceEntry } from "#sandbox/runtime-catalog";
 import type { RuntimeDownloadProgress } from "#sandbox/runtime-download";
 import { SandboxRuntimeManager } from "#sandbox/runtime-manager";
 import { probeSandboxRuntime } from "#sandbox/runtime-probe";
-import { HELPER_PROTOCOL_VERSION } from "#sandbox/types";
 import { sessionWorkspacePath } from "#sandbox/session-workspace";
 import { createSandboxBypass, SANDBOX_BYPASS_TOOL_NAME } from "#sandbox/bypass";
 import { createCodemodeHostToolExecutor } from "#sandbox/codemode/host-execution";
 import { createManagedCodemodeExtension } from "#sandbox/codemode/tool-adapter";
 import { CodemodeRuntimeSupervisor, createPiCodemodeRuntimeFactory } from "#sandbox/codemode/supervisor";
+import { collectSensitivePaths } from "#sandbox/sensitive-paths";
 import { jsonDigest } from "./json";
 import { formatPiSandboxError } from "./error-format";
 import { publishPermissionsService, unpublishPermissionsService, type PermissionsService } from "./service";
@@ -953,7 +953,7 @@ export default function registerPermissionExtension(
     platform: process.platform,
     arch: process.arch,
     pluginVersion: packageMetadata.version,
-    protocolVersion: HELPER_PROTOCOL_VERSION,
+    protocolVersion: 3,
     probe: (runtime, input) => probeSandboxRuntime({ runtime, ...input }),
   });
 
@@ -976,6 +976,8 @@ export default function registerPermissionExtension(
     resolveBackend: (ctx) => runtimeFor(ctx).owner.snapshot({
       sessionId: ctx.sessionManager.getSessionId(),
     }).config.mode === "full-access" ? "full-access" : "restricted",
+    resolveSensitivePaths: ctx => collectSensitivePaths({ agentDirectory: getAgentDir(), cwd: ctx.cwd,
+      denyPaths: runtimeFor(ctx).owner.snapshot({ sessionId: ctx.sessionManager.getSessionId() }).config.execution.denyPaths }),
     getToolNamespace: (name) => codemodeToolInfo(name)?.namespace,
     getToolGuidelines: (name) => codemodeToolInfo(name)?.promptGuidelines ?? [],
     appendEntry: (customType, data) => api.appendEntry(customType, data),

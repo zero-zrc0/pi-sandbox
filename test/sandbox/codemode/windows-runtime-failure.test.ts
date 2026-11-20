@@ -86,6 +86,7 @@ describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Window
     let child: ChildProcessWithoutNullStreams | undefined;
 
     try {
+      await vi.waitFor(() => expect(observed.children[0]).toBeDefined(), { timeout: 15_000 });
       const entry = observed.children[0] as { child: ChildProcessWithoutNullStreams; ready: Promise<void> } | undefined;
       expect(entry).toBeDefined();
       child = entry!.child;
@@ -113,6 +114,7 @@ describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Window
     let child: ChildProcessWithoutNullStreams | undefined;
 
     try {
+      await vi.waitFor(() => expect(observed.children[0]).toBeDefined(), { timeout: 15_000 });
       const entry = observed.children[0] as { child: ChildProcessWithoutNullStreams; ready: Promise<void> } | undefined;
       expect(entry).toBeDefined();
       child = entry!.child;

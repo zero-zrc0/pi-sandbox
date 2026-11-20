@@ -5,7 +5,7 @@ import { SANDBOX_TOOL_TIMEOUT_MS } from "#sandbox/sandbox-tools";
 
 /**
  * The documented per-call cap is 60 s, but the same `execution-timeout` code
- * also carries the helper start timeout and a pre-start deadline refusal. Only
+ * also carries the native start timeout and a pre-start deadline refusal. Only
  * the plan-deadline reason may be reworded (design §6.4).
  */
 describe("sandbox tool failure wording (design §6.4)", () => {
@@ -17,7 +17,7 @@ describe("sandbox tool failure wording (design §6.4)", () => {
 
   it.each([
     "start timed out",
-    "plan deadline expired before the helper started",
+    "plan deadline expired before the native process started",
   ])("keeps another execution-timeout reason intact: %s", (reason) => {
     expect(sandboxToolFailureReason({ code: "execution-timeout", reason })).toBe(reason);
   });

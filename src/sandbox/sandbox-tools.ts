@@ -6,7 +6,7 @@
  * exist for the same metadata:
  *
  * - the sandbox path (restricted modes) runs one worker process inside the
- *   trusted helper and is driven by the execution adapter;
+ *   selected native sandbox and is driven by the execution adapter;
  * - the host path (`full-access`) imports the module in this process, exactly
  *   like every other tool in that mode.
  *

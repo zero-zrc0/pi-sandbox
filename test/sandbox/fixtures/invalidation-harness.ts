@@ -19,7 +19,7 @@ import {
 } from "../../../src/invocation";
 import {
   createTestLayout,
-  fixtureEnvironment,
+  testExecutionEnvironment,
   makeController,
   removeTestLayout,
   type TestLayout,
@@ -57,8 +57,8 @@ export interface InvalidationHarnessOptions {
   readonly maxOutstandingCalls?: number;
   /** Approval budget for the whole tool call, in milliseconds. */
   readonly deadlineMs?: number;
-  /** Extra helper environment, e.g. a business marker file. */
-  readonly helperEnvironmentExtra?: Readonly<Record<string, string>>;
+  /** Extra process environment for the fake native backend. */
+  readonly executionEnvironmentExtra?: Readonly<Record<string, string>>;
 }
 
 export interface InvalidationHarness {
@@ -66,7 +66,7 @@ export interface InvalidationHarness {
   readonly adapter: PiExecutionAdapter;
   readonly controller: ExecutionController;
   readonly records: ExecutionRecord[];
-  readonly helperPidFile: string;
+  readonly nativePidFile: string;
   /** Resolves once the adapter has entered `host.verifyScope`. */
   readonly verificationEntered: Promise<void>;
   releaseVerification: () => void;
@@ -91,16 +91,16 @@ export async function createInvalidationHarness(
 ): Promise<InvalidationHarness> {
   const layout = createTestLayout("plan11-validity");
   layouts.push(layout);
-  const helperPidFile = join(layout.root, "helper.pid");
+  const nativePidFile = join(layout.root, "native.pid");
   const records: ExecutionRecord[] = [];
   const scenario = options.scenario ?? "ok";
   const controller = makeController({
     layout,
     scenario,
     maxConcurrent: options.maxConcurrent ?? 2,
-    helperEnvironment: fixtureEnvironment(scenario, {
-      FIXTURE_SELF_PID_FILE: helperPidFile,
-      ...(options.helperEnvironmentExtra ?? {}),
+    environment: testExecutionEnvironment({
+      FIXTURE_SELF_PID_FILE: nativePidFile,
+      ...(options.executionEnvironmentExtra ?? {}),
     }),
     onRecord: (record) => {
       records.push(record);
@@ -162,7 +162,7 @@ export async function createInvalidationHarness(
         network: { kind: "none" },
       },
       configRevision: options.configRevision ?? "c1",
-      backendId: "fixture-helper",
+      backendId: "fixture-direct",
       ...(options.deadlineMs === undefined ? {} : { deadlineMs: options.deadlineMs }),
       ...(options.readConfigRevision === undefined
         ? {}
@@ -245,7 +245,7 @@ export async function createInvalidationHarness(
     adapter,
     controller,
     records,
-    helperPidFile,
+    nativePidFile,
     verificationEntered,
     releaseVerification: () => releaseHeld(),
     pendingCall,

@@ -7,7 +7,7 @@ function candidate(overrides: Partial<RuntimeCandidate> = {}): RuntimeCandidate 
     stable: true,
     platform: "linux",
     arch: "x64",
-    protocolVersion: 2,
+    protocolVersion: 3,
     minPluginVersion: "1.0.0",
     maxPluginVersionExclusive: "2.0.0",
     ...overrides,
@@ -18,7 +18,7 @@ const request = {
   platform: "linux",
   arch: "x64",
   pluginVersion: "1.2.0",
-  protocolVersion: 2,
+  protocolVersion: 3,
 };
 
 describe("selectRuntime", () => {
@@ -81,7 +81,7 @@ describe("selectRuntime", () => {
       installed: [],
       releases: [
         candidate({ version: "1.9.0", stable: false }),
-        candidate({ version: "1.8.0", protocolVersion: 3 }),
+        candidate({ version: "1.8.0", protocolVersion: 2 }),
         candidate({ version: "1.7.0", minPluginVersion: "2.0.0" }),
       ],
     });

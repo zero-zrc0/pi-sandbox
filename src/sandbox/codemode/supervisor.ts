@@ -8,6 +8,7 @@ import type {
 import { CODEMODE_RUNTIME_LIMITS } from "./limits";
 import { createWindowsCodemodeSandbox } from "./windows-runtime";
 import type { ResolvedRuntimeFiles } from "../runtime-store";
+import type { SensitivePath } from "../sensitive-paths";
 
 export type CodemodeRuntimeBackend = "restricted" | "full-access";
 
@@ -19,6 +20,7 @@ export interface CodemodeRuntimeRequest {
   readonly store?: Readonly<Record<string, unknown>>;
   readonly tools?: CodemodeTool[];
   readonly globals?: CodemodeTool[];
+  readonly sensitivePaths?: readonly SensitivePath[];
 }
 
 export interface CodemodeRuntimeSession {
@@ -29,6 +31,7 @@ export interface CodemodeRuntimeSession {
 export interface CodemodeRuntimeFactoryInput {
   readonly backend: CodemodeRuntimeBackend;
   readonly sandboxOptions: Pick<CodemodeSandboxBaseOptions, "tools" | "globals" | "memoryLimitBytes">;
+  readonly sensitivePaths?: readonly SensitivePath[];
   transferRuntime(exited: Promise<void>): boolean;
 }
 
@@ -230,6 +233,7 @@ export class CodemodeRuntimeSupervisor {
     try {
       session = await this.createRuntime({
         backend: record.request.backend,
+        ...(record.request.sensitivePaths === undefined ? {} : { sensitivePaths: record.request.sensitivePaths }),
         sandboxOptions: {
           tools: record.request.tools,
           globals: record.request.globals,
@@ -337,7 +341,7 @@ export function createPiCodemodeRuntimeFactory(runtime: () => ResolvedRuntimeFil
     if (input.backend === "restricted") {
       const selected = runtime();
       if (!selected) throw new Error("sandbox-unavailable: restricted Codemode requires a ready OS runtime");
-      return createWindowsCodemodeSandbox(options, { transferRuntime: input.transferRuntime }, selected);
+      return createWindowsCodemodeSandbox(options, { transferRuntime: input.transferRuntime }, selected, input.sensitivePaths);
     }
 
     const wasm = await loadQuickJSWasm();

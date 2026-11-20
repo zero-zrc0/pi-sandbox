@@ -103,7 +103,7 @@ describe("whole-call invalidation", () => {
     expect(harness.records[0]?.state).toBe("completed");
   });
 
-  it("cancels the running helper and its call when the session is cleared", async () => {
+  it("cancels the running native process and its call when the session is cleared", async () => {
     const harness = await createInvalidationHarness({
       scenario: "slow",
       maxConcurrent: 1,
@@ -113,8 +113,8 @@ describe("whole-call invalidation", () => {
       "running-cancel",
       { command: "ignored" },
     );
-    await waitFor(() => existsSync(harness.helperPidFile));
-    const pid = Number.parseInt(readFileSync(harness.helperPidFile, "utf8"), 10);
+    await waitFor(() => existsSync(harness.nativePidFile));
+    const pid = Number.parseInt(readFileSync(harness.nativePidFile, "utf8"), 10);
     expect(pid).toBeGreaterThan(0);
 
     await harness.adapter.clearSession(SESSION_ID);
@@ -165,7 +165,7 @@ describe("whole-call invalidation", () => {
     expect(clearedRecord?.code).toBe("session-disposed");
   });
 
-  it("stops a held verification and a running helper when the adapter disposes", async () => {
+  it("stops a held verification and a running native process when the adapter disposes", async () => {
     const harness = await createInvalidationHarness({
       holdVerification: (toolCallId) => toolCallId === "disposed-verification",
       scenario: "slow",

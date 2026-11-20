@@ -19,6 +19,26 @@ function success(): CodemodeResult {
 }
 
 describe("Codemode host execution", () => {
+  it("passes host sensitive paths only to a restricted runtime", async () => {
+    const context = { tools: [], sessionManager: { getSessionId: () => "paths", getBranch: () => [] },
+      executeTool: async () => { throw new Error("not called"); } } as unknown as ExtensionToolContext;
+    const paths = [{ requestedPath: "/secret", path: "/secret", granularity: "file" as const,
+      identity: { device: "1", inode: "2" } }];
+    const requests: CodemodeRuntimeRequest[] = [];
+    let restricted = true;
+    const resolveSensitivePaths = vi.fn(() => paths);
+    const execute = createCodemodeHostToolExecutor({
+      supervisor: { async execute(request) { requests.push(request); return success(); } },
+      resolveBackend: () => restricted ? "restricted" : "full-access", resolveSensitivePaths,
+    });
+    await execute("restricted", { code: "return 1;" }, undefined, undefined, context);
+    restricted = false;
+    await execute("full-access", { code: "return 1;" }, undefined, undefined, context);
+    expect(requests[0]?.sensitivePaths).toEqual(paths);
+    expect(requests[1]?.sensitivePaths).toBeUndefined();
+    expect(resolveSensitivePaths).toHaveBeenCalledTimes(1);
+  });
+
   it("formats console output, preserves images, and spills output over its token budget", async () => {
     const context = {
       tools: [],

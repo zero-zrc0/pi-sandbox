@@ -33,7 +33,7 @@ const REFUSAL_CODES: readonly CancellationCode[] = [
 ];
 
 /**
- * Only this factory issues accepted guards. A plan, helper message or model
+ * Only this factory issues accepted guards. A plan, native process result or model
  * argument cannot produce an object the controller will honour.
  */
 export function createExecutionValidityGuard(

@@ -9,7 +9,7 @@ function linuxRelease(overrides: Record<string, unknown> = {}) {
     stable: true,
     platform: "linux",
     arch: "x64",
-    protocolVersion: 2,
+    protocolVersion: 3,
     minPluginVersion: "1.0.0",
     maxPluginVersionExclusive: "2.0.0",
     backendId: "linux-bwrap-landlock-seccomp",

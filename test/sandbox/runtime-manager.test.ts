@@ -35,7 +35,7 @@ function runtime(pluginRoot: string, version: string): void {
     stable: true,
     platform: "win32",
     arch: "x64",
-    protocolVersion: 2,
+    protocolVersion: 3,
     minPluginVersion: "1.0.0",
     maxPluginVersionExclusive: "2.0.0",
     backendId: "windows-mxc",
@@ -72,7 +72,7 @@ describe("SandboxRuntimeManager", () => {
       platform: "win32",
       arch: "x64",
       pluginVersion: "1.2.0",
-      protocolVersion: 2,
+      protocolVersion: 3,
       probe,
       fetch,
     });
@@ -100,7 +100,7 @@ describe("SandboxRuntimeManager", () => {
       platform: "win32",
       arch: "x64",
       pluginVersion: "1.2.0",
-      protocolVersion: 2,
+      protocolVersion: 3,
       probe,
     });
 
@@ -127,7 +127,7 @@ describe("SandboxRuntimeManager", () => {
       stable: true,
       platform: "win32",
       arch: "x64",
-      protocolVersion: 2,
+      protocolVersion: 3,
       minPluginVersion: "1.0.0",
       maxPluginVersionExclusive: "2.0.0",
       backendId: "windows-mxc",
@@ -147,7 +147,7 @@ describe("SandboxRuntimeManager", () => {
       platform: "win32",
       arch: "x64",
       pluginVersion: "1.2.0",
-      protocolVersion: 2,
+      protocolVersion: 3,
       probe: async () => ({ available: true }),
     });
 
@@ -169,7 +169,7 @@ describe("SandboxRuntimeManager", () => {
       platform: "win32",
       arch: "x64",
       pluginVersion: "1.2.0",
-      protocolVersion: 2,
+      protocolVersion: 3,
       probe: async candidate => {
         probedVersion = candidate.manifest.version;
         return { available: false, reason: "native probe failed" };
@@ -192,7 +192,7 @@ describe("SandboxRuntimeManager", () => {
       platform: "win32",
       arch: "x64",
       pluginVersion: "1.2.0",
-      protocolVersion: 2,
+      protocolVersion: 3,
       probe: async (_candidate, input) => new Promise(resolve => {
         input.signal.addEventListener("abort", () => resolve({ available: false, reason: "aborted" }), { once: true });
       }),
@@ -213,7 +213,7 @@ describe("SandboxRuntimeManager macOS system runtime", () => {
       platform: "darwin",
       arch,
       pluginVersion: "1.2.0",
-      protocolVersion: 2,
+      protocolVersion: 3,
       probe,
     });
   }
@@ -234,7 +234,7 @@ describe("SandboxRuntimeManager macOS system runtime", () => {
       platform: "darwin",
       arch: "arm64",
       pluginVersion: "1.2.0",
-      protocolVersion: 2,
+      protocolVersion: 3,
       probe,
       fetch,
     });
@@ -253,7 +253,7 @@ describe("SandboxRuntimeManager macOS system runtime", () => {
         stable: true,
         platform: "darwin",
         arch: "arm64",
-        protocolVersion: 2,
+        protocolVersion: 3,
         minPluginVersion: "0.0.0",
         maxPluginVersionExclusive: "999999.999.999",
         backendId: "macos-seatbelt",
@@ -287,7 +287,7 @@ describe("SandboxRuntimeManager macOS system runtime", () => {
       platform: "freebsd",
       arch: "x64",
       pluginVersion: "1.2.0",
-      protocolVersion: 2,
+      protocolVersion: 3,
       probe,
     });
 

@@ -6,7 +6,31 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const executable = fileURLToPath(new URL("../../../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url));
+const executable = process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE ??
+  fileURLToPath(new URL("../../../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url));
+
+function nativeRequest(input: { readonly cwd: string; readonly node: string; readonly environment: NodeJS.ProcessEnv; readonly argv: string[] }) {
+  const environment = {
+    SystemRoot: process.env.SystemRoot!,
+    SystemDrive: process.env.SystemDrive!,
+    LOCALAPPDATA: process.env.LOCALAPPDATA!,
+    ...input.environment,
+  };
+  const filesystem = [
+    { path: input.node, access: "read", granularity: "file" },
+    { path: executable, access: "read", granularity: "file" },
+    { path: input.cwd, access: "read", granularity: "directory" },
+  ];
+  return {
+    runtimeProfile: "codemode",
+    plan: { version: 3, filesystem, network: { kind: "none" }, metadataRead: "none", digest: "0".repeat(64) },
+    operation: { kind: "codemode" },
+    cwd: input.cwd,
+    environment,
+    deadlineAt: Date.now() + 30_000,
+    argv: input.argv,
+  };
+}
 
 function probeScript(): string {
   return [
@@ -72,27 +96,12 @@ describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Window
       });
       await expect(fetch(`http://127.0.0.1:${port}`).then((response) => response.text())).resolves.toBe("host-network-reachable");
 
-      const request = {
-        runtimeProfile: "codemode",
-        plan: {
-          backend: { id: "windows-mxc" },
-          cwd,
-          filesystem: [
-            { path: node, access: "read", granularity: "file" },
-            { path: executable, access: "read", granularity: "file" },
-            { path: cwd, access: "read", granularity: "directory" },
-          ],
-          protectedPaths: [],
-          network: { kind: "none" },
-          environment: {
+      const request = nativeRequest({ cwd, node, environment: {
             PROBE_PORT: String(port),
             PROTECTED_C_FILE: protectedC,
             PROTECTED_E_FILE: protectedE,
             PROTECTED_CREDENTIAL_FILE: credentialFile,
-          },
-        },
-        argv: [node, "-e", script],
-      };
+          }, argv: [node, "-e", script] });
       const restricted = spawnSync(executable, ["stdio"], {
         cwd,
         env: {
@@ -126,22 +135,8 @@ describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Window
     const cwd = join(root, "runtime");
     mkdirSync(cwd);
     const node = realpathSync.native(process.execPath);
-    const request = {
-      runtimeProfile: "codemode",
-      plan: {
-        backend: { id: "windows-mxc" },
-        cwd,
-        filesystem: [
-          { path: node, access: "read", granularity: "file" },
-          { path: executable, access: "read", granularity: "file" },
-          { path: cwd, access: "read", granularity: "directory" },
-        ],
-        protectedPaths: [],
-        network: { kind: "none" },
-        environment: {},
-      },
-      argv: [node, "-e", 'process.stderr.write("codemode-runtime-crash"); process.exit(77);'],
-    };
+    const request = nativeRequest({ cwd, node, environment: {},
+      argv: [node, "-e", 'process.stderr.write("codemode-runtime-crash"); process.exit(77);'] });
 
     try {
       const result = spawnSync(executable, ["stdio"], {
@@ -170,22 +165,8 @@ describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Window
     const cwd = join(root, "runtime");
     mkdirSync(cwd);
     const node = realpathSync.native(process.execPath);
-    const request = {
-      runtimeProfile: "codemode",
-      plan: {
-        backend: { id: "windows-mxc" },
-        cwd,
-        filesystem: [
-          { path: node, access: "read", granularity: "file" },
-          { path: executable, access: "read", granularity: "file" },
-          { path: cwd, access: "read", granularity: "directory" },
-        ],
-        protectedPaths: [],
-        network: { kind: "none" },
-        environment: {},
-      },
-      argv: [node, "-e", 'setTimeout(() => {}, 30000); console.log(JSON.stringify({ pid: process.pid }));'],
-    };
+    const request = nativeRequest({ cwd, node, environment: {},
+      argv: [node, "-e", 'setTimeout(() => {}, 30000); console.log(JSON.stringify({ pid: process.pid }));'] });
     const child = spawn(executable, ["stdio"], {
       cwd,
       env: {

@@ -1,50 +1,11 @@
-import { isAbsolute } from "node:path";
-
-import {
-  decodeHelperMessage,
-  encodeHostMessage,
-  helloMessage,
-  type CancelledMessage,
-  type HelperDecodeResult,
-  type HelperErrorMessage,
-  type ReadyMessage,
-  type RejectedMessage,
-  type ResultMessage,
-} from "#sandbox/protocol";
-import {
-  capabilityGap,
-  helperFailureCode,
-  requiredCapabilities,
-  resolveTrustedHelper,
-  versionMatches,
-  type TrustedHelperInstallation,
-} from "#sandbox/helper";
-import {
-  captureExecutionPlan,
-  executionPlanVerifies,
-} from "#sandbox/plan";
-import {
-  spawnHelper,
-  type HelperExitInfo,
-  type HelperProcessSpec,
-  type HelperTransport,
-} from "#sandbox/transport";
-import { correlationKey } from "#sandbox/keys";
-import {
-  isExecutionValidityGuard,
-  validityRefusal,
-  type ExecutionValidityGuard,
-  type ValidityRefusal,
-} from "#sandbox/validity";
 import {
   DEFAULT_CANCEL_GRACE_MS,
   DEFAULT_EXECUTION_DEADLINE_MS,
   DEFAULT_START_TIMEOUT_MS,
-  HELPER_PROTOCOL_VERSION,
   MAX_CONCURRENT_EXECUTIONS,
+  MAX_DEADLINE_HORIZON_MS,
   MAX_EXECUTION_STDERR_BYTES,
   MAX_EXECUTION_STDOUT_BYTES,
-  MAX_HELPER_MESSAGES,
   MAX_QUEUED_EXECUTIONS,
   type BackendCapabilities,
   type BackendIdentity,
@@ -52,57 +13,33 @@ import {
   type ExecutionFailureCode,
   type ExecutionOutcome,
   type ExecutionPlan,
+  type ExecutionRequest,
   type ExecutionRecord,
   type ExecutionStarted,
   type ImpactState,
 } from "#sandbox/types";
+import { captureExecutionRequest } from "#sandbox/plan";
+import { capabilityGap, backendFailureCode, requiredCapabilities } from "#sandbox/backend/capabilities";
+import type { DirectBackendDriver, DirectBackendUnavailable, NativeLaunchPlan } from "#sandbox/backend/direct";
+import { runNativeProcess, type NativeProcessResult } from "#sandbox/backend/native-process";
+import { correlationKey } from "#sandbox/keys";
+import {
+  isExecutionValidityGuard,
+  validityRefusal,
+  type ExecutionValidityGuard,
+  type ValidityRefusal,
+} from "#sandbox/validity";
 
-export interface HelperProbeSuccess {
+export interface BackendProbeSuccess {
   readonly status: "available";
   readonly backend: BackendIdentity;
   readonly capabilities: BackendCapabilities;
-  readonly protocolVersion: number;
 }
 
-export type HelperProbeResult =
-  | HelperProbeSuccess
-  | {
-      readonly status:
-        | "missing"
-        | "version-mismatch"
-        | "setup-failed"
-        | "start-failed"
-        | "protocol-error";
-      readonly reason: string;
-    };
-
-export type HelperProcessPreparation =
-  | { readonly ok: true; readonly spec: HelperProcessSpec }
-  | {
-      readonly ok: false;
-      readonly code:
-        | "sandbox-unavailable"
-        | "sandbox-setup-failed"
-        | "sandbox-capability-unsupported";
-      readonly reason: string;
-    };
-
-export type PrepareHelperProcess = (input: {
-  readonly installation: TrustedHelperInstallation;
-  readonly spec: HelperProcessSpec;
-  readonly plan?: ExecutionPlan;
-}) => HelperProcessPreparation;
-
-/**
- * Host-owned egress seam. The controller asks for one lease before the
- * business start is sent and revokes it on cancel and after settle;
- * revocation must be idempotent. A `null` grant refuses the launch before
- * the sandboxed process exists.
- */
-export interface EgressProvider {
-  acquire(plan: ExecutionPlan): Promise<EgressGrantRef | null>;
-  revoke(leaseId: string): void;
-}
+export type BackendProbeResult = BackendProbeSuccess | {
+  readonly status: "unavailable" | "setup-failed";
+  readonly reason: string;
+};
 
 export interface EgressGrantRef {
   readonly leaseId: string;
@@ -111,18 +48,15 @@ export interface EgressGrantRef {
   readonly credential: string;
 }
 
+export interface EgressProvider {
+  acquire(request: ExecutionRequest): Promise<EgressGrantRef | null>;
+  revoke(leaseId: string): void;
+}
+
 export interface ExecutionControllerOptions {
-  readonly installation: TrustedHelperInstallation;
+  readonly directBackend?: DirectBackendDriver;
   readonly unavailableReason?: string;
-  /** Host-owned working directory for helper processes, outside the workspace. */
-  readonly helperCwd: string;
-  /** Agent workspace; an install root inside it is never trusted. */
-  readonly workspace?: string;
-  /** Explicitly filtered helper environment; never the controller environment. */
-  readonly helperEnvironment: Readonly<Record<string, string>>;
   readonly runtimeUseLease?: () => Promise<() => void>;
-  /** Host-owned hook to apply a platform boundary before the helper starts. */
-  readonly prepareHelperProcess?: PrepareHelperProcess;
   readonly startTimeoutMs?: number;
   readonly cancelGraceMs?: number;
   readonly maxConcurrent?: number;
@@ -135,14 +69,8 @@ export interface ExecutionControllerOptions {
 }
 
 export interface ExecuteInput {
-  readonly plan: ExecutionPlan;
+  readonly request: ExecutionRequest;
   readonly signal?: AbortSignal;
-  /**
-   * Host-issued lease re-checked after every wait this controller owns.
-   * Direct controller consumers that own their validity facts may omit it;
-   * anything arriving through the controlled adapter must always supply one,
-   * and a value that is not an issued lease is refused rather than ignored.
-   */
   readonly validity?: ExecutionValidityGuard;
   readonly onOutput?: (chunk: {
     readonly stream: "stdout" | "stderr";
@@ -156,62 +84,46 @@ interface CancelIntent {
 }
 
 interface PendingTask {
-  readonly plan: ExecutionPlan;
+  readonly request: ExecutionRequest;
   readonly generation: number;
-  readonly signal?: AbortSignal;
+  readonly signal: AbortController;
   readonly validity?: ExecutionValidityGuard;
   readonly onOutput?: ExecuteInput["onOutput"];
   readonly resolve: (outcome: ExecutionOutcome) => void;
-  /** Settles only after this task has released its physical helper. */
   readonly settled: Promise<void>;
+  externalSignal?: AbortSignal;
+  externalAbortHandler?: () => void;
   timer?: NodeJS.Timeout;
-  abortHandler?: () => void;
-  cancelled?: ExecutionOutcome;
-  /** Set while the task has left the queue but has not registered as active. */
+  cancel?: CancelIntent;
   starting?: Promise<void>;
+  resolved: boolean;
 }
 
 interface ActiveExecution {
   readonly task: PendingTask;
   readonly generation: number;
-  readonly transport: HelperTransport;
-  readonly done: Promise<void>;
-  signalDone: () => void;
-  finished: boolean;
-  phase: "handshake" | "starting" | "running";
-  ready?: ReadyMessage;
-  startedAck: boolean;
-  startSent: boolean;
-  helperStarted?: boolean | "unknown";
-  result?: ResultMessage;
-  rejected?: RejectedMessage;
-  cancelledByHelper?: CancelledMessage;
-  helperError?: HelperErrorMessage;
-  protocolError?: string;
-  exitInfo?: HelperExitInfo;
-  versionMismatch?: string;
-  capabilityGap?: readonly string[];
-  /** The host lease refused before the business start was sent. */
-  validityRefusal?: ValidityRefusal;
+  readonly timers: Set<NodeJS.Timeout>;
+  startTimer?: NodeJS.Timeout;
+  started: ExecutionStarted;
+  startAttempted: boolean;
   startTimedOut: boolean;
   outputLimit: boolean;
-  nextSequence: number;
   stdout: string;
   stderr: string;
   stdoutBytes: number;
   stderrBytes: number;
-  messageCount: number;
+  diagnostics: string;
+  failure?: { readonly code: string; readonly reason: string };
+  capabilityGap?: readonly string[];
+  validityRefusal?: ValidityRefusal;
+  result?: NativeProcessResult;
   cancel?: CancelIntent;
-  cancelSent: boolean;
-  startTimer?: NodeJS.Timeout;
-  timers: Set<NodeJS.Timeout>;
-  /** Host-issued egress lease held by this execution, if any. */
   egress?: EgressGrantRef;
   egressSettled: boolean;
 }
 
-function keyFor(plan: ExecutionPlan): string {
-  return correlationKey(plan.requestId, plan.toolCallId);
+function keyFor(request: ExecutionRequest): string {
+  return correlationKey(request.requestId, request.toolCallId);
 }
 
 const ABORT_REASONS: Readonly<Record<CancellationCode, string>> = Object.freeze({
@@ -221,18 +133,9 @@ const ABORT_REASONS: Readonly<Record<CancellationCode, string>> = Object.freeze(
   "session-disposed": "session disposed",
 });
 
-/**
- * An aborted signal can carry the invalidation that caused it, so a session or
- * configuration change is recorded as itself instead of as a user cancellation.
- */
-function abortIntent(
-  signal: AbortSignal,
-): { readonly code: CancellationCode; readonly reason: string } {
+function abortIntent(signal: AbortSignal): CancelIntent {
   const reason = signal.reason;
-  if (
-    typeof reason === "string" &&
-    Object.hasOwn(ABORT_REASONS, reason)
-  ) {
+  if (typeof reason === "string" && Object.hasOwn(ABORT_REASONS, reason)) {
     const code = reason as CancellationCode;
     return { code, reason: ABORT_REASONS[code] };
   }
@@ -240,22 +143,17 @@ function abortIntent(
 }
 
 function startedState(active: ActiveExecution): ExecutionStarted {
-  if (active.startedAck || active.helperStarted === true) return true;
-  if (active.helperStarted === "unknown") return "unknown";
-  return active.startSent ? "unknown" : false;
+  if (active.result) return active.result.started;
+  if (active.started === true || active.started === "unknown") return active.started;
+  return active.startAttempted ? "unknown" : false;
 }
 
-function impactState(
-  started: ExecutionStarted,
-  explicit?: ImpactState,
-): ImpactState {
-  if (explicit) return explicit;
-  if (started === false) return "none";
-  return "unknown";
+function impactState(started: ExecutionStarted): ImpactState {
+  return started === false ? "none" : "unknown";
 }
 
 function makeRecord(
-  plan: ExecutionPlan | undefined,
+  request: ExecutionRequest | undefined,
   generation: number,
   state: ExecutionRecord["state"],
   started: ExecutionStarted,
@@ -266,12 +164,12 @@ function makeRecord(
   },
 ): ExecutionRecord {
   return {
-    requestId: plan?.requestId ?? "unknown",
-    toolCallId: plan?.toolCallId ?? "unknown",
-    actionDigest: plan?.actionDigest ?? "unknown",
-    planDigest: plan?.digest ?? "unknown",
+    requestId: request?.requestId ?? "unknown",
+    toolCallId: request?.toolCallId ?? "unknown",
+    actionDigest: request?.actionDigest ?? "unknown",
+    planDigest: request?.plan.digest ?? "unknown",
     generation,
-    toolName: plan?.tool.name ?? "unknown",
+    toolName: request?.toolName ?? "unknown",
     started,
     state,
     impact,
@@ -280,19 +178,9 @@ function makeRecord(
   };
 }
 
-function completedOutcome(
-  active: ActiveExecution,
-  result: ResultMessage,
-): ExecutionOutcome {
+function completedOutcome(active: ActiveExecution, result: NativeProcessResult): ExecutionOutcome {
   const exitCode = result.exitCode ?? -1;
-  const record = makeRecord(
-    active.task.plan,
-    active.generation,
-    "completed",
-    true,
-    result.impact,
-    { exitCode },
-  );
+  const record = makeRecord(active.task.request, active.generation, "completed", true, result.impact, { exitCode });
   return {
     state: "completed",
     started: true,
@@ -300,9 +188,7 @@ function completedOutcome(
     stdout: active.stdout,
     stderr: active.stderr,
     truncated: false,
-    ...(result.dataBase64 === undefined
-      ? {}
-      : { dataBase64: result.dataBase64 }),
+    ...(result.dataBase64 === undefined ? {} : { dataBase64: result.dataBase64 }),
     record,
   };
 }
@@ -314,6 +200,7 @@ function failedOutcome(
   started: ExecutionStarted,
   impact: ImpactState,
 ): ExecutionOutcome {
+  const result = active.result;
   return {
     state: "failed",
     started,
@@ -321,25 +208,14 @@ function failedOutcome(
     reason,
     impact,
     stdout: active.stdout,
-    stderr: active.stderr || active.transport.diagnostics,
+    stderr: active.stderr || active.diagnostics || result?.diagnostics || "",
     truncated: false,
-    ...(active.result?.dataBase64 === undefined ? {} : { dataBase64: active.result.dataBase64 }),
-    record: makeRecord(
-      active.task.plan,
-      active.generation,
-      "failed",
-      started,
-      impact,
-      { code },
-    ),
+    ...(result?.dataBase64 === undefined ? {} : { dataBase64: result.dataBase64 }),
+    record: makeRecord(active.task.request, active.generation, "failed", started, impact, { code }),
   };
 }
 
-function cancelledOutcome(
-  active: ActiveExecution,
-  code: CancellationCode,
-  reason: string,
-): ExecutionOutcome {
+function cancelledOutcome(active: ActiveExecution, code: CancellationCode, reason: string): ExecutionOutcome {
   const started = startedState(active);
   const impact = impactState(started);
   return {
@@ -351,158 +227,63 @@ function cancelledOutcome(
     stdout: active.stdout,
     stderr: active.stderr,
     truncated: false,
-    record: makeRecord(
-      active.task.plan,
-      active.generation,
-      "cancelled",
-      started,
-      impact,
-      { code },
-    ),
+    record: makeRecord(active.task.request, active.generation, "cancelled", started, impact, { code }),
   };
 }
 
-function outcomeFor(
-  active: ActiveExecution,
-): ExecutionOutcome {
+function outcomeFor(active: ActiveExecution): ExecutionOutcome {
   if (active.validityRefusal) {
-    return cancelledOutcome(
-      active,
-      active.validityRefusal.code,
-      active.validityRefusal.reason,
-    );
+    return cancelledOutcome(active, active.validityRefusal.code, active.validityRefusal.reason);
   }
   if (active.outputLimit) {
-    return failedOutcome(
-      active,
-      "sandbox-output-limit",
-      "helper output exceeded the configured bound",
-      true,
-      "unknown",
-    ) as ExecutionOutcome;
-  }
-  if (active.versionMismatch) {
-    return failedOutcome(
-      active,
-      "sandbox-version-mismatch",
-      active.versionMismatch,
-      false,
-      "none",
-    );
+    return failedOutcome(active, "sandbox-output-limit", "native process output exceeded the configured bound", true, "unknown");
   }
   if (active.capabilityGap) {
-    return failedOutcome(
-      active,
-      "sandbox-capability-unsupported",
-      `backend cannot express: ${active.capabilityGap.join(", ")}`,
-      false,
-      "none",
-    );
-  }
-  if (active.rejected) {
-    return failedOutcome(
-      active,
-      helperFailureCode(active.rejected.code),
-      active.rejected.reason,
-      false,
-      "none",
-    );
-  }
-  if (active.result) {
-    if (active.result.errorCode !== undefined) {
-      const mapped = helperFailureCode(active.result.errorCode);
-      const code: ExecutionFailureCode =
-        mapped === "sandbox-start-failed" || mapped === "sandbox-setup-failed"
-          ? "execution-failed"
-          : mapped;
-      return failedOutcome(
-        active,
-        code,
-        active.result.error ?? "helper reported an execution error",
-        true,
-        active.result.impact,
-      );
-    }
-    if (active.result.exitCode === null) {
-      return failedOutcome(
-        active,
-        "execution-failed",
-        "helper reported a terminated process without an exit code",
-        true,
-        active.result.impact,
-      );
-    }
-    return completedOutcome(active, active.result);
-  }
-  if (active.helperError) {
-    const mapped = helperFailureCode(active.helperError.code);
-    const started = startedState(active);
-    return failedOutcome(
-      active,
-      started === true ? "execution-failed" : mapped,
-      active.helperError.message || active.helperError.code,
-      started,
-      impactState(started),
-    );
+    return failedOutcome(active, "sandbox-capability-unsupported", `backend cannot express: ${active.capabilityGap.join(", ")}`, false, "none");
   }
   if (active.startTimedOut) {
     return failedOutcome(
       active,
       "sandbox-start-failed",
-      "helper did not report a start within the start timeout",
-      active.startSent ? "unknown" : false,
-      active.startSent ? "unknown" : "none",
-    );
-  }
-  if (active.protocolError) {
-    return failedOutcome(
-      active,
-      "sandbox-protocol-error",
-      active.protocolError,
+      "native process did not report a start within the start timeout",
       startedState(active),
-      startedState(active) === false ? "none" : "unknown",
+      impactState(startedState(active)),
     );
   }
-  if (active.cancel) {
-    return cancelledOutcome(active, active.cancel.code, active.cancel.reason);
+  if (active.failure) {
+    const mapped = backendFailureCode(active.failure.code);
+    const code: ExecutionFailureCode = startedState(active) === true &&
+      (mapped === "sandbox-start-failed" || mapped === "sandbox-setup-failed")
+      ? "execution-failed"
+      : mapped;
+    const started = startedState(active);
+    return failedOutcome(active, code, active.failure.reason, started, impactState(started));
   }
-  if (active.cancelledByHelper) {
-    return cancelledOutcome(
-      active,
-      "execution-cancelled",
-      "helper reported cancellation",
-    );
+  if (active.result?.errorCode !== undefined) {
+    const mapped = backendFailureCode(active.result.errorCode);
+    const code: ExecutionFailureCode = active.result.started === true &&
+      (mapped === "sandbox-start-failed" || mapped === "sandbox-setup-failed")
+      ? "execution-failed"
+      : mapped;
+    return failedOutcome(active, code, active.result.error ?? "native process reported an execution error", active.result.started, active.result.impact);
   }
-  if (active.exitInfo) {
-    return failedOutcome(
-      active,
-      "sandbox-transport-lost",
-      `helper exited before a result (code=${String(active.exitInfo.code)}, signal=${String(active.exitInfo.signal)})`,
-      startedState(active),
-      startedState(active) === false ? "none" : "unknown",
-    );
+  if (active.result && active.result.exitCode === null && !active.result.cancelled) {
+    return failedOutcome(active, "execution-failed", "native process terminated without an exit code", active.result.started, active.result.impact);
   }
-  return failedOutcome(
-    active,
-    "sandbox-start-failed",
-    "helper ended without a start or result",
-    startedState(active),
-    startedState(active) === false ? "none" : "unknown",
-  );
+  if (active.result && !active.result.cancelled) return completedOutcome(active, active.result);
+  if (active.cancel) return cancelledOutcome(active, active.cancel.code, active.cancel.reason);
+  if (active.result?.cancelled) {
+    return cancelledOutcome(active, "execution-cancelled", "native process reported cancellation");
+  }
+  const started = startedState(active);
+  return failedOutcome(active, "sandbox-start-failed", "native process ended without a result", started, impactState(started));
 }
 
-/**
- * Plans, queues, starts, streams, cancels, and records helper executions.
- * Approval verdicts stay with the caller; this class only reports execution.
- */
+/** Plans and runs one controlled operation through a trusted native backend. */
 export class ExecutionController {
-  private readonly installation: TrustedHelperInstallation;
+  private readonly directBackend: DirectBackendDriver | undefined;
   private readonly unavailableReason: string | undefined;
-  private readonly helperCwd: string;
-  private readonly workspace: string | undefined;
-  private readonly helperEnvironment: Readonly<Record<string, string>>;
   private readonly runtimeUseLease: ExecutionControllerOptions["runtimeUseLease"];
-  private readonly prepareHelperProcess: PrepareHelperProcess | undefined;
   private readonly startTimeoutMs: number;
   private readonly cancelGraceMs: number;
   private readonly maxConcurrent: number;
@@ -515,37 +296,28 @@ export class ExecutionController {
   private generation = 1;
   private disposed = false;
   private readonly queue: PendingTask[] = [];
-  /** Dequeued tasks that are still acquiring a runtime lease or spawning. */
   private readonly starting = new Map<string, PendingTask>();
   private readonly active = new Map<string, ActiveExecution>();
-  private readonly probes = new Set<HelperTransport>();
+  private readonly probes = new Set<AbortController>();
   private readonly settling = new Set<Promise<void>>();
 
   constructor(options: ExecutionControllerOptions) {
-    this.installation = options.installation;
-    this.unavailableReason = options.unavailableReason;
-    this.helperCwd = options.helperCwd;
-    this.workspace = options.workspace;
-    this.helperEnvironment = Object.freeze({ ...options.helperEnvironment });
+    this.directBackend = options.directBackend;
+    this.unavailableReason = options.unavailableReason ??
+      (options.directBackend === undefined ? "native sandbox backend is unavailable" : undefined);
     this.runtimeUseLease = options.runtimeUseLease;
-    this.prepareHelperProcess = options.prepareHelperProcess;
     this.startTimeoutMs = options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
     this.cancelGraceMs = options.cancelGraceMs ?? DEFAULT_CANCEL_GRACE_MS;
     this.maxConcurrent = options.maxConcurrent ?? MAX_CONCURRENT_EXECUTIONS;
     this.maxQueue = options.maxQueue ?? MAX_QUEUED_EXECUTIONS;
-    this.executionDeadlineMs =
-      options.executionDeadlineMs ?? DEFAULT_EXECUTION_DEADLINE_MS;
+    this.executionDeadlineMs = options.executionDeadlineMs ?? DEFAULT_EXECUTION_DEADLINE_MS;
     this.now = options.now ?? Date.now;
     this.onRecord = options.onRecord;
     this.probeTimeoutMs = options.probeTimeoutMs ?? this.startTimeoutMs;
     this.egress = options.egress;
-    if (!isAbsolute(this.helperCwd)) {
-      throw new Error("helperCwd must be an absolute path");
-    }
     if (!Number.isInteger(this.maxConcurrent) || this.maxConcurrent < 1 ||
-        this.maxConcurrent > MAX_CONCURRENT_EXECUTIONS ||
-        !Number.isInteger(this.maxQueue) || this.maxQueue < 0 ||
-        this.maxQueue > MAX_QUEUED_EXECUTIONS) {
+        this.maxConcurrent > MAX_CONCURRENT_EXECUTIONS || !Number.isInteger(this.maxQueue) ||
+        this.maxQueue < 0 || this.maxQueue > MAX_QUEUED_EXECUTIONS) {
       throw new Error("execution queue bounds are invalid");
     }
   }
@@ -554,7 +326,6 @@ export class ExecutionController {
     return this.generation;
   }
 
-  /** Running helper count, used by hosts to expose local health. */
   get activeCount(): number {
     return this.active.size;
   }
@@ -563,264 +334,164 @@ export class ExecutionController {
     return this.queue.length;
   }
 
-  /** Suggested absolute deadline for a plan compiled now. */
   deadlineFromNow(remainingMs?: number): number {
     return this.now() + (remainingMs ?? this.executionDeadlineMs);
   }
 
-  probe(): Promise<HelperProbeResult> {
+  probe(): Promise<BackendProbeResult> {
     const run = this.probeInternal();
-    const tracked = run.then(
-      () => undefined,
-      () => undefined,
-    );
+    const tracked = run.then(() => undefined, () => undefined);
     this.settling.add(tracked);
     void tracked.finally(() => this.settling.delete(tracked));
     return run;
   }
 
-  private async probeInternal(): Promise<HelperProbeResult> {
-    if (this.disposed) {
-      return {
-        status: "setup-failed",
-        reason: "execution controller is disposed",
-      };
-    }
+  private async probeInternal(): Promise<BackendProbeResult> {
+    if (this.disposed) return { status: "setup-failed", reason: "execution controller is disposed" };
     if (this.active.size + this.probes.size + this.starting.size >= this.maxConcurrent) {
-      return {
-        status: "setup-failed",
-        reason: "helper probe limit reached",
-      };
+      return { status: "setup-failed", reason: "native backend probe limit reached" };
     }
-    const generation = this.generation;
-    const requestId = `probe-${generation}-${this.now()}`;
-    const spawned = this.resolveAndSpawn();
-    if (!spawned.ok) {
-      return {
-        status:
-          spawned.code === "sandbox-unavailable"
-            ? "missing"
-            : spawned.code === "sandbox-start-failed"
-              ? "start-failed"
-              : "setup-failed",
-        reason: spawned.reason,
-      };
+    if (this.unavailableReason !== undefined || this.directBackend === undefined) {
+      return { status: "unavailable", reason: this.unavailableReason ?? "native sandbox backend is unavailable" };
     }
-    const transport = spawned.transport;
-    this.probes.add(transport);
-    try {
-      const result = await this.handshake(transport, requestId, generation);
-      const hello = encodeHostMessage({ type: "shutdown" });
-      if (hello.ok) transport.send(hello.line);
-      return result;
-    } finally {
-      try {
-        await transport.close(500);
-      } finally {
-        this.probes.delete(transport);
-        this.drain();
-      }
-    }
-  }
 
-  private resolveAndSpawn(plan?: ExecutionPlan):
-    | { readonly ok: true; readonly transport: HelperTransport }
-    | {
-        readonly ok: false;
-        readonly code:
-          | "sandbox-unavailable"
-          | "sandbox-setup-failed"
-          | "sandbox-capability-unsupported"
-          | "sandbox-start-failed";
-        readonly reason: string;
-      } {
-    if (this.unavailableReason !== undefined) {
-      return { ok: false, code: "sandbox-unavailable", reason: this.unavailableReason };
-    }
-    const resolution = resolveTrustedHelper(this.installation, {
-      cwd: this.helperCwd,
-      ...(this.workspace === undefined ? {} : { workspace: this.workspace }),
-    });
-    if (!resolution.ok) {
-      return { ok: false, code: resolution.code, reason: resolution.reason };
-    }
+    const controller = new AbortController();
+    this.probes.add(controller);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort("probe-timeout");
+    }, this.probeTimeoutMs);
+    timer.unref?.();
     try {
-      const spec: HelperProcessSpec = {
-        executable: resolution.installation.executable,
-        args: resolution.installation.args ?? [],
-        cwd: this.helperCwd,
-        environment: this.helperEnvironment,
-      };
-      const preparation = this.prepareHelperProcess?.({
-        installation: resolution.installation,
-        spec,
-        ...(plan === undefined ? {} : { plan }),
-      });
-      if (preparation && !preparation.ok) return preparation;
+      const result = await this.directBackend.probe(controller.signal);
+      if (timedOut) return { status: "setup-failed", reason: "native backend probe timed out" };
+      if (controller.signal.aborted) return { status: "setup-failed", reason: "native backend probe was cancelled" };
+      if (!result.ok) {
+        return {
+          status: result.code === "unavailable" ? "unavailable" : "setup-failed",
+          reason: result.reason,
+        };
+      }
       return {
-        ok: true,
-        transport: spawnHelper(preparation?.spec ?? spec),
+        status: "available",
+        backend: { id: this.directBackend.id, version: this.directBackend.version },
+        capabilities: result.capabilities,
       };
     } catch (error) {
       return {
-        ok: false,
-        code: "sandbox-start-failed",
-        reason: error instanceof Error ? error.message : String(error),
+        status: timedOut ? "setup-failed" : "unavailable",
+        reason: timedOut ? "native backend probe timed out" : error instanceof Error ? error.message : String(error),
       };
+    } finally {
+      clearTimeout(timer);
+      this.probes.delete(controller);
+      this.drain();
     }
   }
 
   async execute(input: ExecuteInput): Promise<ExecutionOutcome> {
     if (input.validity !== undefined && !isExecutionValidityGuard(input.validity)) {
-      return this.invalidPlanOutcome(
-        "execution validity lease was not issued by the host",
-        undefined,
-        "invalid-plan",
-      );
+      return this.invalidPlanOutcome("execution validity lease was not issued by the host", undefined, "invalid-plan");
     }
-    const plan = captureExecutionPlan(input.plan);
-    if (!plan) {
-      return this.invalidPlanOutcome(
-        "plan is missing, malformed or contains accessors",
-        undefined,
-        "invalid-plan",
-      );
+    const request = captureExecutionRequest(input.request);
+    if (!request) {
+      return this.invalidPlanOutcome("execution request is missing, malformed or contains accessors", undefined, "invalid-plan");
     }
-    if (!executionPlanVerifies(plan)) {
-      return this.invalidPlanOutcome(
-        "plan digest does not verify",
-        undefined,
-        "invalid-plan",
-      );
+    if (request.start.deadlineAt - this.now() > MAX_DEADLINE_HORIZON_MS) {
+      return this.invalidPlanOutcome("execution deadline exceeds the maximum horizon", request, "invalid-plan");
     }
-    if (plan.mode === "full-access") {
-      return this.invalidPlanOutcome(
-        "full-access has no module sandbox",
-        plan,
-        "full-access-no-sandbox",
-      );
+    if (request.mode === "full-access") {
+      return this.invalidPlanOutcome("full-access has no module sandbox", request, "full-access-no-sandbox");
     }
-    if (this.disposed) {
-      return this.invalidPlanOutcome(
-        "execution controller is disposed",
-        plan,
-        "invalid-plan",
-      );
+    if (this.disposed) return this.invalidPlanOutcome("execution controller is disposed", request, "invalid-plan");
+    if (input.signal?.aborted) {
+      const intent = abortIntent(input.signal);
+      return this.failureOutcome(request, this.generation, "cancelled", false, "none", intent);
     }
     if (this.queue.length >= this.maxQueue &&
         this.active.size + this.probes.size + this.starting.size >= this.maxConcurrent) {
-      return this.immediateFailure(
-        plan,
-        "sandbox-queue-full",
-        "execution queue is full",
-      );
+      return this.immediateFailure(request, "sandbox-queue-full", "execution queue is full");
     }
-    if (plan.deadlineAt <= this.now()) {
-      return this.immediateFailure(
-        plan,
-        "sandbox-deadline-exceeded",
-        "plan deadline has passed",
-      );
+    if (request.start.deadlineAt <= this.now()) {
+      return this.immediateFailure(request, "sandbox-deadline-exceeded", "plan deadline has passed");
     }
-    const key = keyFor(plan);
-    if (
-      this.active.has(key) ||
-      this.starting.has(key) ||
-      this.queue.some((task) => keyFor(task.plan) === key)
-    ) {
-      return this.immediateFailure(
-        plan,
-        "binding-mismatch",
-        "duplicate requestId/toolCallId is already active or queued",
-      );
+
+    const key = keyFor(request);
+    if (this.active.has(key) || this.starting.has(key) || this.queue.some((task) => keyFor(task.request) === key)) {
+      return this.immediateFailure(request, "binding-mismatch", "duplicate requestId/toolCallId is already active or queued");
     }
 
     return new Promise<ExecutionOutcome>((resolve) => {
       let settle!: () => void;
-      const settled = new Promise<void>(done => { settle = done; });
+      const settled = new Promise<void>((done) => { settle = done; });
       const task: PendingTask = {
-        plan,
+        request,
         generation: this.generation,
-        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        signal: new AbortController(),
         ...(input.validity === undefined ? {} : { validity: input.validity }),
         ...(input.onOutput === undefined ? {} : { onOutput: input.onOutput }),
         settled,
-        resolve: outcome => { resolve(outcome); settle(); },
+        resolved: false,
+        resolve: (outcome) => {
+          if (task.resolved) return;
+          task.resolved = true;
+          resolve(outcome);
+          settle();
+        },
       };
+      if (input.signal) {
+        task.externalSignal = input.signal;
+        task.externalAbortHandler = () => this.cancelTask(task, abortIntent(input.signal as AbortSignal));
+        input.signal.addEventListener("abort", task.externalAbortHandler, { once: true });
+        if (input.signal.aborted) task.externalAbortHandler();
+      }
+      if (task.resolved) return;
       this.queue.push(task);
       task.timer = setTimeout(() => {
         this.removeQueued(task);
-        resolve(this.queuedFailure(task, "sandbox-deadline-exceeded", "plan deadline expired while queued"));
-      }, Math.max(0, plan.deadlineAt - this.now()));
+        const outcome = this.queuedFailure(task, "sandbox-deadline-exceeded", "plan deadline expired while queued");
+        this.finishTask(task, outcome);
+        this.drain();
+      }, Math.max(0, request.start.deadlineAt - this.now()));
       task.timer.unref?.();
-      if (task.signal) {
-        if (task.signal.aborted) {
-          const intent = abortIntent(task.signal);
-          this.cancelQueued(task, intent.code, intent.reason);
-          return;
-        }
-        task.abortHandler = () => {
-          const intent = abortIntent(task.signal as AbortSignal);
-          this.cancelQueued(task, intent.code, intent.reason);
-        };
-        task.signal.addEventListener("abort", task.abortHandler, { once: true });
-      }
       this.drain();
     });
   }
 
-  /** Invalidate queued plans and cancel running helpers after a config change. */
   async updateConfiguration(): Promise<void> {
     this.generation += 1;
     this.invalidateQueued("plan-invalidated", "configuration changed");
-    for (const task of this.starting.values()) {
-      this.cancelStarting(task, "plan-invalidated", "configuration changed");
-    }
-    for (const active of this.active.values()) {
-      this.beginCancel(active, "plan-invalidated", "configuration changed");
-    }
-    for (const probe of this.probes) probe.kill(0);
+    for (const task of this.starting.values()) this.cancelStarting(task, "plan-invalidated", "configuration changed");
+    for (const active of this.active.values()) this.beginCancel(active, "plan-invalidated", "configuration changed");
+    for (const probe of this.probes) probe.abort("plan-invalidated");
     await this.waitForSettling();
   }
 
-  async cancelSession(
-    sessionId: string,
-    reason = "session disposed",
-  ): Promise<void> {
-    this.invalidateQueued(
-      "session-disposed",
-      reason,
-      (task) => task.plan.sessionId === sessionId,
-    );
+  async cancelSession(sessionId: string, reason = "session disposed"): Promise<void> {
+    this.invalidateQueued("session-disposed", reason, (task) => task.request.sessionId === sessionId);
     const cancelled: Promise<void>[] = [];
     for (const task of this.starting.values()) {
-      if (task.plan.sessionId !== sessionId) continue;
+      if (task.request.sessionId !== sessionId) continue;
       cancelled.push(this.cancelStarting(task, "session-disposed", reason));
     }
     for (const active of this.active.values()) {
-      if (active.task.plan.sessionId !== sessionId) continue;
+      if (active.task.request.sessionId !== sessionId) continue;
       cancelled.push(active.task.settled);
       this.beginCancel(active, "session-disposed", reason);
     }
     await Promise.all(cancelled);
   }
 
-  async cancel(
-    requestId: string,
-    reason = "cancelled by host",
-  ): Promise<void> {
-    this.invalidateQueued(
-      "execution-cancelled",
-      reason,
-      (task) => task.plan.requestId === requestId,
-    );
+  async cancel(requestId: string, reason = "cancelled by host"): Promise<void> {
+    this.invalidateQueued("execution-cancelled", reason, (task) => task.request.requestId === requestId);
     const cancelled: Promise<void>[] = [];
     for (const task of this.starting.values()) {
-      if (task.plan.requestId !== requestId) continue;
+      if (task.request.requestId !== requestId) continue;
       cancelled.push(this.cancelStarting(task, "execution-cancelled", reason));
     }
     for (const active of this.active.values()) {
-      if (active.task.plan.requestId !== requestId) continue;
+      if (active.task.request.requestId !== requestId) continue;
       cancelled.push(active.task.settled);
       this.beginCancel(active, "execution-cancelled", reason);
     }
@@ -835,13 +506,9 @@ export class ExecutionController {
     this.disposed = true;
     this.generation += 1;
     this.invalidateQueued("session-disposed", "controller disposed");
-    for (const task of this.starting.values()) {
-      this.cancelStarting(task, "session-disposed", "controller disposed");
-    }
-    for (const active of this.active.values()) {
-      this.beginCancel(active, "session-disposed", "controller disposed");
-    }
-    for (const probe of this.probes) probe.kill(0);
+    for (const task of this.starting.values()) this.cancelStarting(task, "session-disposed", "controller disposed");
+    for (const active of this.active.values()) this.beginCancel(active, "session-disposed", "controller disposed");
+    for (const probe of this.probes) probe.abort("session-disposed");
     await this.waitForSettling();
   }
 
@@ -850,53 +517,68 @@ export class ExecutionController {
   }
 
   private drain(): void {
-    while (
-      !this.disposed &&
-      this.active.size + this.probes.size + this.starting.size < this.maxConcurrent &&
-      this.queue.length > 0
-    ) {
+    while (!this.disposed && this.active.size + this.probes.size + this.starting.size < this.maxConcurrent && this.queue.length > 0) {
       const task = this.queue.shift()!;
-      if (task.cancelled) {
-        task.resolve(task.cancelled);
+      if (task.cancel) {
+        this.finishTask(task, this.queuedCancelled(task, task.cancel.code, task.cancel.reason));
         continue;
       }
-      this.clearQueued(task);
-      const key = keyFor(task.plan);
+      this.clearQueueTimer(task);
+      const key = keyFor(task.request);
       this.starting.set(key, task);
       const run = this.runTask(task);
       task.starting = run;
       this.settling.add(run);
       void run.finally(() => {
         this.settling.delete(run);
-        if (this.starting.delete(key)) this.drain();
+        this.starting.delete(key);
+        this.drain();
       });
     }
   }
 
-  private cancelStarting(
-    task: PendingTask,
-    code: CancellationCode,
-    reason: string,
-  ): Promise<void> {
-    task.cancelled ??= this.queuedCancelled(task, code, reason);
+  private cancelTask(task: PendingTask, intent: CancelIntent): void {
+    if (task.resolved || task.cancel) return;
+    task.cancel = intent;
+    if (this.queue.includes(task)) {
+      this.cancelQueued(task, intent.code, intent.reason);
+      return;
+    }
+    const active = this.active.get(keyFor(task.request));
+    if (active) this.beginCancel(active, intent.code, intent.reason);
+    else task.signal.abort(intent.code);
+  }
+
+  private cancelStarting(task: PendingTask, code: CancellationCode, reason: string): Promise<void> {
+    task.cancel ??= { code, reason };
+    task.signal.abort(task.cancel.code);
     return task.starting ?? Promise.resolve();
   }
 
   private removeQueued(task: PendingTask): void {
     const index = this.queue.indexOf(task);
     if (index >= 0) this.queue.splice(index, 1);
-    this.clearQueued(task);
+    this.clearQueueTimer(task);
   }
 
-  private clearQueued(task: PendingTask): void {
+  private clearQueueTimer(task: PendingTask): void {
     if (task.timer) {
       clearTimeout(task.timer);
       task.timer = undefined;
     }
-    if (task.signal && task.abortHandler) {
-      task.signal.removeEventListener("abort", task.abortHandler);
-      task.abortHandler = undefined;
+  }
+
+  private detachExternalAbort(task: PendingTask): void {
+    if (task.externalSignal && task.externalAbortHandler) {
+      task.externalSignal.removeEventListener("abort", task.externalAbortHandler);
+      task.externalAbortHandler = undefined;
     }
+  }
+
+  private finishTask(task: PendingTask, outcome: ExecutionOutcome): void {
+    this.clearQueueTimer(task);
+    this.detachExternalAbort(task);
+    task.resolve(outcome);
   }
 
   private invalidateQueued(
@@ -910,678 +592,246 @@ export class ExecutionController {
     }
   }
 
-  private cancelQueued(
-    task: PendingTask,
-    code: CancellationCode,
-    reason: string,
-  ): void {
+  private cancelQueued(task: PendingTask, code: CancellationCode, reason: string): void {
     this.removeQueued(task);
-    task.resolve(this.queuedCancelled(task, code, reason));
+    task.cancel ??= { code, reason };
+    task.signal.abort(task.cancel.code);
+    this.finishTask(task, this.queuedCancelled(task, task.cancel.code, task.cancel.reason));
   }
 
-  private queuedCancelled(
-    task: PendingTask,
-    code: CancellationCode,
-    reason: string,
-  ): ExecutionOutcome {
-    return this.failureOutcome(
-      task.plan,
-      task.generation,
-      "cancelled",
-      false,
-      "none",
-      { code, reason },
-    );
+  private queuedCancelled(task: PendingTask, code: CancellationCode, reason: string): ExecutionOutcome {
+    return this.failureOutcome(task.request, task.generation, "cancelled", false, "none", { code, reason });
   }
 
-  private queuedFailure(
-    task: PendingTask,
-    code: ExecutionFailureCode,
-    reason: string,
-  ): ExecutionOutcome {
-    return this.failureOutcome(
-      task.plan,
-      task.generation,
-      "failed",
-      false,
-      "none",
-      { code, reason },
-    );
+  private queuedFailure(task: PendingTask, code: ExecutionFailureCode, reason: string): ExecutionOutcome {
+    return this.failureOutcome(task.request, task.generation, "failed", false, "none", { code, reason });
   }
 
-  private immediateFailure(
-    plan: ExecutionPlan,
-    code: ExecutionFailureCode,
-    reason: string,
-  ): ExecutionOutcome {
-    return this.failureOutcome(
-      plan,
-      this.generation,
-      "failed",
-      false,
-      "none",
-      { code, reason },
-    );
+  private immediateFailure(request: ExecutionRequest, code: ExecutionFailureCode, reason: string): ExecutionOutcome {
+    return this.failureOutcome(request, this.generation, "failed", false, "none", { code, reason });
   }
 
-  private invalidPlanOutcome(
-    reason: string,
-    plan: ExecutionPlan | undefined,
-    code: ExecutionFailureCode,
-  ): ExecutionOutcome {
-    return this.failureOutcome(
-      plan,
-      this.generation,
-      "failed",
-      false,
-      "none",
-      { code, reason },
-    );
+  private invalidPlanOutcome(reason: string, request: ExecutionRequest | undefined, code: ExecutionFailureCode): ExecutionOutcome {
+    return this.failureOutcome(request, this.generation, "failed", false, "none", { code, reason });
   }
 
   private failureOutcome(
-    plan: ExecutionPlan | undefined,
+    request: ExecutionRequest | undefined,
     generation: number,
     state: "failed" | "cancelled",
     started: ExecutionStarted,
     impact: ImpactState,
-    detail:
-      | { readonly code: ExecutionFailureCode; readonly reason: string }
-      | { readonly code: CancellationCode; readonly reason: string },
+    detail: { readonly code: ExecutionFailureCode | CancellationCode; readonly reason: string },
   ): ExecutionOutcome {
-    const outcome = this.buildFailure(
-      plan,
-      generation,
-      state,
-      started,
-      impact,
-      detail,
-    );
+    const record = makeRecord(request, generation, state, started, impact, { code: detail.code });
+    const outcome: ExecutionOutcome = state === "failed"
+      ? { state: "failed", started, code: detail.code as ExecutionFailureCode, reason: detail.reason, impact, stdout: "", stderr: "", truncated: false, record }
+      : { state: "cancelled", started, code: detail.code as CancellationCode, reason: detail.reason, impact, stdout: "", stderr: "", truncated: false, record };
     this.record(outcome);
     return outcome;
   }
 
-  /**
-   * Builds an outcome without publishing an execution record. A host lease
-   * refusal belongs to the approval domain: the plan was never executed and
-   * never became an execution result, so the caller is told and no execution
-   * record is written. Failures caused by this layer keep recording.
-   */
-  private buildFailure(
-    plan: ExecutionPlan | undefined,
-    generation: number,
-    state: "failed" | "cancelled",
-    started: ExecutionStarted,
-    impact: ImpactState,
-    detail:
-      | { readonly code: ExecutionFailureCode; readonly reason: string }
-      | { readonly code: CancellationCode; readonly reason: string },
-  ): ExecutionOutcome {
-    const record = makeRecord(plan, generation, state, started, impact, {
-      code: detail.code,
-    });
-    return state === "failed"
-      ? {
-          state: "failed",
-          started,
-          code: detail.code as ExecutionFailureCode,
-          reason: detail.reason,
-          impact,
-          stdout: "",
-          stderr: "",
-          truncated: false,
-          record,
-        }
-      : {
-          state: "cancelled",
-          started,
-          code: detail.code as CancellationCode,
-          reason: detail.reason,
-          impact,
-          stdout: "",
-          stderr: "",
-          truncated: false,
-          record,
-        };
-  }
-
-  private async handshake(
-    transport: HelperTransport,
-    requestId: string,
-    generation: number,
-  ): Promise<HelperProbeResult> {
-    const hello = encodeHostMessage(helloMessage(requestId, generation));
-    if (!hello.ok) {
-      return { status: "protocol-error", reason: hello.reason };
-    }
-    const ready = await new Promise<
-      | { readonly ok: true; readonly message: ReadyMessage }
-      | { readonly ok: false; readonly reason: string; readonly kind: "exit" | "protocol" | "timeout" | "unavailable" }
-    >((resolve) => {
-      let settled = false;
-      const finish = (
-        value:
-          | { readonly ok: true; readonly message: ReadyMessage }
-          | { readonly ok: false; readonly reason: string; readonly kind: "exit" | "protocol" | "timeout" | "unavailable" },
-      ) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        unsubscribeLine();
-        unsubscribeError();
-        resolve(value);
-      };
-      const timer = setTimeout(() => {
-        finish({ ok: false, reason: "helper ready timed out", kind: "timeout" });
-      }, this.probeTimeoutMs);
-      timer.unref?.();
-      const unsubscribeLine = transport.onLine((line) => {
-        const decoded = decodeHelperMessage(line);
-        if (!decoded.ok) {
-          finish({ ok: false, reason: decoded.reason, kind: "protocol" });
-          return;
-        }
-        if (decoded.message.type === "error" && decoded.message.code === "unavailable" &&
-          decoded.message.requestId === requestId && decoded.message.generation === generation) {
-          finish({ ok: false, reason: decoded.message.message, kind: "unavailable" });
-          return;
-        }
-        if (decoded.message.type !== "ready") {
-          finish({
-            ok: false,
-            reason: `expected ready, received ${decoded.message.type}`,
-            kind: "protocol",
-          });
-          return;
-        }
-        finish({ ok: true, message: decoded.message });
-      });
-      const unsubscribeError = transport.onError((error) => {
-        finish({ ok: false, reason: error.message, kind: "exit" });
-      });
-      void transport.waitForExit().then((info) => {
-        finish({
-          ok: false,
-          reason: `helper exited before ready (code=${String(info.code)})`,
-          kind: "exit",
-        });
-      });
-      const sent = transport.send(hello.line);
-      if (!sent.ok) {
-        finish({ ok: false, reason: sent.reason ?? "send failed", kind: "exit" });
-      }
-    });
-    if (!ready.ok) {
-      return {
-        status: ready.kind === "protocol" ? "protocol-error" : ready.kind === "unavailable" ? "missing" : "start-failed",
-        reason: ready.reason,
-      };
-    }
-    const message = ready.message;
-    if (message.requestId !== requestId || message.generation !== generation) {
-      return {
-        status: "protocol-error",
-        reason: "ready message correlation does not match",
-      };
-    }
-    if (!versionMatches(this.installation, message.protocolVersion, message.backend.version, message.backend.id)) {
-      return {
-        status: "version-mismatch",
-        reason: `helper protocol ${message.protocolVersion} (backend ${message.backend.version}) does not match the host requirement`,
-      };
-    }
-    return {
-      status: "available",
-      backend: message.backend,
-      capabilities: message.capabilities,
-      protocolVersion: HELPER_PROTOCOL_VERSION,
-    };
-  }
-
   private async runTask(task: PendingTask): Promise<void> {
-    const plan = task.plan;
+    const request = task.request;
     const generation = task.generation;
-    if (task.cancelled) {
-      task.resolve(task.cancelled);
+    if (task.cancel) {
+      this.finishTask(task, this.queuedCancelled(task, task.cancel.code, task.cancel.reason));
       return;
     }
     if (generation !== this.generation || this.disposed) {
-      task.resolve(
-        this.queuedCancelled(task, "plan-invalidated", "configuration changed"),
-      );
+      this.finishTask(task, this.queuedCancelled(task, "plan-invalidated", "configuration changed"));
       return;
     }
-    if (task.signal?.aborted) {
-      task.resolve(
-        this.queuedCancelled(task, "execution-cancelled", "request was aborted"),
-      );
+    if (request.start.deadlineAt <= this.now()) {
+      this.finishTask(task, this.queuedFailure(task, "sandbox-deadline-exceeded", "plan deadline expired while queued"));
       return;
     }
-
-    if (
-      this.installation.expectedBackendId !== undefined &&
-      plan.backend.id !== this.installation.expectedBackendId
-    ) {
-      task.resolve(
-        this.failureOutcome(
-          plan,
-          generation,
-          "failed",
-          false,
-          "none",
-          {
-            code: "binding-mismatch",
-            reason: `plan backend ${plan.backend.id} does not match the installed backend`,
-          },
-        ),
-      );
+    if (this.directBackend === undefined || this.unavailableReason !== undefined) {
+      this.finishTask(task, this.queuedFailure(task, "sandbox-unavailable", this.unavailableReason ?? "native sandbox backend is unavailable"));
+      return;
+    }
+    if (request.backendId !== this.directBackend.id) {
+      this.finishTask(task, this.queuedFailure(task, "binding-mismatch", `request backend ${request.backendId} does not match the active native backend`));
       return;
     }
 
-    // The lease was checked when the caller queued this task. Time in the
-    // queue is unbounded from the host's point of view, so the facts behind
-    // the approval are re-read before any process exists.
-    const queuedRefusal = validityRefusal(task.validity);
-    if (queuedRefusal) {
-      task.resolve(
-        this.buildFailure(
-          task.plan,
-          task.generation,
-          "cancelled",
-          false,
-          "none",
-          queuedRefusal,
-        ),
-      );
-      return;
-    }
-
-    let releaseRuntimeUse: (() => void) | undefined;
-    try {
-      releaseRuntimeUse = await this.runtimeUseLease?.();
-    } catch (error) {
-      if (task.cancelled) {
-        task.resolve(task.cancelled);
-        return;
-      }
-      task.resolve(this.failureOutcome(
-        plan,
-        generation,
-        "failed",
-        false,
-        "none",
-        {
-          code: "sandbox-unavailable",
-          reason: error instanceof Error ? error.message : String(error),
-        },
-      ));
-      return;
-    }
-    if (task.cancelled) {
-      try { releaseRuntimeUse?.(); } catch { /* Keep the cancellation outcome when lease cleanup fails. */ }
-      task.resolve(task.cancelled);
-      return;
-    }
-    if (generation !== this.generation || this.disposed) {
-      try { releaseRuntimeUse?.(); } catch { /* Keep the cancellation outcome when lease cleanup fails. */ }
-      task.resolve(
-        this.queuedCancelled(task, "plan-invalidated", "configuration changed"),
-      );
-      return;
-    }
-    const releaseUse = () => {
-      try { releaseRuntimeUse?.(); } catch { /* Keep the execution outcome when lease cleanup fails. */ }
-    };
-
-    const spawned = this.resolveAndSpawn(plan);
-    if (!spawned.ok) {
-      releaseUse();
-      const outcome = this.failureOutcome(
-        plan,
-        generation,
-        "failed",
-        false,
-        "none",
-        { code: spawned.code, reason: spawned.reason },
-      );
-      task.resolve(outcome);
-      return;
-    }
-    const transport = spawned.transport;
-
-    let resolveDone!: () => void;
-    const done = new Promise<void>((resolve) => {
-      resolveDone = resolve;
-    });
+    const key = keyFor(request);
     const active: ActiveExecution = {
       task,
       generation,
-      transport,
-      done,
-      signalDone: () => {
-        if (!active.finished) {
-          active.finished = true;
-          resolveDone();
-        }
-      },
-      finished: false,
-      phase: "handshake",
-      startedAck: false,
-      startSent: false,
+      timers: new Set(),
+      started: false,
+      startAttempted: false,
       startTimedOut: false,
       outputLimit: false,
-      nextSequence: 0,
       stdout: "",
       stderr: "",
       stdoutBytes: 0,
       stderrBytes: 0,
-      messageCount: 0,
-      cancelSent: false,
-      timers: new Set(),
+      diagnostics: "",
       egressSettled: false,
     };
-    this.active.set(keyFor(plan), active);
-    this.starting.delete(keyFor(plan));
-
+    this.starting.delete(key);
+    this.active.set(key, active);
     const addTimer = (timer: NodeJS.Timeout): void => {
       timer.unref?.();
       active.timers.add(timer);
     };
     const startTimer = setTimeout(() => {
-      if (active.startedAck || active.finished) return;
+      if (active.started === true || task.resolved) return;
       active.startTimedOut = true;
       this.beginCancel(active, "execution-timeout", "start timed out");
     }, this.startTimeoutMs);
     active.startTimer = startTimer;
     addTimer(startTimer);
-    const deadlineTimer = setTimeout(() => {
-      if (active.finished) return;
+    addTimer(setTimeout(() => {
+      if (task.resolved) return;
       this.beginCancel(active, "execution-timeout", "execution deadline expired");
-    }, Math.max(0, plan.deadlineAt - this.now()));
-    addTimer(deadlineTimer);
+    }, Math.max(0, request.start.deadlineAt - this.now())));
 
-    const onAbort = () => {
-      const intent = abortIntent(task.signal as AbortSignal);
-      this.beginCancel(active, intent.code, intent.reason);
-    };
-    task.signal?.addEventListener("abort", onAbort, { once: true });
-
-    const unsubscribeLine = transport.onLine((line) => {
-      this.handleLine(active, line);
-    });
-    const unsubscribeError = transport.onError((error) => {
-      if (active.finished) return;
-      active.protocolError = `helper transport error: ${error.message}`;
-      active.signalDone();
-    });
-    const unsubscribeExit = transport.onExit((info) => {
-      if (active.finished) return;
-      active.exitInfo = info;
-      active.signalDone();
-    });
-
-    const hello = encodeHostMessage(helloMessage(plan.requestId, generation));
-    const sentHello = hello.ok
-      ? transport.send(hello.line)
-      : { ok: false, reason: hello.reason };
-    if (!sentHello.ok) {
-      active.protocolError = sentHello.reason ?? "could not send hello";
-      active.signalDone();
-    }
-
-    await done;
-    if (active.egress) this.settleEgress(active, active.egress);
-    if (startTimer) clearTimeout(startTimer);
-    if (deadlineTimer) clearTimeout(deadlineTimer);
-    for (const timer of active.timers) clearTimeout(timer);
-    active.timers.clear();
-    task.signal?.removeEventListener("abort", onAbort);
-    unsubscribeLine();
-    unsubscribeError();
-    unsubscribeExit();
-
-    const outcome = outcomeFor(active);
+    let releaseRuntimeUse: (() => void) | undefined;
+    let outcome: ExecutionOutcome;
     try {
-      await transport.close(500);
-    } catch {
-      // The outcome already reflects any transport failure; cleanup continues.
+      const queuedRefusal = validityRefusal(task.validity);
+      if (queuedRefusal) {
+        active.validityRefusal = queuedRefusal;
+        outcome = outcomeFor(active);
+      } else {
+        releaseRuntimeUse = await this.runtimeUseLease?.();
+        if (task.cancel) {
+          active.cancel = task.cancel;
+        } else if (generation !== this.generation || this.disposed) {
+          active.cancel = { code: "plan-invalidated", reason: "configuration changed" };
+        }
+
+        if (!active.cancel) {
+          const probe = await this.directBackend.probe(task.signal.signal);
+          if (task.cancel) active.cancel = task.cancel;
+          let capabilities: BackendCapabilities | undefined;
+          if (!active.cancel && !probe.ok) {
+            active.failure = { code: probe.code, reason: probe.reason };
+          } else if (!active.cancel && probe.ok) {
+            capabilities = probe.capabilities;
+          }
+          if (!active.cancel && capabilities) {
+            const gaps = capabilityGap(capabilities, requiredCapabilities(request.plan, request.start));
+            if (gaps.length > 0) active.capabilityGap = gaps;
+          }
+        }
+
+        if (!active.cancel && !active.failure && !active.capabilityGap) {
+          const refusal = validityRefusal(task.validity);
+          if (refusal) active.validityRefusal = refusal;
+        }
+
+        if (!active.cancel && !active.failure && !active.capabilityGap && !active.validityRefusal && request.plan.network.kind === "destinations") {
+          let grant: EgressGrantRef | null = null;
+          try { grant = this.egress ? await this.egress.acquire(request) : null; }
+          catch { grant = null; }
+          if (task.cancel) {
+            if (grant) this.settleEgress(active, grant);
+            active.cancel = task.cancel;
+          } else if (!grant) {
+            active.failure = { code: "unsupported", reason: "host egress service is unavailable for this destination plan" };
+          } else {
+            active.egress = grant;
+          }
+        }
+
+        if (!active.cancel && !active.failure && !active.capabilityGap && !active.validityRefusal) {
+          const refusal = validityRefusal(task.validity);
+          if (refusal) active.validityRefusal = refusal;
+        }
+
+        if (!active.cancel && !active.failure && !active.capabilityGap && !active.validityRefusal) {
+          let prepared: NativeLaunchPlan | DirectBackendUnavailable;
+          try {
+            prepared = await this.directBackend.prepare(request, active.egress, task.signal.signal);
+          } catch (error) {
+            prepared = {
+              ok: false,
+              code: "setup",
+              reason: error instanceof Error ? error.message : String(error),
+            };
+          }
+          if (task.cancel) active.cancel = task.cancel;
+          if (!active.cancel && "ok" in prepared && !prepared.ok) {
+            active.failure = { code: prepared.code, reason: prepared.reason };
+          } else if (!active.cancel) {
+            const refusal = validityRefusal(task.validity);
+            if (refusal) active.validityRefusal = refusal;
+            else {
+              active.startAttempted = true;
+              const result = await runNativeProcess(prepared as NativeLaunchPlan, {
+                signal: task.signal.signal,
+                cancelGraceMs: this.cancelGraceMs,
+                onStarted: () => {
+                  active.started = true;
+                  this.clearStartTimer(active);
+                },
+                onOutput: (chunk) => this.handleOutput(active, chunk),
+              });
+              active.result = result;
+              active.started = result.started;
+              active.diagnostics = result.diagnostics;
+              if (active.cancel === undefined && task.cancel) active.cancel = task.cancel;
+            }
+          }
+        }
+        outcome = outcomeFor(active);
+      }
+    } catch (error) {
+      if (task.cancel) active.cancel = task.cancel;
+      else active.failure = { code: "setup", reason: error instanceof Error ? error.message : String(error) };
+      outcome = outcomeFor(active);
+    } finally {
+      if (active.egress) this.settleEgress(active, active.egress);
+      if (active.startTimer) clearTimeout(active.startTimer);
+      for (const timer of active.timers) clearTimeout(timer);
+      active.timers.clear();
+      try { releaseRuntimeUse?.(); } catch { /* Preserve the execution result while releasing the runtime lease. */ }
+      this.active.delete(key);
+      this.detachExternalAbort(task);
     }
-    releaseUse();
-    this.active.delete(keyFor(plan));
-    if (!active.validityRefusal) this.recordAsync(outcome);
-    task.resolve(outcome);
+
+    if (!active.validityRefusal) this.recordAsync(outcome!);
+    this.finishTask(task, outcome!);
     this.drain();
   }
 
-  /**
-   * Acquire the egress lease a `destinations` plan needs, then send the
-   * business start. The lease is taken before the sandboxed process exists,
-   * so a missing grant refuses the launch with nothing started.
-   */
-  private async acquireEgressAndSendStart(active: ActiveExecution): Promise<void> {
-    const plan = active.task.plan;
-    if (plan.network.kind === "destinations") {
-      let grant: EgressGrantRef | null = null;
-      try {
-        grant = this.egress ? await this.egress.acquire(plan) : null;
-      } catch {
-        grant = null;
-      }
-      if (active.finished) {
-        // Cancelled while the lease was being taken: drop it unused.
-        if (grant) this.settleEgress(active, grant);
+  private handleOutput(active: ActiveExecution, chunk: { readonly stream: "stdout" | "stderr"; readonly data: string }): void {
+    if (active.outputLimit || active.cancel) return;
+    const bytes = Buffer.byteLength(chunk.data, "utf8");
+    if (chunk.stream === "stdout") {
+      if (active.stdoutBytes + bytes > MAX_EXECUTION_STDOUT_BYTES) {
+        active.outputLimit = true;
+        this.stopForOutputLimit(active);
         return;
       }
-      if (!grant) {
-        active.rejected = {
-          type: "rejected",
-          requestId: plan.requestId,
-          generation: active.generation,
-          started: false,
-          code: "unsupported",
-          reason: "host egress service is unavailable for this destination plan",
-        };
-        active.signalDone();
+      active.stdoutBytes += bytes;
+      active.stdout += chunk.data;
+    } else {
+      if (active.stderrBytes + bytes > MAX_EXECUTION_STDERR_BYTES) {
+        active.outputLimit = true;
+        this.stopForOutputLimit(active);
         return;
       }
-      active.egress = grant;
+      active.stderrBytes += bytes;
+      active.stderr += chunk.data;
     }
-    const start = encodeHostMessage({
-      type: "start",
-      requestId: plan.requestId,
-      generation: active.generation,
-      plan,
-      ...(active.egress === undefined
-        ? {}
-        : {
-            egress: {
-              leaseId: active.egress.leaseId,
-              proxyHost: active.egress.proxyHost,
-              proxyPort: active.egress.proxyPort,
-              credential: active.egress.credential,
-            },
-          }),
-    });
-    if (!start.ok) {
-      active.protocolError = start.reason;
-      active.signalDone();
-      return;
-    }
-    active.startSent = true;
-    const sent = active.transport.send(start.line);
-    if (!sent.ok) {
-      active.protocolError = sent.reason ?? "could not send start";
-      active.signalDone();
-    }
+    try { active.task.onOutput?.(chunk); } catch { /* An observer cannot interrupt execution or cleanup. */ }
   }
 
-  /** Revoke one egress lease once; repeated calls are no-ops. */
+  private stopForOutputLimit(active: ActiveExecution): void {
+    if (active.egress) this.settleEgress(active, active.egress);
+    if (!active.task.signal.signal.aborted) active.task.signal.abort("output-limit");
+  }
+
   private settleEgress(active: ActiveExecution, grant: EgressGrantRef): void {
     if (active.egressSettled) return;
     active.egressSettled = true;
-    try {
-      this.egress?.revoke(grant.leaseId);
-    } catch {
-      // Revocation is best-effort at settle; the proxy also expires leases.
-    }
-  }
-
-  private handleLine(active: ActiveExecution, line: string): void {
-    if (active.finished) return;
-    if (active.messageCount >= MAX_HELPER_MESSAGES) {
-      active.protocolError = "helper exceeded the message limit";
-      active.signalDone();
-      return;
-    }
-    active.messageCount += 1;
-    const decoded: HelperDecodeResult = decodeHelperMessage(line);
-    if (!decoded.ok) {
-      active.protocolError = `invalid helper message: ${decoded.reason}`;
-      this.beginCancel(active, "execution-cancelled", "protocol error");
-      active.signalDone();
-      return;
-    }
-    const message = decoded.message;
-    if (message.type !== "error") {
-      if (message.generation !== active.generation) return; // late, old generation
-      if (message.requestId !== active.task.plan.requestId) {
-        active.protocolError = "helper message correlation does not match the plan";
-        active.signalDone();
-        return;
-      }
-    } else if (
-      message.generation !== undefined &&
-      message.generation !== active.generation
-    ) {
-      return;
-    }
-
-    switch (message.type) {
-      case "ready": {
-        if (active.phase !== "handshake") {
-          active.protocolError = "duplicate ready message";
-          active.signalDone();
-          return;
-        }
-        active.ready = message;
-        if (
-          !versionMatches(
-            this.installation,
-            message.protocolVersion,
-            message.backend.version,
-            message.backend.id,
-          )
-        ) {
-          active.versionMismatch = `helper protocol ${message.protocolVersion} (backend ${message.backend.version}) does not match`;
-          active.signalDone();
-          return;
-        }
-        const gaps = capabilityGap(
-          message.capabilities,
-          requiredCapabilities(active.task.plan),
-        );
-        if (gaps.length > 0) {
-          active.capabilityGap = gaps;
-          active.signalDone();
-          return;
-        }
-        // Handshake is a wait too. Re-reading the lease here is the last point
-        // at which no business effect has happened; after the start is sent
-        // the real state is at best unknown and can never be reported as
-        // "never executed".
-        const preStartRefusal = validityRefusal(active.task.validity);
-        if (preStartRefusal) {
-          active.validityRefusal = preStartRefusal;
-          active.signalDone();
-          return;
-        }
-        active.phase = "starting";
-        void this.acquireEgressAndSendStart(active);
-        return;
-      }
-      case "started": {
-        if (active.phase !== "starting" || active.startedAck) {
-          active.protocolError = "unexpected started message";
-          active.signalDone();
-          return;
-        }
-        active.phase = "running";
-        active.startedAck = true;
-        active.helperStarted = true;
-        this.clearStartTimer(active);
-        return;
-      }
-      case "output": {
-        if (active.phase !== "running") {
-          active.protocolError = "output before started";
-          active.signalDone();
-          return;
-        }
-        if (message.sequence !== active.nextSequence) {
-          active.protocolError = `output sequence ${message.sequence} is out of order`;
-          active.signalDone();
-          return;
-        }
-        active.nextSequence += 1;
-        const bytes = Buffer.byteLength(message.data, "utf8");
-        if (message.stream === "stdout") {
-          active.stdoutBytes += bytes;
-          if (active.stdoutBytes > MAX_EXECUTION_STDOUT_BYTES) {
-            active.outputLimit = true;
-            this.beginCancel(active, "execution-cancelled", "stdout limit");
-            return;
-          }
-          active.stdout += message.data;
-        } else {
-          active.stderrBytes += bytes;
-          if (active.stderrBytes > MAX_EXECUTION_STDERR_BYTES) {
-            active.outputLimit = true;
-            this.beginCancel(active, "execution-cancelled", "stderr limit");
-            return;
-          }
-          active.stderr += message.data;
-        }
-        try {
-          active.task.onOutput?.({ stream: message.stream, data: message.data });
-        } catch {
-          // An observer must not break protocol processing or resource cleanup.
-        }
-        return;
-      }
-      case "result": {
-        if (active.phase !== "running") {
-          active.protocolError = "result before started";
-          active.signalDone();
-          return;
-        }
-        active.result = message;
-        active.signalDone();
-        return;
-      }
-      case "rejected": {
-        if (active.phase !== "starting") {
-          active.protocolError = "unexpected rejected message";
-          active.signalDone();
-          return;
-        }
-        active.rejected = message;
-        active.helperStarted = false;
-        active.signalDone();
-        return;
-      }
-      case "cancelled": {
-        active.cancelledByHelper = message;
-        active.helperStarted = message.started;
-        if (message.started === true) active.startedAck = true;
-        active.signalDone();
-        return;
-      }
-      case "error": {
-        active.helperError = message;
-        active.signalDone();
-        return;
-      }
-    }
+    try { this.egress?.revoke(grant.leaseId); }
+    catch { /* Revocation is best-effort at settle; the proxy also expires leases. */ }
   }
 
   private clearStartTimer(active: ActiveExecution): void {
@@ -1591,48 +841,17 @@ export class ExecutionController {
     active.startTimer = undefined;
   }
 
-  private beginCancel(
-    active: ActiveExecution,
-    code: CancellationCode,
-    reason: string,
-  ): void {
-    if (active.finished) return;
+  private beginCancel(active: ActiveExecution, code: CancellationCode, reason: string): void {
     if (active.cancel) return;
     active.cancel = { code, reason };
-    // Permission removal lands before the kill: the proxy refuses new
-    // connections and drops live ones while the process tree is ending.
+    active.task.cancel ??= active.cancel;
     if (active.egress) this.settleEgress(active, active.egress);
-    if (!active.startSent) {
-      active.signalDone();
-      return;
-    }
-    if (!active.cancelSent) {
-      const message = encodeHostMessage({
-        type: "cancel",
-        requestId: active.task.plan.requestId,
-        generation: active.generation,
-        reason: code,
-      });
-      if (message.ok) {
-        active.transport.send(message.line);
-        active.cancelSent = true;
-      }
-    }
-    const force = setTimeout(() => {
-      if (active.finished) return;
-      active.transport.kill(0);
-      active.signalDone();
-    }, this.cancelGraceMs);
-    force.unref?.();
-    active.timers.add(force);
+    if (!active.task.signal.signal.aborted) active.task.signal.abort(code);
   }
 
   private record(outcome: ExecutionOutcome): void {
-    try {
-      this.onRecord?.(outcome.record);
-    } catch {
-      // Observation is separate from the execution result and its cleanup.
-    }
+    try { this.onRecord?.(outcome.record); }
+    catch { /* Observation is separate from the execution result and its cleanup. */ }
   }
 
   private recordAsync(outcome: ExecutionOutcome): void {

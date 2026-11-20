@@ -2,11 +2,11 @@ import type {
   BoundAssessmentExecution,
   ShellSandboxCapability,
 } from "#approve-core/nodes/assessment/types";
-import { capabilityGap, type RequiredCapabilities } from "#sandbox/helper";
-import type { HelperProbeResult } from "#sandbox/lifecycle";
+import { capabilityGap, type RequiredCapabilities } from "#sandbox/backend/capabilities";
+import type { BackendProbeResult } from "#sandbox/lifecycle";
 
 export interface ShellCapabilityInput {
-  readonly probe: HelperProbeResult;
+  readonly probe: BackendProbeResult;
   /** Digest used by the assessment snapshot for this exact action. */
   readonly actionDigest: string;
   readonly executionBinding: BoundAssessmentExecution;
@@ -19,7 +19,7 @@ export interface ShellCapabilityInput {
 }
 
 /**
- * Map a real helper probe to the local-assessment capability contract. A
+ * Map a direct backend probe to the local-assessment capability contract. A
  * fixture backend can be reported, but only the host's `boundary` name is
  * recorded; this function never upgrades a probe into an OS-isolation claim.
  */

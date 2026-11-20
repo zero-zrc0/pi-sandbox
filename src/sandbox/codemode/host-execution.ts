@@ -15,6 +15,7 @@ import { renderToolSample, toCodemodeIdentifier } from "@earendil-works/pi-codem
 import { CODEMODE_RUNTIME_LIMITS } from "./limits";
 import { createCodemodeModelGlobals, type CodemodeModelCallOptions } from "./model-bridge";
 import { runWithApprovedCodemode } from "./approval-scope";
+import type { SensitivePath } from "../sensitive-paths";
 import {
   type CodemodeRuntimeRequest,
   type CodemodeRuntimeBackend,
@@ -40,6 +41,7 @@ export interface CodemodeHostToolExecutorOptions {
     execute(request: CodemodeRuntimeRequest): Promise<CodemodeResult>;
   };
   readonly resolveBackend: (context: ExtensionToolContext) => CodemodeRuntimeBackend;
+  readonly resolveSensitivePaths?: (context: ExtensionToolContext) => readonly SensitivePath[];
   readonly getToolNamespace?: (toolName: string) => ToolNamespace | undefined;
   readonly getToolGuidelines?: (toolName: string) => readonly string[];
   readonly appendEntry?: (customType: string, data: unknown) => void;
@@ -675,6 +677,8 @@ export function createCodemodeHostToolExecutor(
     try {
       const result = await options.supervisor.execute({
         backend,
+        ...(backend === "restricted" && options.resolveSensitivePaths !== undefined
+          ? { sensitivePaths: options.resolveSensitivePaths(context) } : {}),
         code: parsed.code,
         timeoutMs: parsed.options.timeoutMs,
         signal: executionController.signal,

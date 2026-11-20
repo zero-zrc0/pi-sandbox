@@ -7,7 +7,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 import {
   createAgentSession,
@@ -26,7 +26,7 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { PermissionScope } from "../../src/action";
-import type { TrustedHelperInstallation } from "#sandbox/helper";
+import type { DirectBackendDriver } from "#sandbox/backend/direct";
 import {
   createPiExecutionAdapter,
   type PiExecutionHostBinding,
@@ -40,12 +40,13 @@ import {
 } from "../../src/invocation";
 import {
   createTestLayout,
-  fixtureEnvironment,
   makeController,
   removeTestLayout,
   runtimeEnvironment,
+  testExecutionEnvironment,
   type TestLayout,
 } from "./fixtures/harness";
+import { createTestDirectBackend } from "./fixtures/direct-backend";
 
 const OWNER = "plan-11-pi-owner";
 const BINDING_ID = "plan-11-pi-binding";
@@ -64,8 +65,8 @@ interface HarnessOptions {
   readonly mode?: "default" | "full-access";
   /** Allow scopes to bind with the approval; defaults to a bash execute scope. */
   readonly scopes?: (facts: ToolCallFacts) => readonly PermissionScope[];
-  /** Override the resolved helper installation (for example to remove it). */
-  readonly installation?: (layout: TestLayout) => TrustedHelperInstallation;
+  /** Override the fake backend to exercise a failure mode. */
+  readonly directBackend?: DirectBackendDriver;
   /** The active tool names offered to the faux model. */
   readonly activeTools?: readonly string[];
   readonly readConfigRevision?: () => string;
@@ -83,7 +84,6 @@ type FauxProvider = ReturnType<typeof fauxProvider>;
 
 interface PiHostHarness {
   readonly layout: TestLayout;
-  readonly markerFile: string;
   readonly bindings: ToolInvocationBindingStore;
   readonly adapter: ReturnType<typeof createPiExecutionAdapter>;
   readonly session: AgentSession;
@@ -140,24 +140,17 @@ async function createPiHostHarness(
   activeLayouts.push(layout);
   const cwd = layout.workspace;
   const agentDir = layout.agent;
-  const markerFile = join(layout.root, "helper-marker.txt");
-  mkdirSync(dirname(markerFile), { recursive: true });
-
   const environment = runtimeEnvironment();
   const records: ExecutionRecord[] = [];
   const controller = makeController({
     layout,
     scenario: "ok",
-    helperEnvironment: fixtureEnvironment("ok", {
-      FIXTURE_MARKER_FILE: markerFile,
-    }),
+    environment: testExecutionEnvironment(),
     onRecord: (record) => {
       records.push(record);
       options.onRecord?.(record);
     },
-    ...(options.installation === undefined
-      ? {}
-      : { installation: options.installation(layout) }),
+    ...(options.directBackend === undefined ? {} : { directBackend: options.directBackend }),
   });
   activeControllers.push(controller);
 
@@ -194,7 +187,7 @@ async function createPiHostHarness(
         network: { kind: "none" },
       },
       configRevision: CONFIG_REVISION,
-      backendId: "fixture-helper",
+      backendId: "fixture-direct",
       ...(options.readConfigRevision === undefined
         ? {}
         : { readConfigRevision: options.readConfigRevision }),
@@ -292,7 +285,7 @@ async function createPiHostHarness(
   session = created.session;
   activeSessions.push(session);
 
-  return { layout, markerFile, bindings, adapter, session, faux, records };
+  return { layout, bindings, adapter, session, faux, records };
 }
 
 type ToolResultMessage = Extract<
@@ -321,9 +314,9 @@ function resultText(message: ToolResultMessage): string {
 }
 
 describe("public Pi controlled execution host", () => {
-  it("takes over the builtin bash definition and executes through the helper", async () => {
+  it("takes over the builtin bash definition and executes through the native backend", async () => {
     const harness = await createPiHostHarness({ authorize: true });
-    const { session, faux, layout, markerFile } = harness;
+    const { session, faux, layout } = harness;
 
     const bashInfo = session
       .getAllTools()
@@ -348,13 +341,12 @@ describe("public Pi controlled execution host", () => {
 
     const result = toolResultFor(session, "bash");
     expect(result.isError).not.toBe(true);
-    expect(existsSync(markerFile)).toBe(true);
     expect(
       readFileSync(join(layout.workspace, "host-executed.txt"), "utf8"),
     ).toBe("host");
   });
 
-  it("writes a file only through the negotiated helper", async () => {
+  it("writes a file only through the negotiated native backend", async () => {
     const harness = await createPiHostHarness({
       authorize: true,
       scopes: (facts) =>
@@ -364,14 +356,14 @@ describe("public Pi controlled execution host", () => {
           join(harness.layout.workspace, "controlled.txt"),
         ),
     });
-    const { session, faux, layout, markerFile } = harness;
+    const { session, faux, layout } = harness;
 
     faux.setResponses([
       fauxAssistantMessage(
         [
           fauxToolCall(
             "write",
-            { path: "controlled.txt", content: "from-helper" },
+            { path: "controlled.txt", content: "from-native" },
             { id: "plan11-pi-write-call" },
           ),
         ],
@@ -383,9 +375,8 @@ describe("public Pi controlled execution host", () => {
     await session.prompt("Write the controlled file.");
 
     expect(toolResultFor(session, "write").isError).not.toBe(true);
-    expect(existsSync(markerFile)).toBe(true);
     expect(readFileSync(join(layout.workspace, "controlled.txt"), "utf8")).toBe(
-      "from-helper",
+      "from-native",
     );
   });
 
@@ -399,7 +390,7 @@ describe("public Pi controlled execution host", () => {
           join(harness.layout.root, "external", "report.txt"),
         ),
     });
-    const { session, faux, layout, markerFile } = harness;
+    const { session, faux, layout } = harness;
     const external = join(layout.root, "external");
     mkdirSync(external, { recursive: true });
 
@@ -425,7 +416,6 @@ describe("public Pi controlled execution host", () => {
     const result = toolResultFor(session, "write");
     expect(resultText(result)).not.toContain("scope-expansion");
     expect(result.isError).not.toBe(true);
-    expect(existsSync(markerFile)).toBe(true);
     expect(readFileSync(join(external, "report.txt"), "utf8")).toBe(
       "into-existing-parent",
     );
@@ -441,7 +431,7 @@ describe("public Pi controlled execution host", () => {
           join(harness.layout.root, "external", "absent", "report.txt"),
         ),
     });
-    const { session, faux, layout, markerFile } = harness;
+    const { session, faux, layout } = harness;
     const external = join(layout.root, "external");
     const absent = join(external, "absent");
     mkdirSync(external, { recursive: true });
@@ -470,10 +460,9 @@ describe("public Pi controlled execution host", () => {
     expect(resultText(result)).toContain("scope-expansion");
     expect(existsSync(absent)).toBe(false);
     expect(existsSync(join(absent, "report.txt"))).toBe(false);
-    expect(existsSync(markerFile)).toBe(false);
   });
 
-  it("reads an existing file through the helper instead of the host filesystem", async () => {
+  it("reads an existing file through the native worker", async () => {
     const harness = await createPiHostHarness({
       authorize: true,
       scopes: (facts) =>
@@ -582,7 +571,7 @@ describe("public Pi controlled execution host", () => {
 
   it("preserves SDK shell truncation and output-file details", async () => {
     const harness = await createPiHostHarness({ authorize: true });
-    const { session, faux, markerFile } = harness;
+    const { session, faux } = harness;
     const before = new Set(
       readdirSync(tmpdir()).filter((name) => name.startsWith("pi-bash-")),
     );
@@ -603,7 +592,6 @@ describe("public Pi controlled execution host", () => {
     const result = toolResultFor(session, "bash");
     expect(result.isError).not.toBe(true);
     expect(resultText(result)).toContain("Full output:");
-    expect(existsSync(markerFile)).toBe(true);
     const created = readdirSync(tmpdir())
       .filter((name) => name.startsWith("pi-bash-") && !before.has(name))
       .sort();
@@ -654,12 +642,12 @@ describe("public Pi controlled execution host", () => {
     expect(harness.records[0]?.started).toBe(true);
   });
 
-  it("edits a file through the helper with the real Pi edit definition", async () => {
+  it("edits a file through the native worker with the real Pi edit definition", async () => {
     const harness = await createPiHostHarness({
       authorize: true,
       scopes: () => [],
     });
-    const { session, faux, layout, markerFile } = harness;
+    const { session, faux, layout } = harness;
     const target = join(layout.workspace, "editable.txt");
     writeFileSync(target, "alpha beta", "utf8");
 
@@ -683,7 +671,6 @@ describe("public Pi controlled execution host", () => {
     await session.prompt("Edit the controlled file.");
 
     expect(toolResultFor(session, "edit").isError).not.toBe(true);
-    expect(existsSync(markerFile)).toBe(true);
     expect(readFileSync(target, "utf8")).toBe("gamma beta");
   });
 
@@ -692,7 +679,7 @@ describe("public Pi controlled execution host", () => {
       authorize: false,
       activeTools: ["ls"],
     });
-    const { session, faux, markerFile } = harness;
+    const { session, faux } = harness;
 
     faux.setResponses([
       fauxAssistantMessage(
@@ -707,7 +694,6 @@ describe("public Pi controlled execution host", () => {
     const result = toolResultFor(session, "ls");
     expect(result.isError).toBe(true);
     expect(resultText(result)).toContain("approved-action-unavailable");
-    expect(existsSync(markerFile)).toBe(false);
   });
 
   it("does not execute an approval captured under an older configuration", async () => {
@@ -723,7 +709,7 @@ describe("public Pi controlled execution host", () => {
       readConfigRevision: () =>
         reads++ === 0 ? "plan11-config-r1" : "plan11-config-r2",
     });
-    const { session, faux, layout, markerFile } = harness;
+    const { session, faux, layout } = harness;
 
     faux.setResponses([
       fauxAssistantMessage(
@@ -744,7 +730,6 @@ describe("public Pi controlled execution host", () => {
     const result = toolResultFor(session, "write");
     expect(result.isError).toBe(true);
     expect(resultText(result)).toContain("plan-invalidated");
-    expect(existsSync(markerFile)).toBe(false);
     expect(existsSync(join(layout.workspace, "stale.txt"))).toBe(false);
   });
 
@@ -754,7 +739,7 @@ describe("public Pi controlled execution host", () => {
       activeTools: ["ls"],
       ownsAdditionalTool: name => name === "ls",
     });
-    const { session, faux, markerFile } = harness;
+    const { session, faux } = harness;
 
     faux.setResponses([
       fauxAssistantMessage(
@@ -767,12 +752,11 @@ describe("public Pi controlled execution host", () => {
     await session.prompt("List with a host-vouched tool.");
 
     expect(toolResultFor(session, "ls").isError).toBe(true);
-    expect(existsSync(markerFile)).toBe(false);
   });
 
-  it("fails closed when no approval was captured and never starts the helper", async () => {
+  it("fails closed when no approval was captured and never starts a native process", async () => {
     const harness = await createPiHostHarness({ authorize: false });
-    const { session, faux, layout, markerFile } = harness;
+    const { session, faux, layout } = harness;
 
     faux.setResponses([
       fauxAssistantMessage(
@@ -793,11 +777,10 @@ describe("public Pi controlled execution host", () => {
     const result = toolResultFor(session, "write");
     expect(result.isError).toBe(true);
     expect(resultText(result)).toContain("approved-action-unavailable");
-    expect(existsSync(markerFile)).toBe(false);
     expect(existsSync(join(layout.workspace, "blocked.txt"))).toBe(false);
   });
 
-  it("reports a missing helper without starting it", async () => {
+  it("reports an unavailable native backend without starting a process", async () => {
     const harness = await createPiHostHarness({
       authorize: true,
       scopes: (facts) =>
@@ -806,12 +789,9 @@ describe("public Pi controlled execution host", () => {
           "write",
           join(harness.layout.workspace, "never.txt"),
         ),
-      installation: (layout) => ({
-        installRoot: join(layout.root, "absent-helper"),
-        executable: process.execPath,
-      }),
+      directBackend: createTestDirectBackend({ scenario: "unavailable" }),
     });
-    const { session, faux, layout, markerFile } = harness;
+    const { session, faux, layout } = harness;
 
     faux.setResponses([
       fauxAssistantMessage(
@@ -827,12 +807,11 @@ describe("public Pi controlled execution host", () => {
       fauxAssistantMessage("finished"),
     ]);
 
-    await session.prompt("Attempt a write with a missing helper.");
+    await session.prompt("Attempt a write with an unavailable native backend.");
 
     const result = toolResultFor(session, "write");
     expect(result.isError).toBe(true);
     expect(resultText(result)).toContain("sandbox-unavailable");
-    expect(existsSync(markerFile)).toBe(false);
     expect(existsSync(join(layout.workspace, "never.txt"))).toBe(false);
   });
 

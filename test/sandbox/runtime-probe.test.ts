@@ -1,9 +1,8 @@
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { BackendCapabilities } from "#sandbox/types";
-import type { HelperProbeResult } from "#sandbox/lifecycle";
+import type { BackendProbeResult } from "#sandbox/lifecycle";
 import { probeSandboxRuntime } from "#sandbox/runtime-probe";
-import { prepareMacOSHelperProcess } from "#sandbox/backend/macos/index";
 
 const harness = vi.hoisted(() => ({
   options: undefined as unknown,
@@ -21,17 +20,7 @@ vi.mock("#sandbox/lifecycle", () => ({
 }));
 
 interface CapturedControllerOptions {
-  readonly installation: {
-    readonly installRoot: string;
-    readonly executable: string;
-    readonly args?: readonly string[];
-    readonly expectedProtocolVersion?: number;
-    readonly expectedBackendId?: string;
-  };
-  readonly helperCwd: string;
-  readonly workspace?: string;
-  readonly helperEnvironment: Readonly<Record<string, string>>;
-  readonly prepareHelperProcess?: unknown;
+  readonly directBackend?: { readonly id: string; readonly version: string };
   readonly probeTimeoutMs?: number;
 }
 
@@ -46,7 +35,7 @@ const darwinRuntime = {
     stable: true as const,
     platform: "darwin",
     arch: "arm64",
-    protocolVersion: 2,
+    protocolVersion: 3,
     minPluginVersion: "0.0.0",
     maxPluginVersionExclusive: "999999.999.999",
     backendId: "macos-seatbelt",
@@ -66,7 +55,7 @@ const linuxRuntime = {
 
 function capabilities(overrides: Partial<BackendCapabilities> = {}): BackendCapabilities {
   return {
-    filesystem: { read: true, write: true, granularity: "file", protectedPaths: true, environment: true },
+    filesystem: { read: true, write: true, granularity: "file", protectedPaths: true, environment: true, metadataRead: "all" },
     network: "none",
     cancel: true,
     streamOutput: true,
@@ -76,12 +65,11 @@ function capabilities(overrides: Partial<BackendCapabilities> = {}): BackendCapa
   };
 }
 
-function probeResult(overrides: Partial<BackendCapabilities> = {}, id = "macos-seatbelt"): HelperProbeResult {
+function probeResult(overrides: Partial<BackendCapabilities> = {}, id = "macos-seatbelt"): BackendProbeResult {
   return {
     status: "available",
     backend: { id, version: "1.0.0" },
     capabilities: capabilities(overrides),
-    protocolVersion: 2,
   };
 }
 
@@ -94,33 +82,21 @@ function probe(runtime: typeof darwinRuntime | typeof linuxRuntime, signal = new
 }
 
 describe("probeSandboxRuntime", () => {
-  it("probes the macOS helper through the Seatbelt wrapper without runtime directories", async () => {
+  it("probes the host-native macOS backend without runtime directories", async () => {
     harness.result = probeResult();
 
     expect(await probe(darwinRuntime)).toEqual({ available: true });
 
     const options = capture();
-    expect(options.installation.args?.[0]).toBe(
-      fileURLToPath(new URL("../../src/sandbox/backend/macos/helper.mjs", import.meta.url)),
-    );
-    expect(options.installation.expectedBackendId).toBe("macos-seatbelt");
-    expect(options.installation.expectedProtocolVersion).toBe(2);
-    expect(options.prepareHelperProcess).toBe(prepareMacOSHelperProcess);
-    expect(options.helperEnvironment).toMatchObject({
-      HOME: process.env.HOME,
-      PI_SANDBOX_WORKSPACE_ROOT: workspaceRoot,
-    });
-    expect(options.helperEnvironment).not.toHaveProperty("PI_SANDBOX_RUNTIME_DIR");
-    expect(options.helperEnvironment).not.toHaveProperty("PI_SANDBOX_RUNTIME_ROOT");
-    expect(options.workspace).toBe(workspaceRoot);
+    expect(options.directBackend).toMatchObject({ id: "macos-seatbelt", version: "1.0.0" });
   });
 
   it("reports an unusable macOS system runtime with the probe reason", async () => {
-    harness.result = { status: "missing", reason: "helper executable is missing: /usr/bin/sandbox-exec" };
+    harness.result = { status: "unavailable", reason: "sandbox-exec is unavailable" };
 
     expect(await probe(darwinRuntime)).toEqual({
       available: false,
-      reason: "helper executable is missing: /usr/bin/sandbox-exec",
+      reason: "sandbox-exec is unavailable",
     });
   });
 
@@ -133,22 +109,13 @@ describe("probeSandboxRuntime", () => {
     });
   });
 
-  it("keeps the linux capability gate and runtime environment unchanged", async () => {
+  it("probes the host-native Linux backend with the runtime environment", async () => {
     harness.result = probeResult({ network: "domains", streamOutput: false }, "linux-bwrap-landlock-seccomp");
 
     expect(await probe(linuxRuntime)).toEqual({ available: true });
 
     const options = capture();
-    expect(options.installation.args?.[0]).toBe(
-      fileURLToPath(new URL("../../src/sandbox/backend/linux/helper.mjs", import.meta.url)),
-    );
-    expect(options.installation.expectedBackendId).toBe("linux-bwrap-landlock-seccomp");
-    expect(options.prepareHelperProcess).toBeUndefined();
-    expect(options.helperEnvironment).toMatchObject({
-      PI_SANDBOX_RUNTIME_DIR: linuxRuntime.directory,
-      PI_SANDBOX_RUNTIME_ROOT: linuxRuntime.storageRoot,
-      PI_SANDBOX_WORKSPACE_ROOT: workspaceRoot,
-    });
+    expect(options.directBackend).toMatchObject({ id: "linux-bwrap-landlock-seccomp", version: "1.1.0" });
   });
 
   it("still requires controlled network egress on linux", async () => {

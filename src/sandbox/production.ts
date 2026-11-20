@@ -6,6 +6,7 @@ import {
   type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
 import { join, resolve } from "node:path";
+import { existsSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { fileURLToPath } from "node:url";
 import type { ApprovalChainConfigSnapshot } from "../config/owner";
@@ -20,7 +21,9 @@ import { EgressService } from "./egress/index";
 import { createPiExecutionAdapter, type AnyToolDefinition, type PiExecutionAdapter } from "./pi";
 import { selectExecutionEnvironment } from "./plan";
 import { findSystemBubblewrap } from "./backend/linux/bwrap-selection.mjs";
-import { prepareMacOSHelperProcess } from "./backend/macos/index";
+import { createLinuxDirectBackend } from "./backend/linux/direct";
+import { createMacOSDirectBackend } from "./backend/macos/direct";
+import { createWindowsDirectBackend } from "./backend/windows/direct";
 import { toRuntimeNetworkScope } from "./network-scope";
 import { BUILTIN_TOOL_NAMES, type ExecutionRecord, type FilesystemGrantInput } from "./types";
 import { EXECUTION_INSTALL_ROOT } from "./platform";
@@ -31,6 +34,9 @@ import { ManagedMcpTransports } from "./mcp";
 import { resolveHostPathIdentity, findProtectedControlRoot, isPathWithin } from "./path";
 import { ensureSessionWorkspace } from "./session-workspace";
 import { builtinToolPath, resolveTemporaryToolPath } from "./builtin-path";
+import { collectSensitivePaths } from "./sensitive-paths";
+import { linuxRuntimeFilesystem, macOSRuntimeFilesystem, windowsRuntimeFilesystem } from "./runtime-filesystem";
+import { captureRuntimeIdentity } from "./runtime-identity";
 import type { ToolElevation } from "../elevation";
 import type { SandboxBypassReviewInput } from "../approve-core/host";
 import { hasApprovedCodemodeScope } from "./codemode/approval-scope";
@@ -127,7 +133,12 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       ...(readOnly ? [] : [{ path: workspace, access: "write" as const, granularity: "directory" as const }]),
       ...(readOnly ? [] : [{ path: ctx.cwd, access: "write" as const, granularity: "directory" as const }])];
   };
-  const environment = () => selectExecutionEnvironment(process.env as Record<string, string>);
+  const environment = () => {
+    const selected = selectExecutionEnvironment(process.env as Record<string, string>);
+    if (process.platform === "win32") return { ...selected, PI_CODING_AGENT_DIR: resolve(getAgentDir()) };
+    const { PI_CODING_AGENT_DIR: _agentDir, LOCALAPPDATA: _localAppData, ...other } = selected;
+    return other;
+  };
   const executionEnvironment = (ctx: ExtensionContext) => {
     const config = options.snapshot(ctx).config;
     if (config.mode === "full-access" || !config.experimental.sandboxEnabled) return environment();
@@ -232,18 +243,45 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     const macOSSystemRuntime = runtime?.manifest.platform === "darwin";
     const backendId = runtime?.manifest.backendId ?? "unsupported-platform";
     const currentEnvironment = environment();
+    const hostCwd = resolve(process.env.TEMP ?? process.env.TMPDIR ?? "/tmp");
     const systemBubblewrapPath = process.platform === "linux" && runtime !== undefined
       ? findSystemBubblewrap(currentEnvironment.PATH, ctx.cwd)
       : undefined;
-    const controller = options.controller?.(ctx, record) ?? new ExecutionController({
-      ...(!runtime ? { unavailableReason: current.config.experimental.sandboxEnabled
-        ? unavailableReason() : "the Sandbox total switch is off" } : {}),
-      installation: {
+    const hostEnvironment = {
+      ...currentEnvironment,
+      PI_MXC_AGENT_DIR: agentDirectory,
+      PI_SANDBOX_WORKSPACE_ROOT: resolve(ctx.cwd),
+      ...(process.env.LOCALAPPDATA ? { LOCALAPPDATA: process.env.LOCALAPPDATA } : {}),
+      ...(runtime === undefined || macOSSystemRuntime ? {} : {
+        PI_SANDBOX_RUNTIME_DIR: runtime.directory,
+        PI_SANDBOX_RUNTIME_ROOT: runtimeStorageRoot!,
+      }),
+      ...(systemBubblewrapPath === undefined ? {} : { PI_SANDBOX_SYSTEM_BWRAP_PATH: systemBubblewrapPath }),
+    };
+    const directBackend = runtime === undefined ? undefined
+      : process.platform === "win32" ? createWindowsDirectBackend({
+        runtime,
         installRoot: EXECUTION_INSTALL_ROOT,
-        executable: process.execPath,
-        args: [fileURLToPath(new URL(`./backend/${process.platform === "linux" ? "linux" : process.platform === "darwin" ? "macos" : "windows"}/helper.mjs`, import.meta.url))],
-        expectedBackendId: backendId,
-      },
+        hostCwd,
+        hostEnvironment,
+      })
+        : process.platform === "linux" ? createLinuxDirectBackend({
+          runtime,
+          installRoot: EXECUTION_INSTALL_ROOT,
+          hostCwd,
+          hostEnvironment,
+          ...(systemBubblewrapPath === undefined ? {} : { systemBubblewrapPath }),
+        })
+          : process.platform === "darwin" ? createMacOSDirectBackend({
+            installRoot: EXECUTION_INSTALL_ROOT,
+            hostEnvironment,
+          })
+            : undefined;
+    const controller = options.controller?.(ctx, record) ?? new ExecutionController({
+      ...(!runtime || directBackend === undefined ? { unavailableReason: current.config.experimental.sandboxEnabled
+        ? runtime === undefined ? unavailableReason() : `native sandbox backend is unavailable on ${process.platform}`
+        : "the Sandbox total switch is off" } : {}),
+      ...(directBackend === undefined ? {} : { directBackend }),
       ...(runtime === undefined || macOSSystemRuntime ? {} : {
         runtimeUseLease: () => acquireRuntimeUseLease({
           storageRoot: runtime.storageRoot,
@@ -251,21 +289,10 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
           arch: runtime.manifest.arch,
         }),
       }),
-      ...(process.platform === "darwin" ? { prepareHelperProcess: prepareMacOSHelperProcess } : {}),
-      helperCwd: resolve(process.env.TEMP ?? process.env.TMPDIR ?? "/tmp"),
-      workspace: ctx.cwd, helperEnvironment: {
-        ...currentEnvironment, PI_MXC_AGENT_DIR: agentDirectory,
-        PI_SANDBOX_WORKSPACE_ROOT: resolve(ctx.cwd),
-        ...(process.env.LOCALAPPDATA ? { LOCALAPPDATA: process.env.LOCALAPPDATA } : {}),
-        ...(runtime === undefined || macOSSystemRuntime ? {} : {
-          PI_SANDBOX_RUNTIME_DIR: runtime.directory,
-          PI_SANDBOX_RUNTIME_ROOT: runtimeStorageRoot!,
-        }),
-        ...(systemBubblewrapPath === undefined ? {} : { PI_SANDBOX_SYSTEM_BWRAP_PATH: systemBubblewrapPath }),
-      }, onRecord: record,
+      onRecord: record,
       egress: {
-        acquire: async plan => {
-          const acquired = await egress.acquireForPlan(plan);
+        acquire: async request => {
+          const acquired = await egress.acquireForPlan(request);
           if (!acquired) return null;
           if (process.platform !== "win32") return acquired.grant;
           try {
@@ -286,9 +313,22 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       plan: {
         mode: current.config.mode, configRevision: key,
         backendId,
+        metadataRead: process.platform === "darwin" ? "all" : "none",
         protectedPaths: [EXECUTION_INSTALL_ROOT,
           ...(runtime === undefined || macOSSystemRuntime ? [] : [runtimeStorageRoot!, runtime.directory]),
           ...(systemBubblewrapPath === undefined ? [] : [systemBubblewrapPath])],
+        protectedFilePaths: [process.execPath,
+          ...(existsSync(current.paths.globalConfigFile) ? [current.paths.globalConfigFile] : []),
+          ...(current.projectConfig === undefined ? [] : [current.paths.projectConfigFile])],
+        readSensitivePaths: () => collectSensitivePaths({ agentDirectory, cwd: ctx.cwd,
+          denyPaths: current.config.execution.denyPaths }),
+        ...(runtime === undefined || options.controller !== undefined ? {} : { validateRuntime: captureRuntimeIdentity(runtime) }),
+        ...(process.platform === "win32" ? { runtimeFilesystem: (operation: import("./types").ExecutionOperation) =>
+          windowsRuntimeFilesystem({ cwd: ctx.cwd, installRoot: EXECUTION_INSTALL_ROOT,
+            operation, environment: executionEnvironment(ctx), agentDirectory: resolve(getAgentDir()) }) } : process.platform === "linux" ? {
+          runtimeFilesystem: (operation: import("./types").ExecutionOperation) =>
+            linuxRuntimeFilesystem({ installRoot: EXECUTION_INSTALL_ROOT, operation }),
+        } : process.platform === "darwin" ? { runtimeFilesystem: () => macOSRuntimeFilesystem(EXECUTION_INSTALL_ROOT) } : {}),
         ...(current.config.execution.shell === undefined ? {} : {
           shellBaseline: {
             filesystem: [

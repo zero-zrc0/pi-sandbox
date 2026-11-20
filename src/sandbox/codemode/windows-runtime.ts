@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   mkdtempSync,
@@ -23,6 +23,10 @@ import { CODEMODE_RUNTIME_LIMITS } from "./limits";
 import { isPathWithin } from "../path";
 import { EXECUTION_INSTALL_ROOT } from "../platform";
 import { acquireRuntimeUseLease } from "../runtime-installation";
+import { sensitivePathIdentityMatches, type SensitivePath } from "../sensitive-paths";
+import { windowsRuntimeFilesystem } from "../runtime-filesystem";
+import { compilePermissionPlan } from "../plan";
+import { EXECUTION_PLAN_VERSION, type FilesystemGrantInput } from "../types";
 
 type VmLauncher = ConstructorParameters<typeof CodemodeSandboxBase>[1];
 type VmEvents = Parameters<VmLauncher>[1];
@@ -57,6 +61,14 @@ function resolveRuntimeFiles(runtime: ResolvedRuntimeFiles) {
     throw new Error("sandbox-unavailable: Windows Codemode runtime files are incomplete");
   }
   const mxc = runtimeFile(runtime.files.windowsExecutable, executableEntry.sha256);
+  const probe = spawnSync(mxc, ["probe"], { encoding: "utf8", timeout: 6_000, windowsHide: true });
+  let capabilities: unknown;
+  try { capabilities = JSON.parse(probe.stdout); } catch { throw new Error("sandbox-unavailable: Windows runtime probe failed"); }
+  if (probe.status !== 0 || typeof capabilities !== "object" || capabilities === null ||
+      (capabilities as { available?: unknown }).available !== true ||
+      (capabilities as { planVersion?: unknown }).planVersion !== EXECUTION_PLAN_VERSION) {
+    throw new Error("sandbox-unavailable: Windows runtime does not support this execution plan version");
+  }
   const mxcManifest = runtimeFile(runtime.files.mxcManifest, manifestEntry.sha256);
   if (!isPathWithin(runtime.directory, mxc) || !isPathWithin(runtime.directory, mxcManifest)) {
     throw new Error("sandbox-unavailable: Windows Codemode runtime path is outside its fixed directory");
@@ -87,25 +99,40 @@ function requestFor(input: {
   readonly cwd: string;
   readonly executable: string;
   readonly bootstrapSource: string;
+  readonly sensitivePaths: readonly SensitivePath[];
 }): string {
-  const filesystem = [
-    { path: input.executable, access: "read", granularity: "file" },
+  const environment = { SystemRoot: process.env.SystemRoot ?? "", SystemDrive: process.env.SystemDrive ?? "",
+    LOCALAPPDATA: process.env.LOCALAPPDATA ?? "" };
+  const runtime = windowsRuntimeFilesystem({ cwd: input.cwd, installRoot: EXECUTION_INSTALL_ROOT,
+    agentDirectory: process.env.PI_CODING_AGENT_DIR ?? input.cwd, environment,
+    includeWorkingDirectoryVolumeRoot: false,
+    operation: { kind: "builtin-tool", name: "read", arguments: {} } });
+  const runtimeFilesystem: FilesystemGrantInput[] = [
+    ...runtime.grants,
+    { path: input.runtimeStorageRoot, access: "read", granularity: "directory" },
+    { path: input.runtimeDirectory, access: "read", granularity: "directory" },
     { path: input.mxc, access: "read", granularity: "file" },
     { path: input.mxcManifest, access: "read", granularity: "file" },
-    { path: input.runtimeDirectory, access: "read", granularity: "directory" },
-    { path: input.cwd, access: "read", granularity: "directory" },
-    { path: input.cwd, access: "write", granularity: "directory" },
   ];
+  const compiled = compilePermissionPlan({
+    baseline: { filesystem: [
+      { path: input.cwd, access: "read", granularity: "directory" },
+      { path: input.cwd, access: "write", granularity: "directory" },
+    ], network: { kind: "none" } },
+    runtimeFilesystem,
+    approved: { filesystem: [] },
+    network: { kind: "none" },
+    metadataRead: "none",
+    sensitivePaths: input.sensitivePaths,
+  });
+  if (!compiled.ok) throw new Error(`sandbox-setup-failed: ${compiled.reason}`);
   return JSON.stringify({
     runtimeProfile: "codemode",
-    plan: {
-      backend: { id: "windows-mxc" },
-      cwd: input.cwd,
-      filesystem,
-      protectedPaths: [EXECUTION_INSTALL_ROOT, input.runtimeStorageRoot, input.runtimeDirectory],
-      network: { kind: "none" },
-      environment: {},
-    },
+    plan: compiled.plan,
+    operation: { kind: "codemode" },
+    cwd: input.cwd,
+    environment,
+    deadlineAt: Date.now() + READY_TIMEOUT_MS,
     argv: [input.executable, "-e", input.bootstrapSource],
   });
 }
@@ -115,6 +142,7 @@ async function launchWindowsRuntime(
   events: VmEvents,
   lifecycle?: WindowsCodemodeRuntimeLifecycle,
   runtime?: ResolvedRuntimeFiles,
+  sensitivePaths: readonly SensitivePath[] = [],
 ): Promise<VmChannel> {
   if (process.platform !== "win32") return Promise.reject(new Error("Codemode restricted Runtime is unavailable on this platform"));
   if (!runtime) return Promise.reject(new Error("sandbox-unavailable: Windows runtime is not ready"));
@@ -132,6 +160,7 @@ async function launchWindowsRuntime(
   let cwd: string;
   try {
     files = resolveRuntimeFiles(runtime);
+    if (!sensitivePaths.every(sensitivePathIdentityMatches)) throw new Error("sensitive path changed before Codemode Runtime startup");
     cwd = realpathSync.native(mkdtempSync(join(tmpdir(), "pi-codemode-runtime-")));
   } catch (error) {
     releaseRuntimeUse();
@@ -146,6 +175,7 @@ async function launchWindowsRuntime(
       runtimeStorageRoot: runtime.storageRoot,
       mxcManifest: runtime.files.mxcManifest!,
       cwd,
+      sensitivePaths,
     });
   } catch (error) {
     releaseRuntimeUse();
@@ -188,6 +218,9 @@ async function launchWindowsRuntime(
   }
   let child: ChildProcessWithoutNullStreams;
   try {
+    runtimeFile(files.mxc, runtime.manifest.files.find(file => file.role === "windowsExecutable")?.sha256);
+    runtimeFile(runtime.files.mxcManifest!, runtime.manifest.files.find(file => file.role === "mxcManifest")?.sha256);
+    if (!sensitivePaths.every(sensitivePathIdentityMatches)) throw new Error("sensitive path changed before Codemode Runtime startup");
     child = spawn(files.mxc, ["stdio"], {
       cwd,
       env: {
@@ -351,9 +384,33 @@ export function createWindowsCodemodeSandbox(
   options: CodemodeSandboxBaseOptions = {},
   lifecycle?: WindowsCodemodeRuntimeLifecycle,
   runtime?: ResolvedRuntimeFiles,
+  sensitivePaths: readonly SensitivePath[] = [],
 ): CodemodeSandboxBase {
   if (process.platform !== "win32") throw new Error("Codemode restricted Runtime is unavailable on this platform");
-  return new CodemodeSandboxBase(options, (data, events) => launchWindowsRuntime(data, events, lifecycle, runtime));
+  let closing = false;
+  const launches = new Set<Promise<VmChannel>>();
+  const exits = new Set<Promise<void>>();
+  const sandbox = new CodemodeSandboxBase(options, (data, events) => {
+    const launch = launchWindowsRuntime(data, events, {
+      transferRuntime(exited) {
+        if (closing || lifecycle?.transferRuntime(exited) === false) return false;
+        exits.add(exited);
+        void exited.then(() => exits.delete(exited));
+        return true;
+      },
+    }, runtime, sensitivePaths);
+    launches.add(launch);
+    void launch.then(() => launches.delete(launch), () => launches.delete(launch));
+    return launch;
+  });
+  const close = sandbox.close.bind(sandbox);
+  sandbox.close = async () => {
+    closing = true;
+    await close();
+    await Promise.allSettled([...launches]);
+    await Promise.all([...exits]);
+  };
+  return sandbox;
 }
 
 export const windowsCodemodeRuntimeLimits = CODEMODE_RUNTIME_LIMITS;

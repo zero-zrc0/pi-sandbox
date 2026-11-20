@@ -1,48 +1,49 @@
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
 import { ExecutionController } from "./lifecycle";
 import { EXECUTION_INSTALL_ROOT } from "./platform";
 import { selectExecutionEnvironment } from "./plan";
-import { HELPER_PROTOCOL_VERSION } from "./types";
-import { prepareMacOSHelperProcess } from "./backend/macos/index";
+import { findSystemBubblewrap } from "./backend/linux/bwrap-selection.mjs";
+import { createLinuxDirectBackend } from "./backend/linux/direct";
+import { createMacOSDirectBackend } from "./backend/macos/direct";
+import { createWindowsDirectBackend } from "./backend/windows/direct";
 import type { ResolvedRuntimeFiles } from "./runtime-store";
 import type { RuntimeProbeResult } from "./runtime-manager";
-
-function backendDirectory(runtime: ResolvedRuntimeFiles): "macos" | "linux" | "windows" {
-  if (runtime.manifest.platform === "darwin") return "macos";
-  return runtime.manifest.platform === "linux" ? "linux" : "windows";
-}
 
 export async function probeSandboxRuntime(input: {
   readonly runtime: ResolvedRuntimeFiles;
   readonly workspaceRoot: string;
   readonly signal: AbortSignal;
 }): Promise<RuntimeProbeResult> {
-  const macOS = input.runtime.manifest.platform === "darwin";
-  const helper = fileURLToPath(new URL(`./backend/${backendDirectory(input.runtime)}/helper.mjs`, import.meta.url));
+  const platform = input.runtime.manifest.platform;
+  const macOS = platform === "darwin";
+  const hostCwd = resolve(tmpdir());
+  const environment = selectExecutionEnvironment(process.env as Record<string, string>);
+  const systemBubblewrapPath = platform === "linux"
+    ? findSystemBubblewrap(environment.PATH, input.workspaceRoot)
+    : undefined;
+  const hostEnvironment = {
+    ...environment,
+    ...(macOS ? {} : {
+      PI_SANDBOX_RUNTIME_DIR: input.runtime.directory,
+      PI_SANDBOX_RUNTIME_ROOT: input.runtime.storageRoot,
+    }),
+    PI_SANDBOX_WORKSPACE_ROOT: resolve(input.workspaceRoot),
+    ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
+    ...(process.env.LOCALAPPDATA ? { LOCALAPPDATA: process.env.LOCALAPPDATA } : {}),
+    ...(systemBubblewrapPath === undefined ? {} : { PI_SANDBOX_SYSTEM_BWRAP_PATH: systemBubblewrapPath }),
+  };
+  const directBackend = platform === "win32"
+    ? createWindowsDirectBackend({ runtime: input.runtime, installRoot: EXECUTION_INSTALL_ROOT, hostCwd, hostEnvironment })
+    : platform === "linux"
+      ? createLinuxDirectBackend({ runtime: input.runtime, installRoot: EXECUTION_INSTALL_ROOT, hostCwd, hostEnvironment,
+        ...(systemBubblewrapPath === undefined ? {} : { systemBubblewrapPath }) })
+      : platform === "darwin"
+        ? createMacOSDirectBackend({ installRoot: EXECUTION_INSTALL_ROOT, hostEnvironment })
+        : undefined;
+  if (!directBackend) return { available: false, reason: `runtime platform is unsupported: ${platform}` };
   const controller = new ExecutionController({
-    installation: {
-      installRoot: EXECUTION_INSTALL_ROOT,
-      executable: process.execPath,
-      args: [helper],
-      expectedProtocolVersion: HELPER_PROTOCOL_VERSION,
-      expectedBackendId: input.runtime.manifest.backendId,
-    },
-    helperCwd: resolve(tmpdir()),
-    workspace: input.workspaceRoot,
-    helperEnvironment: {
-      ...selectExecutionEnvironment(process.env as Record<string, string>),
-      // The system macOS runtime has no runtime directory to expose.
-      ...(macOS ? {} : {
-        PI_SANDBOX_RUNTIME_DIR: input.runtime.directory,
-        PI_SANDBOX_RUNTIME_ROOT: input.runtime.storageRoot,
-      }),
-      PI_SANDBOX_WORKSPACE_ROOT: resolve(input.workspaceRoot),
-      ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
-      ...(process.env.LOCALAPPDATA ? { LOCALAPPDATA: process.env.LOCALAPPDATA } : {}),
-    },
-    ...(macOS ? { prepareHelperProcess: prepareMacOSHelperProcess } : {}),
+    directBackend,
     probeTimeoutMs: 15_000,
   });
   const stop = () => { void controller.dispose(); };

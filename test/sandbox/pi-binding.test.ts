@@ -1,14 +1,19 @@
 import { dirname, join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_CONTROLLED_TOOLS,
   effectiveBaselineForOperation,
   operationMatchesApprovedAction,
+  prepareExecutionOperation,
   UNCONTROLLED_BUILTIN_TOOLS,
+  validateOperationPermissions,
 } from "#sandbox/pi";
 import type { ExecutionOperation } from "#sandbox/types";
 import { makeInvocation } from "./fixtures/harness";
+import { resolveHostPathIdentity } from "#sandbox/path";
 
 const CWD = process.platform === "win32" ? "C:\\work\\project" : "/work/project";
 
@@ -27,6 +32,63 @@ describe("Pi SDK 1.0.0 tool inventory", () => {
 });
 
 describe("operation binding to the approved action", () => {
+  it("binds relative builtin paths to the resolved approved file, including read fallbacks", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-bound-target-"));
+    const storedName = join(cwd, "cafe\u0301.txt");
+    writeFileSync(storedName, "contents");
+    try {
+      const facts = makeInvocation({ cwd, toolName: "read", args: { path: "@café.txt" } });
+      const operation: ExecutionOperation = { kind: "builtin-tool", name: "read", arguments: { path: "@café.txt" } };
+      expect(operationMatchesApprovedAction(facts, operation)).toBeNull();
+      const prepared = prepareExecutionOperation(operation, facts, resolveHostPathIdentity);
+      expect(prepared.ok).toBe(true);
+      if (!prepared.ok || prepared.operation.kind !== "builtin-tool") return;
+      expect(prepared.operation.arguments.path).toBe(resolveHostPathIdentity(storedName));
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("checks target grants and explicit control-file access in the host", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-sandbox-target-scope-"));
+    const controlFile = join(root, ".git", "config");
+    mkdirSync(dirname(controlFile), { recursive: true });
+    writeFileSync(controlFile, "fixture");
+    try {
+      const operation: ExecutionOperation = { kind: "read-file", path: controlFile };
+      const baseline = { filesystem: [{ path: root, access: "read" as const, granularity: "directory" as const }], network: { kind: "none" as const } };
+      const denied = validateOperationPermissions({ operation, baseline, approved: { filesystem: [] }, runtime: [], resolvePath: resolveHostPathIdentity });
+      expect(denied).toMatchObject({ ok: false, code: "protected-path" });
+      const approved = validateOperationPermissions({ operation, baseline,
+        approved: { filesystem: [{ path: controlFile, access: "read", granularity: "file" }] }, runtime: [],
+        resolvePath: resolveHostPathIdentity });
+      expect(approved).toEqual({ ok: true, additionalProtectedPaths: [] });
+      const outside = validateOperationPermissions({ operation: { kind: "read-file", path: join(root, "..", "outside.txt") },
+        baseline, approved: { filesystem: [] }, runtime: [], resolvePath: resolveHostPathIdentity });
+      expect(outside).toMatchObject({ ok: false, code: "scope-expansion" });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("limits a parent-directory check to its exact writable file", () => {
+    const parent = process.platform === "win32" ? "D:\\data" : "/data";
+    const file = join(parent, "report.txt");
+    const operation: ExecutionOperation = { kind: "access-dir", path: parent, forFile: file };
+    const result = validateOperationPermissions({ operation,
+      baseline: { filesystem: [], network: { kind: "none" } },
+      approved: { filesystem: [{ path: file, access: "write", granularity: "file" }] },
+      runtime: [], resolvePath: path => path,
+    });
+    expect(result).toMatchObject({ ok: true });
+    const denied = validateOperationPermissions({ operation,
+      baseline: { filesystem: [], network: { kind: "none" } },
+      approved: { filesystem: [{ path: file, access: "read", granularity: "file" }] },
+      runtime: [], resolvePath: path => path,
+    });
+    expect(denied).toMatchObject({ ok: false, code: "scope-expansion" });
+  });
+
   it("accepts only the approved shell command", () => {
     const facts = invocation("bash", { command: "echo ok" });
     expect(

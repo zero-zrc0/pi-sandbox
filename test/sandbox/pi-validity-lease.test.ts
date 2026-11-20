@@ -10,9 +10,8 @@ import {
   useInvalidationCleanup,
 } from "./fixtures/invalidation-harness";
 import {
-  compileTestPlan,
+  compileTestRequest,
   createTestLayout,
-  fixtureEnvironment,
   makeController,
   makeInvocation,
   removeTestLayout,
@@ -28,7 +27,7 @@ import {
 useInvalidationCleanup();
 
 function planFor(workspace: string, requestId: string) {
-  return compileTestPlan({
+  return compileTestRequest({
     invocation: makeInvocation({ cwd: workspace, requestId, toolCallId: requestId }),
     operation: { kind: "shell", command: "ignored" },
     workspace,
@@ -40,22 +39,19 @@ interface Rig {
   readonly layout: TestLayout;
   readonly controller: ExecutionController;
   readonly records: { toolCallId: string; started: unknown; state: string }[];
-  readonly marker: string;
 }
 
 function controllerRig(scenario: string, maxConcurrent = 1): Rig {
   const layout = createTestLayout("plan11-validity-rig");
-  const marker = join(layout.root, "business-marker.txt");
   const records: Rig["records"] = [];
   const controller = makeController({
     layout,
     scenario,
     maxConcurrent,
     startTimeoutMs: 20_000,
-    helperEnvironment: fixtureEnvironment(scenario, { FIXTURE_MARKER_FILE: marker }),
     onRecord: (record) => records.push(record),
   });
-  return { layout, controller, records, marker };
+  return { layout, controller, records };
 }
 
 async function teardown(rig: Rig): Promise<void> {
@@ -64,12 +60,12 @@ async function teardown(rig: Rig): Promise<void> {
 }
 
 describe("the validity lease reaches every wait the controller owns", () => {
-  it("refuses a queued call before its helper exists, and records nothing", async () => {
+  it("refuses a queued call before a native process exists, and records nothing", async () => {
     const rig = controllerRig("slow");
     try {
-      const holder = rig.controller.execute({ plan: planFor(rig.layout.workspace, "holder") });
+      const holder = rig.controller.execute({ request: planFor(rig.layout.workspace, "holder") });
       const refused = rig.controller.execute({
-        plan: planFor(rig.layout.workspace, "queued-refused"),
+        request: planFor(rig.layout.workspace, "queued-refused"),
         validity: createExecutionValidityGuard(() => ({
           code: "plan-invalidated",
           reason: "the policy revision changed while queued",
@@ -87,7 +83,7 @@ describe("the validity lease reaches every wait the controller owns", () => {
         expect(outcome.code).toBe("plan-invalidated");
         expect(outcome.started).toBe(false);
       }
-      // A helper that ever ran publishes exactly one record, so the absence of
+      // An operation that reached execution publishes exactly one record, so the absence of
       // a record for this plan is the evidence that no process was created.
       expect(rig.records.filter((r) => r.toolCallId === "queued-refused")).toHaveLength(0);
       expect(rig.controller.activeCount).toBe(0);
@@ -97,13 +93,13 @@ describe("the validity lease reaches every wait the controller owns", () => {
     }
   }, 20_000);
 
-  it("refuses during the handshake when the lease expires after the dequeue check", async () => {
+  it("refuses after backend probing when the lease expires after the dequeue check", async () => {
     const rig = controllerRig("ok");
     try {
       let calls = 0;
       const outcome = await rig.controller.execute({
-        plan: planFor(rig.layout.workspace, "handshake-refused"),
-        // Valid when the task is dequeued, expired by the time ready arrives.
+        request: planFor(rig.layout.workspace, "handshake-refused"),
+        // Valid when the task is dequeued, expired by the time the backend probe completes.
         validity: createExecutionValidityGuard(() => {
           calls += 1;
           return calls >= 2
@@ -118,8 +114,6 @@ describe("the validity lease reaches every wait the controller owns", () => {
         expect(outcome.code).toBe("plan-invalidated");
         expect(outcome.started).toBe(false);
       }
-      // The marker is written only after the helper acknowledges a start.
-      expect(existsSync(rig.marker)).toBe(false);
       expect(rig.records.filter((r) => r.toolCallId === "handshake-refused")).toHaveLength(0);
     } finally {
       await teardown(rig);
@@ -130,14 +124,13 @@ describe("the validity lease reaches every wait the controller owns", () => {
     const rig = controllerRig("ok");
     try {
       const outcome = await rig.controller.execute({
-        plan: planFor(rig.layout.workspace, "always-valid"),
+        request: planFor(rig.layout.workspace, "always-valid"),
         validity: createExecutionValidityGuard(() => null),
       });
 
-      // This is the control for the test above: the same rig does reach the
-      // business start when nothing expired.
+      // This is the control for the test above: the same rig reaches native start when nothing expired.
       expect(outcome.state).not.toBe("cancelled");
-      expect(existsSync(rig.marker)).toBe(true);
+      expect(outcome.started).toBe(true);
       expect(rig.records.filter((r) => r.toolCallId === "always-valid")).toHaveLength(1);
     } finally {
       await teardown(rig);
@@ -149,13 +142,12 @@ describe("the validity lease reaches every wait the controller owns", () => {
     try {
       const forged = { check: () => null } as unknown as ExecutionValidityGuard;
       const outcome = await rig.controller.execute({
-        plan: planFor(rig.layout.workspace, "forged"),
+        request: planFor(rig.layout.workspace, "forged"),
         validity: forged,
       });
 
       expect(outcome.state).toBe("failed");
       if (outcome.state === "failed") expect(outcome.code).toBe("invalid-plan");
-      expect(existsSync(rig.marker)).toBe(false);
     } finally {
       await teardown(rig);
     }
@@ -173,7 +165,7 @@ describe("the validity lease reaches every wait the controller owns", () => {
 
       for (const [name, validity] of [["throwing", throwing], ["junk", junk]] as const) {
         const outcome = await rig.controller.execute({
-          plan: planFor(rig.layout.workspace, `broken-${name}`),
+          request: planFor(rig.layout.workspace, `broken-${name}`),
           validity,
         });
         expect(outcome.state, name).toBe("cancelled");
@@ -182,7 +174,6 @@ describe("the validity lease reaches every wait the controller owns", () => {
           expect(outcome.started, name).toBe(false);
         }
       }
-      expect(existsSync(rig.marker)).toBe(false);
     } finally {
       await teardown(rig);
     }
@@ -262,7 +253,7 @@ describe("the validity lease reaches every wait the controller owns", () => {
     writeFileSync(target, "stale-read-value");
 
     const holder = harness.controller.execute({
-      plan: planFor(harness.layout.workspace, "queue-holder"),
+      request: planFor(harness.layout.workspace, "queue-holder"),
     });
     await waitFor(() => harness.controller.activeCount === 1);
     const pending = harness.runCall("read", "queued-policy", { path: target });
@@ -292,7 +283,7 @@ describe("the validity lease reaches every wait the controller owns", () => {
     writeFileSync(target, "budget-value");
 
     const holder = harness.controller.execute({
-      plan: planFor(harness.layout.workspace, "budget-holder"),
+      request: planFor(harness.layout.workspace, "budget-holder"),
     });
     await waitFor(() => harness.controller.activeCount === 1);
     const pending = harness.runCall("read", "budget-expired", { path: target });
@@ -329,11 +320,11 @@ describe("the validity lease reaches every wait the controller owns", () => {
     const invalidations: Promise<void>[] = [];
 
     const holder = harness.controller.execute({
-      plan: planFor(harness.layout.workspace, "reentry-holder"),
+      request: planFor(harness.layout.workspace, "reentry-holder"),
     });
     await waitFor(() => harness.controller.activeCount === 1);
     const pending = harness.controller.execute({
-      plan: planFor(harness.layout.workspace, "reentry-guard"),
+      request: planFor(harness.layout.workspace, "reentry-guard"),
       validity: createExecutionValidityGuard(() => {
         // The check runs inside the controller, so a host can invalidate from
         // within it. The task must still settle exactly once.

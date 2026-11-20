@@ -1,10 +1,13 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { MAX_OUTPUT_CHARS, MAX_OUTPUT_ITEMS, MAX_STORE_TOTAL_CHARS, MAX_STORE_VALUE_CHARS } from "@earendil-works/pi-codemode/portable";
 import { describe, expect, it } from "vitest";
 import { createWindowsCodemodeSandbox as createWindowsRuntimeSandbox } from "#sandbox/codemode/windows-runtime";
 import { windowsRuntimeFiles } from "../fixtures/runtime";
+import { collectSensitivePaths } from "#sandbox/sensitive-paths";
 
 const executable = fileURLToPath(new URL("../../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url));
 const createWindowsCodemodeSandbox = (options: Parameters<typeof createWindowsRuntimeSandbox>[0] = {}) =>
@@ -53,6 +56,25 @@ function nearLimitPngBase64(): string {
 }
 
 describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Windows Codemode process Runtime", () => {
+  it("carries sensitive path restrictions and rejects an identity changed before another launch", async () => {
+    const root = mkdtempSync(join(tmpdir(), "codemode-sensitive-"));
+    const secret = join(root, "secret.txt");
+    writeFileSync(secret, "fixture");
+    const paths = collectSensitivePaths({ cwd: root, agentDirectory: join(root, "agent"), home: join(root, "home"),
+      environment: {}, denyPaths: [secret] });
+    const sandbox = createWindowsRuntimeSandbox({}, undefined, windowsRuntimeFiles(), paths);
+    try {
+      expect(await sandbox.execute("return 7;")).toMatchObject({ ok: true, value: 7 });
+      renameSync(secret, join(root, "old-secret.txt"));
+      writeFileSync(secret, "replacement");
+      expect(await sandbox.execute("return 8;")).toMatchObject({ ok: false,
+        error: { kind: "sandbox", message: expect.stringContaining("sensitive path changed") } });
+    } finally {
+      await sandbox.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("runs the public Pi Codemode worker and returns host calls and script errors", async () => {
     const sandbox = createWindowsCodemodeSandbox({
       timeoutMs: 15_000,

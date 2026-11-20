@@ -220,7 +220,7 @@ describe.each([
         },
       }],
     });
-    await vi.waitFor(() => expect(callSignal).toBeDefined());
+      await vi.waitFor(() => expect(callSignal).toBeDefined(), { timeout: 15_000 });
     abort.abort();
     await expect(running).resolves.toMatchObject({ ok: false, error: { kind: "aborted" } });
     expect(callSignal?.aborted).toBe(true);

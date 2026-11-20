@@ -12,14 +12,13 @@ import { createApprovalChainConfigOwner } from "#config/owner";
 import { createControlledExecution } from "#sandbox/production";
 import { probeSandboxRuntime } from "#sandbox/runtime-probe";
 import { SandboxRuntimeManager } from "#sandbox/runtime-manager";
-import { HELPER_PROTOCOL_VERSION } from "#sandbox/types";
 import { probeMacOSSeatbelt } from "#sandbox/backend/macos/index";
 import type { AnyToolDefinition } from "#sandbox/pi";
 
-const helperPath = fileURLToPath(new URL("../../../../src/sandbox/backend/macos/helper.mjs", import.meta.url));
+const operationWorkerPath = fileURLToPath(new URL("../../../../src/sandbox/backend/macos/operation-worker.mjs", import.meta.url));
 const extensionSource = fileURLToPath(new URL("../../../../src/index.ts", import.meta.url));
 const seatbelt = process.platform === "darwin" ? probeMacOSSeatbelt() : undefined;
-const nativeReady = process.platform === "darwin" && existsSync(helperPath) && seatbelt?.status === "candidate-present";
+const nativeReady = process.platform === "darwin" && existsSync(operationWorkerPath) && seatbelt?.status === "candidate-present";
 
 /**
  * End-to-end macOS route: the real runtime manager prepares the system
@@ -55,7 +54,7 @@ describe.skipIf(!nativeReady)("native macOS runtime end to end", () => {
       platform: "darwin",
       arch: process.arch === "arm64" ? "arm64" : "x64",
       pluginVersion: packageVersion,
-      protocolVersion: HELPER_PROTOCOL_VERSION,
+      protocolVersion: 3,
       probe: (runtime, input) => probeSandboxRuntime({ runtime, ...input }),
     });
     const state = await manager.prepare({ workspaceRoot: workspace });

@@ -34,10 +34,11 @@ import type {
 import type { PermissionScope } from "../action";
 import { compileExecutionPlan, filterExecutionEnvironment, selectExecutionEnvironment } from "#sandbox/plan";
 import {
-  DEFAULT_HELPER_ENVIRONMENT_ALLOWLIST,
+  DEFAULT_EXECUTION_ENVIRONMENT_ALLOWLIST,
   BUILTIN_TOOL_NAMES,
   type BuiltinToolName,
   DEFAULT_EXECUTION_DEADLINE_MS,
+  MAX_FILE_CONTENT_BYTES,
   MCP_EXECUTION_COVERAGE,
   type CancellationCode,
   type ExecutionCoverage,
@@ -61,9 +62,10 @@ import {
   type OperationOutputChunk,
   type OperationRunOptions,
 } from "#sandbox/operations";
-import { isPathWithin, isSamePath, normalizeHostPath } from "#sandbox/path";
+import { findProtectedControlRoot, isPathWithin, isSamePath, normalizeHostPath, PROTECTED_CONTROL_DIRECTORY_NAMES } from "#sandbox/path";
 import type { PlanApprovedScope, PlanBaselineScope } from "#sandbox/plan";
 import { intersectNetworkScopes } from "#sandbox/network-scope";
+import { sensitivePathIdentityMatches, type SensitivePath } from "#sandbox/sensitive-paths";
 import {
   sandboxToolDefinitionFields,
   SANDBOX_TOOL_TIMEOUT_MS,
@@ -101,15 +103,23 @@ export interface PiExecutionPlanOptions {
   /** Trusted shell grants added only to Bash and PowerShell operations. */
   readonly shellBaseline?: PlanBaselineScope;
   readonly networkCeiling?: NetworkScope;
+  readonly metadataRead?: "none" | "all";
   /** Host-approved extension. Defaults to the action's matching allow scopes. */
   readonly approvedScope?: (invocation: ToolInvocationFacts) => PlanApprovedScope;
   readonly configRevision: string;
   readonly backendId: string;
   readonly deadlineMs?: number;
-  /** Explicit helper environment. Defaults to the allowlisted action environment. */
+  /** Explicit execution environment. Defaults to the allowlisted action environment. */
   readonly environment?: Readonly<Record<string, string>>;
   readonly environmentAllowlist?: readonly string[];
   readonly protectedPaths?: readonly string[];
+  readonly protectedFilePaths?: readonly string[];
+  readonly readSensitivePaths?: () => readonly SensitivePath[];
+  readonly validateRuntime?: () => string | undefined;
+  readonly runtimeFilesystem?: (operation: ExecutionOperation) => {
+    readonly grants: readonly FilesystemGrantInput[];
+    readonly protectedPaths: readonly string[];
+  };
   readonly protectedControlNames?: readonly string[];
   /** Host-approved shell interpreter recorded in shell plans. */
   readonly shell?: string;
@@ -268,7 +278,7 @@ interface ActiveCall extends CapturedExecution {
 }
 
 /**
- * One in-flight tool call, cancellable while no helper is running.
+ * One in-flight tool call, cancellable while no native process is running.
  * The entry keeps the session claim so the call stays an outstanding,
  * capacity-consuming owner until its own `finally` releases it.
  */
@@ -374,7 +384,11 @@ export function operationMatchesApprovedAction(
   const toolName = invocation.action.tool.name;
   const expectedPath = (value: unknown): string | null => {
     if (typeof value !== "string" || !value.trim()) return null;
-    return normalizeHostPath(resolve(cwd, value));
+    try {
+      return normalizeHostPath(builtinToolPath(toolName as BuiltinToolName, value, cwd));
+    } catch {
+      return null;
+    }
   };
   switch (toolName) {
     case "bash": {
@@ -441,6 +455,173 @@ export function operationMatchesApprovedAction(
   }
 }
 
+function resolveExecutionPath(
+  path: string,
+  cwd: string,
+  resolver: (path: string) => string | null,
+): string | null {
+  if (typeof path !== "string" || !path || path.includes("\0")) return null;
+  const absolute = normalizeHostPath(resolve(cwd, path));
+  if (!absolute) return null;
+  try {
+    return normalizeHostPath(resolver(absolute));
+  } catch {
+    return null;
+  }
+}
+
+function nonempty(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+export function prepareExecutionOperation(
+  operation: ExecutionOperation,
+  invocation: ToolInvocationFacts,
+  resolver: (path: string) => string | null,
+  approvedShell?: string,
+): { readonly ok: true; readonly operation: ExecutionOperation } | { readonly ok: false; readonly reason: string } {
+  if (typeof operation !== "object" || operation === null) return { ok: false, reason: "operation must be an object" };
+  switch (operation.kind) {
+    case "builtin-tool": {
+      if (!BUILTIN_TOOL_NAMES.includes(operation.name) || operation.name !== invocation.action.tool.name ||
+          typeof operation.arguments !== "object" || operation.arguments === null || Array.isArray(operation.arguments) ||
+          jsonDigest(operation.arguments) !== jsonDigest(invocation.action.effectiveArguments)) {
+        return { ok: false, reason: "builtin invocation differs from the approved tool or arguments" };
+      }
+      if (operation.name === "bash" || operation.name === "powershell") return { ok: true, operation };
+      const requested = operation.arguments.path ?? ".";
+      if (typeof requested !== "string" || requested.includes("\0")) return { ok: false, reason: "invalid builtin path" };
+      const resolved = resolveExecutionPath(builtinToolPath(operation.name, requested, invocation.action.cwd), invocation.action.cwd, resolver);
+      if (!resolved) return { ok: false, reason: "builtin path cannot be resolved" };
+      return { ok: true, operation: { ...operation, arguments: { ...operation.arguments, path: resolved } } };
+    }
+    case "sandbox-tool": {
+      if (!nonempty(operation.name) || operation.name !== invocation.action.tool.name ||
+          jsonDigest(operation.arguments) !== jsonDigest(invocation.action.effectiveArguments)) {
+        return { ok: false, reason: "sandbox tool invocation differs from the approved tool or arguments" };
+      }
+      const modulePath = resolveExecutionPath(operation.modulePath, invocation.action.cwd, resolver);
+      const stateDirectory = resolveExecutionPath(operation.stateDirectory, invocation.action.cwd, resolver);
+      if (!modulePath || !stateDirectory) return { ok: false, reason: "sandbox tool path cannot be resolved" };
+      return { ok: true, operation: { ...operation, modulePath, stateDirectory } };
+    }
+    case "shell": {
+      if (!nonempty(operation.command) || operation.command.includes("\0")) return { ok: false, reason: "shell command is invalid" };
+      if (operation.timeoutMs !== undefined && (!Number.isInteger(operation.timeoutMs) || operation.timeoutMs <= 0)) {
+        return { ok: false, reason: "shell timeout is invalid" };
+      }
+      if (operation.shell !== undefined && approvedShell !== undefined && !isSamePath(operation.shell, approvedShell)) {
+        return { ok: false, reason: "shell interpreter does not match the host approval" };
+      }
+      const shell = operation.shell ?? approvedShell ?? (process.platform === "win32"
+        ? process.env.ComSpec?.trim() || "cmd.exe" : process.env.SHELL?.trim() || "/bin/sh");
+      if (!nonempty(shell) || shell.includes("\0")) return { ok: false, reason: "shell interpreter is invalid" };
+      return { ok: true, operation: { ...operation, shell } };
+    }
+    case "read-file":
+    case "access-file":
+    case "write-file":
+    case "mkdir": {
+      const path = resolveExecutionPath(operation.path, invocation.action.cwd, resolver);
+      if (!path) return { ok: false, reason: `${operation.kind} path cannot be resolved` };
+      if (operation.kind === "write-file" && (typeof operation.content !== "string" ||
+          Buffer.byteLength(operation.content, "utf8") > MAX_FILE_CONTENT_BYTES)) {
+        return { ok: false, reason: "file content is invalid or exceeds the size limit" };
+      }
+      if (operation.kind === "access-file" && operation.mode !== "read" && operation.mode !== "read-write") {
+        return { ok: false, reason: "file access mode is invalid" };
+      }
+      return { ok: true, operation: { ...operation, path } };
+    }
+    case "access-dir": {
+      const path = resolveExecutionPath(operation.path, invocation.action.cwd, resolver);
+      const forFile = resolveExecutionPath(operation.forFile, invocation.action.cwd, resolver);
+      if (!path || !forFile) return { ok: false, reason: "access-dir path cannot be resolved" };
+      if (!isSamePath(normalizeHostPath(dirname(forFile)) ?? "", path)) {
+        return { ok: false, reason: "access-dir path must be the parent of its approved file" };
+      }
+      return { ok: true, operation: { ...operation, path, forFile } };
+    }
+    default:
+      return { ok: false, reason: "unknown operation kind" };
+  }
+}
+
+function grantCoversTarget(grant: FilesystemGrantInput, target: string): boolean {
+  return grant.granularity === "file" ? isSamePath(grant.path, target) : isPathWithin(grant.path, target);
+}
+
+export function validateOperationPermissions(input: {
+  readonly operation: ExecutionOperation;
+  readonly baseline: PlanBaselineScope;
+  readonly approved: PlanApprovedScope;
+  readonly runtime: readonly FilesystemGrantInput[];
+  readonly resolvePath: (path: string) => string | null;
+  readonly protectedControlNames?: readonly string[];
+}): { readonly ok: true; readonly additionalProtectedPaths: readonly string[] } | { readonly ok: false; readonly code: "invalid-plan" | "scope-expansion" | "protected-path"; readonly reason: string } {
+  const readable: string[] = [];
+  const writable: string[] = [];
+  const operation = input.operation;
+  if (operation.kind === "builtin-tool") {
+    if (operation.name === "bash" || operation.name === "powershell") return { ok: true, additionalProtectedPaths: [] };
+    const path = operation.arguments.path;
+    if (typeof path !== "string") return { ok: false, code: "scope-expansion", reason: "builtin path is invalid" };
+    if (operation.name !== "write") readable.push(path);
+    if (operation.name === "write" || operation.name === "edit") writable.push(path);
+  } else if (operation.kind === "sandbox-tool") {
+    readable.push(operation.modulePath);
+    writable.push(operation.stateDirectory);
+  } else if (operation.kind === "read-file") readable.push(operation.path);
+  else if (operation.kind === "access-file") {
+    readable.push(operation.path);
+    if (operation.mode === "read-write") writable.push(operation.path);
+  } else if (operation.kind === "write-file" || operation.kind === "mkdir") writable.push(operation.path);
+  else if (operation.kind === "access-dir") {
+    const grants = [...input.baseline.filesystem, ...input.approved.filesystem, ...input.runtime];
+    if (!grants.some(grant => grant.access === "write" && grantCoversTarget(grant, operation.forFile))) {
+      return { ok: false, code: "scope-expansion", reason: `parent directory check has no write grant for its approved file: ${operation.forFile}` };
+    }
+  }
+
+  const canonicalize = (source: readonly FilesystemGrantInput[]): FilesystemGrantInput[] | null => {
+    const result: FilesystemGrantInput[] = [];
+    for (const grant of source) {
+      if (!grant || (grant.access !== "read" && grant.access !== "write") ||
+          (grant.granularity !== "file" && grant.granularity !== "directory")) return null;
+      const path = resolveExecutionPath(grant.path, ".", input.resolvePath);
+      if (!path) return null;
+      result.push({ ...grant, path });
+    }
+    return result;
+  };
+  const baseline = canonicalize(input.baseline.filesystem);
+  const approved = canonicalize(input.approved.filesystem);
+  const runtime = canonicalize(input.runtime);
+  if (!baseline || !approved || !runtime) return { ok: false, code: "invalid-plan", reason: "filesystem grant is invalid or cannot be resolved" };
+  const grants = [...baseline, ...approved, ...runtime];
+  const protectedNames = input.protectedControlNames ?? PROTECTED_CONTROL_DIRECTORY_NAMES;
+  const additionalProtectedPaths = new Set<string>();
+  for (const { targets, access } of [{ targets: readable, access: "read" as const }, { targets: writable, access: "write" as const }]) {
+    for (const target of targets) {
+      if (!grants.some(grant => grant.access === access && grantCoversTarget(grant, target))) {
+        return { ok: false, code: "scope-expansion", reason: `${access} target is outside the approved scope: ${target}` };
+      }
+      const protectedRoot = findProtectedControlRoot(target, protectedNames);
+      if (!protectedRoot) continue;
+      const exactApprovedFile = approved.some(grant => grant.access === access && grant.granularity === "file" &&
+        isSamePath(grant.path, target));
+      if (!exactApprovedFile) return { ok: false, code: "protected-path", reason: `protected control path requires an explicit ${access} approval: ${protectedRoot}` };
+      if (access === "write") additionalProtectedPaths.add(protectedRoot);
+    }
+  }
+  for (const grant of grants) {
+    if (grant.access !== "write" || grant.granularity !== "directory") continue;
+    const protectedRoot = findProtectedControlRoot(grant.path, protectedNames);
+    if (protectedRoot) return { ok: false, code: "protected-path", reason: `directory write grant is inside a protected control path: ${grant.path}` };
+  }
+  return { ok: true, additionalProtectedPaths: [...additionalProtectedPaths] };
+}
+
 function deadlineFor(
   captured: CapturedExecution,
   operation: ExecutionOperation,
@@ -458,9 +639,9 @@ function deadlineFor(
  * User-facing reason for a failed sandbox tool outcome (design §6.4).
  *
  * Only the plan deadline is the documented per-call cap (`ABORT_REASONS` in
- * lifecycle.ts). The same `execution-timeout` code also carries the helper start
+ * lifecycle.ts). The same `execution-timeout` code also carries the native start
  * timeout (a literal "start timed out") and a deadline that expired before the
- * helper started (`callRefusal` below), which must keep their own text, so the
+ * native process started (`callRefusal` below), which must keep their own text, so the
  * mapping is keyed on the exact reason.
  */
 export function sandboxToolFailureReason(
@@ -472,7 +653,7 @@ export function sandboxToolFailureReason(
 }
 
 /**
- * Create Pi-owned tool definitions backed by the trusted-helper executor and
+ * Create Pi-owned tool definitions backed by the trusted native backend and
  * reuse 04's final invocation binding. Full access registers nothing: this
  * module never claims a sandbox for that mode.
  */
@@ -522,7 +703,7 @@ export function createPiExecutionAdapter(
   const deadlineMs =
     options.plan.deadlineMs ?? DEFAULT_EXECUTION_DEADLINE_MS;
   const allowlist =
-    options.plan.environmentAllowlist ?? DEFAULT_HELPER_ENVIRONMENT_ALLOWLIST;
+    options.plan.environmentAllowlist ?? DEFAULT_EXECUTION_ENVIRONMENT_ALLOWLIST;
   const readConfigRevision = (): string =>
     options.plan.readConfigRevision?.() ?? options.plan.configRevision;
   const resolvePath = options.plan.resolvePath ?? resolveHostPathIdentity;
@@ -677,7 +858,7 @@ export function createPiExecutionAdapter(
   /**
    * Why this call may no longer execute, or `null` while it still may.
    * Every fact that can expire between two operations of one call is re-read
-   * as one stable snapshot, both before compiling and before the helper starts.
+   * as one stable snapshot, both before compiling and before the native process starts.
    */
   function callRefusal(
     call: CapturedExecution,
@@ -718,7 +899,7 @@ export function createPiExecutionAdapter(
     if (deadlineAt !== undefined && deadlineAt <= now()) {
       return {
         code: "execution-timeout",
-        reason: "plan deadline expired before the helper started",
+        reason: "plan deadline expired before the native process started",
       };
     }
     return null;
@@ -841,10 +1022,13 @@ export function createPiExecutionAdapter(
         mismatch,
       );
     }
+    const preparedOperation = prepareExecutionOperation(operation, call.invocation, resolvePath, options.plan.shell);
+    if (!preparedOperation.ok) throw new ControlledOperationError("unsupported-operation", preparedOperation.reason);
+    const startOperation = preparedOperation.operation;
     const current = now();
     const deadlineAt = deadlineFor(
       call,
-      operation,
+      startOperation,
       runOptions.timeoutMs,
       current,
     );
@@ -865,41 +1049,58 @@ export function createPiExecutionAdapter(
       );
     }
     const requestedApproval = options.plan.approvedScope?.(call.invocation) ?? approvedScopeFromInvocation(call.invocation);
+    const runtimeFailure = options.plan.validateRuntime?.();
+    if (runtimeFailure) throw new ControlledOperationError("sandbox-unavailable", runtimeFailure);
     const oneCallDefault = options.plan.oneCallDefault?.(call.invocation);
-    const baseline = effectiveBaselineForOperation(oneCallDefault ?? options.plan.baseline, options.plan.shellBaseline, operation);
+    const baseline = effectiveBaselineForOperation(oneCallDefault ?? options.plan.baseline, options.plan.shellBaseline, startOperation);
     const approved = {
       ...requestedApproval,
       filesystem: requestedApproval.filesystem.filter(grant => !baseline.filesystem.some(baselineGrant =>
         baselineGrant.access === grant.access && (baselineGrant.granularity === "directory"
           ? isPathWithin(baselineGrant.path, grant.path) : isSamePath(baselineGrant.path, grant.path)))),
     };
-    if (operation.kind === "builtin-tool" && operation.name === "write") {
-      const path = builtinToolPath(operation.name, String(operation.arguments.path), call.invocation.action.cwd);
+    if (startOperation.kind === "builtin-tool" && startOperation.name === "write") {
+      const path = String(startOperation.arguments.path);
       const parent = dirname(path);
       if (!existsSync(parent) && ![...baseline.filesystem, ...approved.filesystem].some(grant =>
         grant.access === "write" && grant.granularity === "directory" && isPathWithin(grant.path, parent))) {
         throw new ControlledOperationError("scope-expansion", "creating the target parent requires an approved directory grant");
       }
     }
+    let sensitivePaths: readonly SensitivePath[];
+    let runtimeFilesystem: readonly FilesystemGrantInput[];
+    let runtimeProtectedPaths: readonly string[];
+    try {
+      sensitivePaths = options.plan.readSensitivePaths?.() ?? [];
+      const runtime = options.plan.runtimeFilesystem?.(startOperation);
+      runtimeFilesystem = runtime?.grants ?? [];
+      runtimeProtectedPaths = runtime?.protectedPaths ?? [];
+    } catch (error) {
+      throw new ControlledOperationError("invalid-plan", error instanceof Error ? error.message : String(error));
+    }
+    const operationPermissions = validateOperationPermissions({
+      operation: startOperation,
+      baseline,
+      approved,
+      runtime: runtimeFilesystem,
+      resolvePath,
+      ...(options.plan.protectedControlNames === undefined ? {} : { protectedControlNames: options.plan.protectedControlNames }),
+    });
+    if (!operationPermissions.ok) {
+      throw new ControlledOperationError(operationPermissions.code, operationPermissions.reason);
+    }
+    const cwd = resolveExecutionPath(call.invocation.action.cwd, call.invocation.action.cwd, resolvePath);
+    if (!cwd) throw new ControlledOperationError("invalid-plan", "approved cwd cannot be resolved");
     const compiled = compileExecutionPlan({
       invocation: call.invocation,
-      operation,
-      mode: oneCallDefault === undefined ? modeWithSandbox : "default",
-      owner: options.owner,
-      bindingId: options.bindingId,
       baseline,
+      runtimeFilesystem,
       ...(options.plan.networkCeiling === undefined ? {} : { networkCeiling: options.plan.networkCeiling }),
       approved,
-      backendId: options.plan.backendId,
-      policyRevision: call.policyRevision,
-      configRevision: call.configRevision,
-      deadlineAt,
-      now: current,
-      environment: environmentCheck.environment,
-      environmentAllowlist: allowlist,
-      ...(options.plan.protectedPaths === undefined ? {} : { protectedPaths: options.plan.protectedPaths }),
-      expectedToolRevision: call.invocation.action.tool.revision,
-      ...(options.plan.shell === undefined ? {} : { shell: options.plan.shell }),
+      metadataRead: options.plan.metadataRead,
+      protectedPaths: [...(options.plan.protectedPaths ?? []), ...runtimeProtectedPaths, ...operationPermissions.additionalProtectedPaths],
+      ...(options.plan.protectedFilePaths === undefined ? {} : { protectedFilePaths: options.plan.protectedFilePaths }),
+      sensitivePaths,
       resolvePath,
       ...(options.plan.protectedControlNames === undefined
         ? {}
@@ -916,13 +1117,37 @@ export function createPiExecutionAdapter(
     }
     const signal = runOptions.signal ?? call.signal;
     const executeInput = {
-      plan: compiled.plan,
+      request: {
+        plan: compiled.plan,
+        requestId: call.invocation.action.requestId,
+        toolCallId: call.invocation.action.toolCallId,
+        actionDigest: call.invocation.digest,
+        sessionId: call.invocation.requester.sessionId,
+        toolName: call.invocation.action.tool.name,
+        mode: oneCallDefault === undefined ? modeWithSandbox : "default",
+        policyRevision: call.policyRevision,
+        configRevision: call.configRevision,
+        backendId: options.plan.backendId,
+        start: {
+          cwd,
+          operation: startOperation,
+          environment: environmentCheck.environment,
+          deadlineAt,
+        },
+      },
       ...(signal === undefined ? {} : { signal }),
       // The checks above only describe the moment they ran. This task may then
       // wait in the queue and in the handshake, so the controller re-reads the
       // same facts after each wait it owns: once before a process exists and
       // once before the business start is sent.
-      validity: createExecutionValidityGuard(() => callRefusal(call, deadlineAt)),
+      validity: createExecutionValidityGuard(() => callRefusal(call, deadlineAt) ??
+        (!compiled.plan.filesystem.every(rule => rule.access !== "deny-write" || !rule.identity || !rule.requestedPath ||
+          sensitivePathIdentityMatches({ path: rule.path, requestedPath: rule.requestedPath, granularity: rule.granularity, identity: rule.identity })) ||
+          !sensitivePaths.every(sensitivePathIdentityMatches) ? {
+          code: "plan-invalidated", reason: "a protected or sensitive path changed after plan creation",
+        } : options.plan.validateRuntime?.() ? {
+          code: "plan-invalidated", reason: "the selected runtime changed after plan creation",
+        } : null)),
       ...(runOptions.onOutput === undefined
         ? {}
         : { onOutput: runOptions.onOutput }),
@@ -964,7 +1189,7 @@ export function createPiExecutionAdapter(
           throw error;
         }
         // The call owns a cancellation source of its own: an invalidation can
-        // arrive while no helper is running, between two SDK sub-operations.
+        // arrive while no native process is running, between two SDK sub-operations.
         const callController = new AbortController();
         const forwardAbort = () => callController.abort();
         if (signal) signal.addEventListener("abort", forwardAbort, { once: true });

@@ -1,21 +1,24 @@
-import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 
 import {
   captureToolInvocationSeed,
   finalizeToolInvocation,
   type ToolInvocationFacts,
 } from "../../../src/invocation";
-import { compileExecutionPlan } from "#sandbox/plan";
+import { compileExecutionPlan, filterExecutionEnvironment } from "#sandbox/plan";
+import { builtinToolPath } from "#sandbox/builtin-path";
+import { normalizeHostPath } from "#sandbox/path";
 import { ExecutionController } from "#sandbox/lifecycle";
-import type { TrustedHelperInstallation } from "#sandbox/helper";
+import type { DirectBackendDriver } from "#sandbox/backend/direct";
 import type {
   ExecutionOperation,
   ExecutionPlan,
+  ExecutionRequest,
   NetworkScope,
 } from "#sandbox/types";
+import { createTestDirectBackend } from "./direct-backend";
 
 export const OWNER = "plan-11-test-owner";
 export const BINDING_ID = "plan-11-test-binding";
@@ -25,8 +28,6 @@ export const CONFIG_REVISION = "config-r1";
 
 export interface TestLayout {
   readonly root: string;
-  readonly installRoot: string;
-  readonly helperCwd: string;
   readonly workspace: string;
   readonly agent: string;
 }
@@ -34,21 +35,14 @@ export interface TestLayout {
 export function createTestLayout(prefix = "plan11-exec"): TestLayout {
   // macOS exposes the per-user temp directory through the /var symlink while
   // realpath returns /private/var. Canonicalize once so fixtures that compare
-  // sandbox paths (which the helper canonicalizes) stay aligned.
+  // sandbox paths (which the backend canonicalizes) stay aligned.
   const root = realpathSync(mkdtempSync(join(tmpdir(), `${prefix}-`)));
   const layout = {
     root,
-    installRoot: join(root, "helper"),
-    helperCwd: join(root, "helper-runtime"),
     workspace: join(root, "workspace"),
     agent: join(root, "agent"),
   };
-  for (const directory of [
-    layout.installRoot,
-    layout.helperCwd,
-    layout.workspace,
-    layout.agent,
-  ]) {
+  for (const directory of [layout.workspace, layout.agent]) {
     mkdirSync(directory, { recursive: true });
   }
   return layout;
@@ -59,29 +53,10 @@ export function removeTestLayout(layout: TestLayout | undefined): void {
   rmSync(layout.root, { recursive: true, force: true });
 }
 
-export function installFixtureHelper(layout: TestLayout): TrustedHelperInstallation {
-  const source = fileURLToPath(
-    new URL("./helper-fixture.mjs", import.meta.url),
-  );
-  const target = join(layout.installRoot, "helper-fixture.mjs");
-  mkdirSync(dirname(target), { recursive: true });
-  copyFileSync(source, target);
-  return {
-    installRoot: layout.installRoot,
-    executable: process.execPath,
-    args: [target],
-  };
-}
-
-export function fixtureEnvironment(
-  scenario: string,
+export function testExecutionEnvironment(
   extra: Readonly<Record<string, string>> = {},
 ): Readonly<Record<string, string>> {
-  const result: Record<string, string> = {
-    FIXTURE_SCENARIO: scenario,
-    FIXTURE_BUILTIN_WORKER: fileURLToPath(new URL("../../../src/sandbox/builtin-worker.mjs", import.meta.url)),
-    FIXTURE_SANDBOX_TOOL_WORKER: fileURLToPath(new URL("../../../src/sandbox/sandbox-tool-worker.mjs", import.meta.url)),
-  };
+  const result: Record<string, string> = {};
   for (const name of [
     "PATH",
     "PATHEXT",
@@ -102,7 +77,7 @@ export function fixtureEnvironment(
   return Object.freeze(result);
 }
 
-/** A shell/helper environment that is explicit and contains no controller keys. */
+/** An explicit process environment that contains no controller keys. */
 export function runtimeEnvironment(): Readonly<Record<string, string>> {
   const result: Record<string, string> = {};
   for (const name of [
@@ -219,15 +194,19 @@ export interface CompileTestPlanOptions {
   readonly deadlineMs?: number;
   readonly now?: number;
   readonly backendId?: string;
+  readonly metadataRead?: "none" | "all";
   readonly mode?: "read-only" | "default" | "auto-review";
   readonly owner?: string;
   readonly bindingId?: string;
   readonly protectedControlNames?: readonly string[];
+  readonly protectedPaths?: readonly string[];
+  readonly runtimeFilesystem?: readonly import("#sandbox/types").FilesystemGrantInput[];
+  readonly sensitivePaths?: readonly import("#sandbox/sensitive-paths").SensitivePath[];
   readonly shell?: string;
   readonly resolvePath?: (path: string) => string | null;
 }
 
-export function compileTestPlan(options: CompileTestPlanOptions): ExecutionPlan {
+function compileTestExecution(options: CompileTestPlanOptions): ExecutionRequest {
   const now = options.now ?? Date.now();
   const baselineFilesystem: {
     path: string;
@@ -239,12 +218,18 @@ export function compileTestPlan(options: CompileTestPlanOptions): ExecutionPlan 
       { path: options.workspace, access: "write", granularity: "directory" },
     ]
     : [...options.baselineFilesystem];
+  const environment = filterExecutionEnvironment(options.environment ?? {});
+  if (!environment.ok) throw new Error(`environment is invalid: ${environment.reason}`);
+  const cwd = normalizeHostPath(options.invocation.action.cwd);
+  if (!cwd) throw new Error("test invocation cwd is invalid");
+  const operation = options.operation.kind === "shell" && options.shell !== undefined
+    ? { ...options.operation, shell: options.shell }
+    : options.operation.kind === "builtin-tool" && options.operation.name !== "bash" && options.operation.name !== "powershell"
+    ? { ...options.operation, arguments: { ...options.operation.arguments,
+      path: builtinToolPath(options.operation.name, String(options.operation.arguments.path ?? "."), cwd) } }
+    : options.operation;
   const compiled = compileExecutionPlan({
     invocation: options.invocation,
-    operation: options.operation,
-    mode: options.mode ?? "default",
-    owner: options.owner ?? OWNER,
-    bindingId: options.bindingId ?? BINDING_ID,
     baseline: {
       filesystem: baselineFilesystem,
       network: options.network ?? { kind: "none" },
@@ -255,12 +240,10 @@ export function compileTestPlan(options: CompileTestPlanOptions): ExecutionPlan 
         ? {}
         : { network: options.approved.network }),
     },
-    backendId: options.backendId ?? "fixture-helper",
-    policyRevision: POLICY_REVISION,
-    configRevision: CONFIG_REVISION,
-    deadlineAt: now + (options.deadlineMs ?? 30_000),
-    now,
-    environment: options.environment ?? {},
+    metadataRead: options.metadataRead ?? "none",
+    ...(options.protectedPaths === undefined ? {} : { protectedPaths: options.protectedPaths }),
+    ...(options.runtimeFilesystem === undefined ? {} : { runtimeFilesystem: options.runtimeFilesystem }),
+    ...(options.sensitivePaths === undefined ? {} : { sensitivePaths: options.sensitivePaths }),
     ...(options.shell === undefined ? {} : { shell: options.shell }),
     ...(options.resolvePath === undefined
       ? {}
@@ -272,15 +255,39 @@ export function compileTestPlan(options: CompileTestPlanOptions): ExecutionPlan 
   if (!compiled.ok) {
     throw new Error(`plan compilation failed: ${compiled.code}: ${compiled.reason}`);
   }
-  return compiled.plan;
+  return {
+    plan: compiled.plan,
+    requestId: options.invocation.action.requestId,
+    toolCallId: options.invocation.action.toolCallId,
+    actionDigest: options.invocation.digest,
+    sessionId: options.invocation.requester.sessionId,
+    toolName: options.invocation.action.tool.name,
+    mode: options.mode ?? "default",
+    policyRevision: POLICY_REVISION,
+    configRevision: CONFIG_REVISION,
+    backendId: options.backendId ?? "fixture-direct",
+    start: {
+      cwd,
+      operation,
+      environment: environment.environment,
+      deadlineAt: now + (options.deadlineMs ?? 30_000),
+    },
+  };
+}
+
+export function compileTestPlan(options: CompileTestPlanOptions): ExecutionPlan {
+  return compileTestExecution(options).plan;
+}
+
+export function compileTestRequest(options: CompileTestPlanOptions): ExecutionRequest {
+  return compileTestExecution(options);
 }
 
 export interface MakeControllerOptions {
   readonly layout: TestLayout;
-  readonly installation?: TrustedHelperInstallation;
   readonly scenario?: string;
-  readonly helperEnvironment?: Readonly<Record<string, string>>;
-  readonly workspace?: string;
+  readonly environment?: Readonly<Record<string, string>>;
+  readonly directBackend?: DirectBackendDriver;
   readonly startTimeoutMs?: number;
   readonly cancelGraceMs?: number;
   readonly maxConcurrent?: number;
@@ -294,12 +301,10 @@ export function makeController(
   options: MakeControllerOptions,
 ): ExecutionController {
   return new ExecutionController({
-    installation: options.installation ?? installFixtureHelper(options.layout),
-    helperCwd: options.layout.helperCwd,
-    workspace: options.workspace ?? options.layout.workspace,
-    helperEnvironment:
-      options.helperEnvironment ??
-      fixtureEnvironment(options.scenario ?? "ok"),
+    directBackend: options.directBackend ?? createTestDirectBackend({
+      ...(options.scenario === undefined ? {} : { scenario: options.scenario }),
+      ...(options.environment === undefined ? {} : { environment: options.environment }),
+    }),
     startTimeoutMs: options.startTimeoutMs ?? 5_000,
     cancelGraceMs: options.cancelGraceMs ?? 500,
     maxConcurrent: options.maxConcurrent ?? 2,

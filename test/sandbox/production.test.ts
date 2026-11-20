@@ -7,8 +7,8 @@ import { networkInterfaces } from "node:os";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ExtensionToolContext, type RegisteredMcpServer } from "@earendil-works/pi-coding-agent";
@@ -24,10 +24,12 @@ import type { ResolvedRuntimeFiles } from "#sandbox/runtime-store";
 import { runWithApprovedCodemode } from "#sandbox/codemode/approval-scope";
 import type { AnyToolDefinition } from "#sandbox/pi";
 import type { ExecutionOutcome, ExecutionRecord } from "#sandbox/types";
-import { createTestLayout, makeController, removeTestLayout, waitFor, waitForProcessGone } from "./fixtures/harness";
+import { compileTestRequest, createTestLayout, makeController, makeInvocation, removeTestLayout, runtimeEnvironment, waitFor, waitForProcessGone } from "./fixtures/harness";
+import { createTestDirectBackend } from "./fixtures/direct-backend";
 import { PROTECTED_CONTROL_DIRECTORY_NAMES } from "#sandbox/path";
 import { prepareWindowsRuntimeExecutable } from "#sandbox/runtime-windows-integrity";
 import { findSystemBubblewrap } from "../../src/sandbox/backend/linux/bwrap-selection.mjs";
+import { selectExecutionEnvironment } from "../../src/sandbox/plan";
 
 const cleanup: (() => Promise<void>)[] = [];
 const privateAddress = Object.values(networkInterfaces()).flat().find(address => address?.family === "IPv4" && !address.internal)?.address;
@@ -45,13 +47,13 @@ function setup(
   const sources = new Map<string, string>();
   const handlers = new Map<string, ((...args: unknown[]) => unknown)[]>();
   const records: unknown[] = [];
-  const controllers: ReturnType<typeof makeController>[] = [];
+  const controllers: ExecutionController[] = [];
   const registeredServers: RegisteredMcpServer[] = [];
   const ctx = { cwd: layout.workspace, isProjectTrusted: () => true,
     sessionManager: SessionManager.inMemory(layout.workspace, { id: "controlled-session" }),
   } as unknown as ExtensionToolContext;
   const paths = resolveConfigPaths({ agentDir: layout.agent, cwd: layout.workspace, extensionRoot: dirname(dirname(source)) });
-  const owner = createApprovalChainConfigOwner({ paths, cwd: layout.workspace, projectTrusted: true });
+  const owner = createApprovalChainConfigOwner({ paths, cwd: layout.workspace, projectTrusted: true, platform: process.platform });
   // Production keeps one config owner per session (src/index.ts runtimeFor).
   // Most cases share the single owner; the cross-session sandbox-tool case
   // registers a second one so its rule table really differs.
@@ -85,8 +87,19 @@ function setup(
   };
   if (runtimePlatform === "win32") {
     const module = join(dirname(dirname(source)), "src/sandbox/backend/windows/mxc");
-    installRuntimeFile("windowsExecutable", join(module, "pi-sandbox-windows-mxc.exe"), "pi-sandbox-windows-mxc.exe", true);
-    installRuntimeFile("mxcManifest", join(module, "mxc-runtime.json"), "mxc-runtime.json", false);
+    const testExecutable = process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE;
+    installRuntimeFile("windowsExecutable", testExecutable ?? join(module, "pi-sandbox-windows-mxc.exe"), "pi-sandbox-windows-mxc.exe", true);
+    if (testExecutable && runtimeFiles.windowsExecutable) {
+      const target = join(runtimeDirectory, "mxc-runtime.json");
+      writeFileSync(target, JSON.stringify({ schemaVersion: 1, backend: "windows-mxc", version: "1.0.0",
+        sdkRevision: "b21120168d70befe12356411423266bfef168446",
+        sha256: createHash("sha256").update(readFileSync(runtimeFiles.windowsExecutable)).digest("hex") }));
+      runtimeFiles.mxcManifest = target;
+      runtimeManifestFiles.push({ role: "mxcManifest", path: "mxc-runtime.json", executable: false,
+        sha256: createHash("sha256").update(readFileSync(target)).digest("hex") });
+    } else {
+      installRuntimeFile("mxcManifest", join(module, "mxc-runtime.json"), "mxc-runtime.json", false);
+    }
   } else if (runtimePlatform === "linux") {
     const module = join(dirname(dirname(source)), "src/sandbox/backend/linux");
     installRuntimeFile("linuxLauncher", join(module, "linux-sandbox"), "linux-sandbox", true);
@@ -112,7 +125,7 @@ function setup(
       stable: true,
       platform: runtimePlatform,
       arch: runtimeArch,
-      protocolVersion: 2,
+      protocolVersion: 3,
       minPluginVersion: "1.0.0",
       maxPluginVersionExclusive: "2.0.0",
       backendId,
@@ -122,6 +135,7 @@ function setup(
   }
   const runtime = {
     directory: runtimeDirectory,
+    storageRoot: runtimeRoot,
     source: "manual",
     manifest: {
       schemaVersion: 1,
@@ -129,12 +143,12 @@ function setup(
       stable: true,
       platform: runtimePlatform,
       arch: runtimeArch,
-      protocolVersion: 2,
+      protocolVersion: 3,
       minPluginVersion: "1.0.0",
       maxPluginVersionExclusive: "2.0.0",
       backendId,
       files: runtimeManifestFiles,
-      ...(runtimePlatform === "linux" ? { components: { bubblewrapVersion: "0.13.2", bubblewrapSourceCommit: "a".repeat(40) } } : {}),
+      ...(runtimePlatform === "linux" ? { components: { bubblewrapVersion: bubblewrapVersion ?? "0.13.2", bubblewrapSourceCommit: "a".repeat(40) } } : {}),
     },
     files: runtimeFiles,
   } as unknown as ResolvedRuntimeFiles;
@@ -154,6 +168,11 @@ function setup(
     appendEntry: (_type: string, value: unknown) => records.push(value),
     on: (event: string, handler: (...args: unknown[]) => unknown) => { handlers.set(event, [...(handlers.get(event) ?? []), handler]); return () => undefined; },
   } as unknown as ExtensionAPI;
+  const controllerFactory = (_ctx: ExtensionContext, onRecord: (record: ExecutionRecord) => void) => {
+    const controller = makeController({ layout, onRecord, scenario, directBackend: createTestDirectBackend({ id: backendId, scenario }) });
+    controllers.push(controller);
+    return controller;
+  };
   const execution = createControlledExecution({
     agentDir: layout.agent,
     runtime: () => runtimeState,
@@ -161,9 +180,7 @@ function setup(
       const id = snapshotCtx.sessionManager.getSessionId();
       return (sessionOwners.get(id) ?? owner).snapshot({ sessionId: id });
     },
-    ...(native ? {} : { controller: (_ctx: ExtensionContext, onRecord: (record: import("#sandbox/types").ExecutionRecord) => void) => {
-      const controller = makeController({ layout, onRecord, scenario }); controllers.push(controller); return controller;
-    } }),
+    ...(native ? {} : { controller: controllerFactory }),
     mcp: { loadConfig: () => ({ servers: [], errors: [] }) },
   });
   execution.install(api);
@@ -175,11 +192,146 @@ function setup(
   const emit = async (name: string, eventContext: ExtensionToolContext = ctx, event: unknown = { type: name }) => {
     for (const handler of handlers.get(name) ?? []) await handler(event, eventContext);
   };
-  return { layout, paths, ctx, owner, sessionOwners, execution, definitions, sources, records, controllers, registeredServers, api, emit };
+  return { layout, paths, ctx, owner, sessionOwners, execution, definitions, sources, records, controllers, registeredServers, api, emit, runtimeDirectory };
 }
 
 describe("production controlled execution boundary", () => {
-  it.skipIf(process.platform !== "linux")("protects the same system bubblewrap binary that the helper selects", async () => {
+  it.skipIf(process.platform !== "linux" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/linux/linux-sandbox", import.meta.url))))(
+    "enforces configured sensitive paths through the production Linux backend", async () => {
+      const rig = setup("default", true);
+      const secretDir = join(rig.layout.workspace, "private-dir");
+      const secretFile = join(rig.layout.workspace, "private.txt");
+      mkdirSync(secretDir);
+      writeFileSync(join(secretDir, "data.txt"), "private-dir-data");
+      writeFileSync(secretFile, "private-file-data");
+      writeFileSync(rig.paths.globalConfigFile, JSON.stringify({ mode: "default", experimental: { sandboxEnabled: true },
+        execution: { denyPaths: [secretDir, secretFile] } }));
+      rig.owner.reload({ sessionId: rig.ctx.sessionManager.getSessionId() });
+      const command = "set -eu; printf saved > sibling.txt; test ! -e private-dir/data.txt; " +
+        "test \"$(stat -c %s private.txt)\" = 0; printf protected";
+      const event = { type: "tool_call" as const, toolName: "bash", toolCallId: "sensitive-linux", input: { command } };
+      expect(await rig.execution.guard(event, rig.ctx, async () => undefined)).toBeUndefined();
+      const result = await rig.definitions.get("bash")!.execute(event.toolCallId, event.input, undefined, undefined, rig.ctx);
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      expect(JSON.stringify(result)).toContain("protected");
+      expect(readFileSync(join(rig.layout.workspace, "sibling.txt"), "utf8")).toBe("saved");
+      expect(readFileSync(secretFile, "utf8")).toBe("private-file-data");
+    }, 30_000,
+  );
+
+  it.skipIf(process.platform !== "win32" || !process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE)(
+    "refuses a runtime changed after selection before starting a tool", async () => {
+      const rig = setup("default", true);
+      const event = { type: "tool_call" as const, toolName: "write", toolCallId: "runtime-replaced",
+        input: { path: "out.txt", content: "data" } };
+      expect(await rig.execution.guard(event, rig.ctx, async () => undefined)).toBeUndefined();
+      const manifest = join(rig.runtimeDirectory, "runtime.json");
+      writeFileSync(manifest, `${readFileSync(manifest, "utf8")} `);
+      await expect(rig.definitions.get("write")!.execute(event.toolCallId, event.input, undefined, undefined, rig.ctx))
+        .rejects.toThrow("runtime manifest changed");
+      expect(rig.records.some(record => (record as { started?: unknown }).started === true)).toBe(false);
+      expect(existsSync(join(rig.layout.workspace, "out.txt"))).toBe(false);
+    }, 20_000,
+  );
+
+  it.skipIf(process.platform !== "win32" || !process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE)(
+    "enforces configured sensitive paths through the host-direct production Windows backend", async () => {
+      const rig = setup("default", true);
+      const secretDir = join(rig.layout.workspace, "private-dir");
+      const secretFile = join(rig.layout.workspace, "private.txt");
+      mkdirSync(secretDir);
+      writeFileSync(join(secretDir, "data.txt"), "private-dir-data");
+      writeFileSync(secretFile, "private-file-data");
+      writeFileSync(rig.paths.globalConfigFile, JSON.stringify({ mode: "default", experimental: { sandboxEnabled: true },
+        execution: { denyPaths: [secretDir, secretFile] } }));
+      rig.owner.reload({ sessionId: rig.ctx.sessionManager.getSessionId() });
+      const command = ["$ErrorActionPreference='Stop'",
+        "[IO.File]::WriteAllText('sibling.txt', 'saved')",
+        "try { [void][IO.File]::ReadAllText('private-dir/data.txt'); exit 11 } catch {}",
+        "try { [void][IO.File]::ReadAllText('private.txt'); exit 12 } catch {}",
+        "try { [void](Get-Item -LiteralPath 'private.txt' -ErrorAction Stop).Length; exit 13 } catch {}",
+        "Write-Output 'protected'; exit 0"].join("; ");
+      const event = { type: "tool_call" as const, toolName: "powershell", toolCallId: "sensitive-native", input: { command } };
+      expect(await rig.execution.guard(event, rig.ctx, async () => undefined)).toBeUndefined();
+      const result = await rig.definitions.get("powershell")!.execute(event.toolCallId, event.input, undefined, undefined, rig.ctx);
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      expect(JSON.stringify(result)).toContain("protected");
+      expect(readFileSync(join(rig.layout.workspace, "sibling.txt"), "utf8")).toBe("saved");
+      expect(readFileSync(secretFile, "utf8")).toBe("private-file-data");
+    }, 30_000,
+  );
+
+  it("does not start a tool when a configured sensitive path is missing", async () => {
+    const rig = setup("read-only");
+    const secret = join(rig.layout.workspace, "missing-secret");
+    writeFileSync(rig.paths.globalConfigFile, JSON.stringify({ mode: "read-only", experimental: { sandboxEnabled: true },
+      execution: { denyPaths: [secret] } }));
+    rig.owner.reload({ sessionId: rig.ctx.sessionManager.getSessionId() });
+    const args = { path: "out.txt", content: "approved" };
+    const elevation = rig.execution.prepareElevation("write", args, "default", rig.ctx);
+    if ("block" in elevation) throw new Error(elevation.reason);
+    const execute = vi.spyOn(ExecutionController.prototype, "execute");
+    try {
+      await expect(rig.execution.executeDefault({ toolCallId: "missing-sensitive", targetToolName: "write",
+        arguments: args, reason: "save", elevation }, undefined, undefined, rig.ctx)).rejects.toThrow(secret);
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      execute.mockRestore();
+    }
+  });
+
+  it("captures configured sensitive paths in the plan and invalidates a replaced target", async () => {
+    const rig = setup("read-only");
+    const secret = join(rig.layout.workspace, "secret.txt");
+    writeFileSync(secret, "fixture");
+    writeFileSync(rig.paths.globalConfigFile, JSON.stringify({ mode: "read-only", experimental: { sandboxEnabled: true },
+      execution: { denyPaths: [secret] } }));
+    rig.owner.reload({ sessionId: rig.ctx.sessionManager.getSessionId() });
+    const event = { type: "tool_call" as const, toolName: "write", toolCallId: "sensitive-capture",
+      input: { path: "out.txt", content: "approved" } };
+    const elevation = rig.execution.prepareElevation("write", event.input, "default", rig.ctx);
+    if ("block" in elevation) throw new Error(elevation.reason);
+    let captured: import("#sandbox/types").ExecutionPlan | undefined;
+    let refusal: string | undefined;
+    const execute = vi.spyOn(ExecutionController.prototype, "execute").mockImplementation(async input => {
+      captured = input.request.plan;
+      renameSync(secret, join(rig.layout.workspace, "old-secret.txt"));
+      writeFileSync(secret, "replacement");
+      refusal = input.validity?.check()?.reason;
+      throw new Error("captured execution plan");
+    });
+    try {
+      await expect(rig.execution.executeDefault({ toolCallId: "sensitive-capture-execution", targetToolName: "write",
+        arguments: event.input, reason: "save", elevation }, undefined, undefined, rig.ctx)).rejects.toThrow("captured execution plan");
+    } finally {
+      execute.mockRestore();
+    }
+    expect(captured?.filesystem).toContainEqual(expect.objectContaining({ path: secret, access: "deny-access", granularity: "file" }));
+    expect(refusal).toBe("a protected or sensitive path changed after plan creation");
+  });
+
+  it("sends the absolute approved builtin target in the startup parameters", async () => {
+    const rig = setup("read-only");
+    const target = join(rig.layout.workspace, "notes.txt");
+    writeFileSync(target, "contents");
+    const event = { type: "tool_call" as const, toolName: "read", toolCallId: "absolute-read-target",
+      input: { path: "notes.txt" } };
+    await rig.execution.guard(event, rig.ctx, async () => undefined);
+    let captured: import("#sandbox/types").ExecutionOperation | undefined;
+    const execute = vi.spyOn(ExecutionController.prototype, "execute").mockImplementation(async input => {
+      captured = input.request.start.operation;
+      throw new Error("captured startup request");
+    });
+    try {
+      await expect(rig.definitions.get("read")!.execute(event.toolCallId, event.input, undefined, undefined, rig.ctx))
+        .rejects.toThrow("captured startup request");
+    } finally {
+      execute.mockRestore();
+    }
+    expect(captured).toMatchObject({ kind: "builtin-tool", name: "read", arguments: { path: target } });
+  });
+
+  it.skipIf(process.platform !== "linux")("protects the same system bubblewrap binary that the backend selects", async () => {
     const systemBinaryDirectory = mkdtempSync(join(tmpdir(), "pi-sandbox-system-bwrap-"));
     const systemBinary = join(systemBinaryDirectory, "bwrap");
     writeFileSync(systemBinary, "#!/bin/sh\nexit 0\n");
@@ -187,7 +339,7 @@ describe("production controlled execution boundary", () => {
     const previousPath = process.env.PATH;
     let capturedProtectedPaths: readonly string[] | undefined;
     const execute = vi.spyOn(ExecutionController.prototype, "execute").mockImplementation(async input => {
-      capturedProtectedPaths = input.plan.protectedPaths;
+      capturedProtectedPaths = input.request.plan.filesystem.filter(rule => rule.access === "deny-write").map(rule => rule.path);
       throw new Error("captured execution plan");
     });
     process.env.PATH = systemBinaryDirectory;
@@ -244,7 +396,7 @@ describe("production controlled execution boundary", () => {
       if ("block" in elevation) throw new Error(elevation.reason);
       let capturedPlan: import("#sandbox/types").ExecutionPlan | undefined;
       const execute = vi.spyOn(ExecutionController.prototype, "execute").mockImplementation(async input => {
-        capturedPlan = input.plan;
+        capturedPlan = input.request.plan;
         throw new Error("captured execution plan");
       });
 
@@ -268,6 +420,11 @@ describe("production controlled execution boundary", () => {
         granularity: "directory",
         source: "approved-extension",
       }));
+      if (process.platform === "win32") {
+        expect(capturedPlan?.filesystem).toContainEqual(expect.objectContaining({
+          path: realpathSync.native(process.execPath), access: "read", source: "runtime",
+        }));
+      }
       expect(capturedPlan?.filesystem).not.toContainEqual(expect.objectContaining({
         path: join(rig.layout.workspace, "elevated.txt"), access: "write", granularity: "file",
       }));
@@ -527,8 +684,10 @@ describe("production controlled execution boundary", () => {
     };
     expect(await rig.execution.guard(event, rig.ctx, async () => undefined)).toBeUndefined();
     let capturedPlan: import("#sandbox/types").ExecutionPlan | undefined;
+    let capturedEnvironment: Readonly<Record<string, string>> | undefined;
     const execute = vi.spyOn(ExecutionController.prototype, "execute").mockImplementation(async input => {
-      capturedPlan = input.plan;
+      capturedPlan = input.request.plan;
+      capturedEnvironment = input.request.start.environment;
       throw new Error("captured execution plan");
     });
     try {
@@ -542,7 +701,7 @@ describe("production controlled execution boundary", () => {
       expect.objectContaining({ path: workspace, access: "read", source: "baseline" }),
       expect.objectContaining({ path: workspace, access: "write", source: "baseline" }),
     ]));
-    expect(capturedPlan?.environment).toMatchObject({
+    expect(capturedEnvironment).toMatchObject({
       PI_SANDBOX_WORK_DIR: workspace,
       TEMP: join(workspace, "tmp"),
       TMP: join(workspace, "tmp"),
@@ -1076,7 +1235,7 @@ describe("production controlled execution boundary", () => {
     }, 25_000,
   );
   it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
-    "allows workspace writes while denying a missing protected control directory", async () => {
+    "allows workspace writes and leaves a missing automatic protection path unprotected", async () => {
       const rig = setup("default", true);
       const target = join(rig.layout.workspace, ".aws");
       const allowed = join(rig.layout.workspace, "allowed.txt");
@@ -1085,9 +1244,9 @@ describe("production controlled execution boundary", () => {
       expect(await rig.execution.guard(event, rig.ctx, async () => undefined)).toBeUndefined();
       const result = await rig.definitions.get("powershell")!.execute(event.toolCallId, event.input, undefined, undefined, rig.ctx);
       expect(result.isError, JSON.stringify(result)).not.toBe(true);
-      expect(JSON.stringify(result)).toContain("denied");
+      expect(JSON.stringify(result)).toContain("created");
       expect(readFileSync(allowed, "utf8")).toBe("allowed");
-      expect(existsSync(target)).toBe(false);
+      expect(existsSync(target)).toBe(true);
       expect(rig.records).toEqual([expect.objectContaining({ state: "completed", started: true })]);
     }, 25_000,
   );
@@ -1115,7 +1274,7 @@ describe("production controlled execution boundary", () => {
       expect(rig.records).toEqual([]);
     }, 25_000,
   );
-  it("keeps final binding in full-access while running the original SDK tool without a helper", async () => {
+  it("keeps final binding in full-access while running the original SDK tool without a sandbox process", async () => {
     const rig = setup("full-access");
     const event = { type: "tool_call" as const, toolName: "write", toolCallId: "full-access", input: { path: "approved.txt", content: "approved" } };
     expect(await rig.execution.guard(event, rig.ctx, async () => undefined)).toBeUndefined();
@@ -1342,7 +1501,7 @@ describe("production controlled execution boundary", () => {
     expect(review).not.toHaveBeenCalled(); expect(rig.records).toEqual([]);
   });
 
-  it("blocks parameters changed after the sole approval without starting a helper", async () => {
+  it("blocks parameters changed after the sole approval without starting a native process", async () => {
     const rig = setup();
     writeFileSync(join(rig.layout.workspace, "a.txt"), "approved");
     writeFileSync(join(rig.layout.workspace, "b.txt"), "unapproved");
@@ -1644,7 +1803,7 @@ describe("sandbox-hosted tools through the controlled executor (design §6)", ()
     }
   });
 
-  it("runs a declared tool in the helper and keeps its state across calls", async () => {
+  it("runs a declared tool in the sandbox worker and keeps its state across calls", async () => {
     const rig = setup();
     writeFileSync(join(rig.layout.workspace, "counter-tool.mjs"), COUNTER_TOOL, "utf8");
     configureSandboxRules(rig, [{
@@ -1942,8 +2101,8 @@ describe("sandbox-hosted tools through the controlled executor (design §6)", ()
   it("finishes a call whose module leaves an interval handle open and exits its worker", async () => {
     const rig = setup();
     // A module that leaves an event-loop handle open after returning. The
-    // one-shot worker must still write its result and exit: the helper only
-    // relays the result when the worker process closes, so a linger would turn
+    // one-shot worker must still write its result and exit: the native runner
+    // only returns the result when the worker process closes, so a linger would turn
     // a completed call into a 60 s execution-timeout.
     writeFileSync(join(rig.layout.workspace, "interval-tool.mjs"), `
       import { writeFile } from "node:fs/promises";
@@ -1968,7 +2127,7 @@ describe("sandbox-hosted tools through the controlled executor (design §6)", ()
     expect(await rig.execution.guard(first, rig.ctx, review)).toBeUndefined();
 
     // (a) The call finishes promptly even though the module left a timer open.
-    // The bound only has to be far below the 60 s deadline; helper and worker
+    // The bound only has to be far below the 60 s deadline; native and worker
     // spawn time under parallel test load is orders of magnitude smaller.
     const startedAt = Date.now();
     const firstResult = await tool!.execute("interval-1", {}, undefined, undefined, rig.ctx);
@@ -1990,4 +2149,5 @@ describe("sandbox-hosted tools through the controlled executor (design §6)", ()
     expect(await rig.execution.guard(second, rig.ctx, review)).toBeUndefined();
     expect(textOf(await tool!.execute("interval-2", {}, undefined, undefined, rig.ctx))).toBe("interval=ok");
   }, 90_000);
+
 });

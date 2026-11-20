@@ -4,8 +4,8 @@ import { fileURLToPath } from "node:url";
 
 /*
  * The sandboxed worker cannot resolve the pi SDK on its own: managed installs
- * omit peer dependencies, and the helper only grants read access to this
- * package and the Node executable. Bundling keeps the artifact self-contained.
+ * omit peer dependencies, and the native sandbox only grants read access to
+ * this package and the Node executable. Bundling keeps the artifact self-contained.
  */
 const outfile = fileURLToPath(new URL("../src/sandbox/builtin-worker.bundle.mjs", import.meta.url));
 

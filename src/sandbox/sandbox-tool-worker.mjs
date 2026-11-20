@@ -18,7 +18,7 @@ import { pathToFileURL } from "node:url";
  * a pipe write is asynchronous, so an immediate `process.exit()` could
  * truncate a large result. Exiting is part of the one-shot contract because a
  * module may leave handles open (timers, watchers, keep-alive sockets); the
- * helpers only relay the result once this process closes.
+ * the native runner only returns the result once this process closes.
  */
 function finish(payload) {
   const line = `${JSON.stringify({ type: "result", ...payload })}\n`;
