@@ -6,21 +6,17 @@ import { createConnection, createServer as createTcpServer } from "node:net";
 import { once } from "node:events";
 
 import { EgressService } from "#sandbox/egress/index";
-import type { ExecutionPlan } from "#sandbox/types";
-import { compileExecutionPlan } from "#sandbox/plan";
+import type { ExecutionRequest } from "#sandbox/types";
 import {
-  BINDING_ID,
+  compileTestRequest,
   makeInvocation,
-  OWNER,
-  POLICY_REVISION,
-  CONFIG_REVISION,
 } from "../fixtures/harness";
 
 const PLAN_WORKSPACE = join(tmpdir(), "egress-service-plan-workspace");
 
-function destinationPlan(workspace: string, host: string, port?: number): ExecutionPlan {
+function destinationPlan(workspace: string, host: string, port?: number): ExecutionRequest {
   const destination = port === undefined ? { host } : { host, port };
-  const compiled = compileExecutionPlan({
+  return compileTestRequest({
     invocation: makeInvocation({
       cwd: workspace,
       toolName: "bash",
@@ -37,19 +33,11 @@ function destinationPlan(workspace: string, host: string, port?: number): Execut
       ],
     }),
     operation: { kind: "shell", command: "curl example" },
-    mode: "default",
-    owner: OWNER,
-    bindingId: BINDING_ID,
-    baseline: { filesystem: [{ path: workspace, access: "read", granularity: "directory" }], network: { kind: "none" } },
-    approved: { filesystem: [], network: [destination] },
-    backendId: "fixture-helper",
-    policyRevision: POLICY_REVISION,
-    configRevision: CONFIG_REVISION,
-    deadlineAt: Date.now() + 30_000,
+    workspace,
+    baselineFilesystem: [{ path: workspace, access: "read", granularity: "directory" }],
+    approved: { network: [destination] },
     environment: {},
   });
-  if (!compiled.ok) throw new Error(`${compiled.code}: ${compiled.reason}`);
-  return compiled.plan;
 }
 
 describe("EgressService", () => {
@@ -118,11 +106,9 @@ describe("EgressService", () => {
   });
   it("returns null for plans without destinations", async () => {
     const service = new EgressService();
-    const nonePlan = {
-      ...destinationPlan(PLAN_WORKSPACE, "api.example.com"),
-      network: { kind: "none" },
-    } as ExecutionPlan;
-    expect(await service.acquireForPlan(nonePlan)).toBeNull();
+    const request = destinationPlan(PLAN_WORKSPACE, "api.example.com");
+    const noDestinations = { ...request, plan: { ...request.plan, network: { kind: "none" } } } as ExecutionRequest;
+    expect(await service.acquireForPlan(noDestinations)).toBeNull();
     await service.dispose();
   });
 

@@ -150,6 +150,21 @@ function codes(snapshot: ApprovalChainConfigSnapshot): string[] {
   return snapshot.issues.map((issue) => issue.code);
 }
 
+describe("execution deny paths", () => {
+  it("combines global and trusted project paths without letting the project remove global restrictions", () => {
+    const harness = createHarness();
+    harness.writeGlobal({ execution: { denyPaths: ["private", "~/.ssh"] } });
+    harness.writeProject({ execution: { denyPaths: ["secret"] } });
+    const snapshot = snapshotOf(ownerFor(harness));
+    expect(snapshot.config.execution.denyPaths).toEqual([
+      join(harness.paths.globalConfigDir, "private"), "~/.ssh", join(harness.paths.projectConfigDir, "secret"),
+    ]);
+    expect(snapshot.source).toBe("project");
+    const untrusted = snapshotOf(ownerFor(harness, { projectTrusted: false }));
+    expect(untrusted.config.execution.denyPaths).toEqual([join(harness.paths.globalConfigDir, "private"), "~/.ssh"]);
+  });
+});
+
 function pathsFor(snapshot: ApprovalChainConfigSnapshot, code: string): string[] {
   return snapshot.issues.filter((issue) => issue.code === code).map((issue) => issue.path);
 }

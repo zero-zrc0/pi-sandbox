@@ -418,6 +418,10 @@ function normalizeFilesystemGrants(
   return normalized;
 }
 
+function normalizeDenyPaths(paths: readonly string[] | undefined, baseDir: string, platform: string): string[] | undefined {
+  return paths?.map(path => path.startsWith("~") ? path : resolveExecutionGrantPath(baseDir, path, platform) ?? path);
+}
+
 function normalizeShellPermissions(
   permissions: ShellExecutionPermissions,
   baseDir: string,
@@ -753,6 +757,9 @@ export function createApprovalChainConfigOwner(
       execution: {
         ...(network === undefined ? {} : { network }),
         ...(shell === undefined ? {} : { shell }),
+        ...(parsed.config.execution.denyPaths === undefined ? {} : {
+          denyPaths: normalizeDenyPaths(parsed.config.execution.denyPaths, paths.globalConfigDir, platform),
+        }),
       },
     });
     return { exists: true, invalid: false, config, messages };
@@ -868,6 +875,9 @@ export function createApprovalChainConfigOwner(
       execution: {
         ...(networkDeclared ? { network: network ?? NONE_NETWORK } : {}),
         ...(shellDeclared ? { shell: normalizedShell ?? NONE_SHELL } : {}),
+        ...(parsed.config.execution.denyPaths === undefined ? {} : {
+          denyPaths: normalizeDenyPaths(parsed.config.execution.denyPaths, paths.projectConfigDir, platform),
+        }),
       },
     });
     return {
@@ -1058,6 +1068,9 @@ export function createApprovalChainConfigOwner(
       }
     }
     if (projectModeAdopted) projectContributed = true;
+    if (projectLoad.kind === "valid" && (projectLoad.config?.execution.denyPaths?.length ?? 0) > 0) {
+      projectContributed = true;
+    }
 
     /* -- engine runtime merge -- */
     const projectRuntime = projectLoad.kind === "valid" && projectLoad.config !== undefined && projectLoad.raw !== undefined
@@ -1178,6 +1191,9 @@ export function createApprovalChainConfigOwner(
       execution: {
         network: effectiveNetwork,
         ...(effectiveShell === undefined ? {} : { shell: effectiveShell }),
+        ...((globalConfig.execution.denyPaths !== undefined || projectLoad.config?.execution.denyPaths !== undefined) ? {
+          denyPaths: [...(globalConfig.execution.denyPaths ?? []), ...(projectLoad.config?.execution.denyPaths ?? [])],
+        } : {}),
       },
       approval: { nodes: nodesDeclaration },
       ...(shellPolicyMerge.policy === undefined ? {} : { shellPolicy: shellPolicyMerge.policy }),

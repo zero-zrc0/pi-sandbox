@@ -832,6 +832,13 @@
             "network"
           ],
           "additionalProperties": false
+        },
+        "denyPaths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       },
       "additionalProperties": false

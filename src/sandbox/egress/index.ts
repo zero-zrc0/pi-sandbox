@@ -7,7 +7,7 @@
  * is what the native launcher uses to reach this service. The service is
  * module-internal: callers never see the registry or the sockets.
  */
-import type { ExecutionPlan } from "../types";
+import type { ExecutionRequest } from "../types";
 import { EgressLeaseRegistry, type EgressLeaseRegistryOptions } from "./leases";
 import { EgressProxyServer, type EgressProxyOptions } from "./proxy";
 import { createEgressForwarder, type EgressForwarder } from "./forwarder";
@@ -85,18 +85,19 @@ export class EgressService {
    * `destinations`. The scope snapshot is frozen here; later permission
    * changes can only revoke, never widen.
    */
-  async acquireForPlan(plan: ExecutionPlan): Promise<AcquiredEgress | null> {
+  async acquireForPlan(request: ExecutionRequest): Promise<AcquiredEgress | null> {
+    const plan = request.plan;
     if (plan.network.kind !== "destinations") return null;
     const started = await this.ensureStarted();
     if (!started.ok || this.disposed) return null;
     const binding: EgressBinding = Object.freeze({
-      sessionId: plan.sessionId,
-      requestId: plan.requestId,
+      sessionId: request.sessionId,
+      requestId: request.requestId,
       actor: "tool",
-      actorName: plan.tool.name,
+      actorName: request.toolName,
       generation: 0,
-      policyRevision: plan.policyRevision,
-      configRevision: plan.configRevision,
+      policyRevision: request.policyRevision,
+      configRevision: request.configRevision,
     });
     const scope: EgressScope = Object.freeze({
       destinations: plan.network.destinations,

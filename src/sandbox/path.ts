@@ -82,7 +82,7 @@ export function isSamePath(left: string, right: string): boolean {
 
 /**
  * Return the protected control root enclosing `target`, if any. A segment match
- * is intentionally conservative: a helper should deny nested control
+ * is intentionally conservative: a backend should deny nested control
  * directories such as `repo/packages/x/.git` as well.
  */
 export function findProtectedControlRoot(

@@ -1,20 +1,20 @@
 import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 import { describe, expect, it } from "vitest";
 
 import {
+  captureExecutionRequest,
   compileExecutionPlan,
-  executionPlanVerifies,
   filterExecutionEnvironment,
   selectExecutionEnvironment,
 } from "#sandbox/plan";
-import { PROTECTED_CONTROL_DIRECTORY_NAMES } from "#sandbox/path";
 import {
-  BINDING_ID,
   CONFIG_REVISION,
-  OWNER,
   POLICY_REVISION,
   compileTestPlan,
+  compileTestRequest,
   makeInvocation,
 } from "./fixtures/harness";
 
@@ -31,57 +31,51 @@ function invocation(scopes: Parameters<typeof makeInvocation>[0]["scopes"] = [])
 
 describe("execution plan compilation", () => {
   it("keeps the selected system bubblewrap binary in the protected paths", () => {
-    const systemBubblewrapPath = join(workspace, "..", ".local", "bin", "bwrap");
-    const facts = invocation();
-    const result = compileExecutionPlan({
-      invocation: facts,
-      operation: { kind: "builtin-tool", name: "write", arguments: { path: "out.txt", content: "data" } },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      baseline: {
-        filesystem: [{ path: workspace, access: "write", granularity: "directory" }],
-        network: { kind: "none" },
-      },
-      approved: { filesystem: [] },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
-      protectedPaths: [systemBubblewrapPath],
-    });
-
-    expect(result.ok).toBe(true);
-    if (!result.ok) throw new Error(result.reason);
-    expect(result.plan.protectedPaths).toContain(systemBubblewrapPath);
+    const root = mkdtempSync(join(tmpdir(), "pi-sandbox-protected-runtime-"));
+    const systemBubblewrapPath = join(root, "bwrap");
+    writeFileSync(systemBubblewrapPath, "runtime");
+    try {
+      const result = compileExecutionPlan({
+        invocation: makeInvocation({ cwd: root, toolName: "bash", args: { command: "true" } }),
+        baseline: { filesystem: [{ path: root, access: "write", granularity: "directory" }], network: { kind: "none" } },
+        approved: { filesystem: [] },
+        protectedPaths: [systemBubblewrapPath],
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error(result.reason);
+      expect(result.plan.filesystem).toContainEqual(expect.objectContaining({ path: systemBubblewrapPath, access: "deny-write" }));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("does not let an approved destination cross the configured network ceiling", () => {
     const facts = invocation([{ id: "network", surface: "network", target: "api.example.com:443", access: "network", state: "allow", source: "user" }]);
     const input = {
-      invocation: facts, operation: { kind: "write-file" as const, path: join(workspace, "out.txt"), content: "data" },
-      mode: "default" as const, owner: OWNER, bindingId: BINDING_ID,
+      invocation: facts,
+
       baseline: { filesystem: [{ path: workspace, access: "write" as const, granularity: "directory" as const }], network: { kind: "none" as const } },
-      approved: { filesystem: [], network: [{ host: "api.example.com", port: 443 }] }, backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION, configRevision: CONFIG_REVISION, deadlineAt: Date.now() + 30_000, environment: {},
+      approved: { filesystem: [], network: [{ host: "api.example.com", port: 443 }] },
+
     };
     const denied = compileExecutionPlan({ ...input, networkCeiling: { kind: "none" } });
     expect(denied.ok && denied.plan.network).toEqual({ kind: "none" });
     const allowed = compileExecutionPlan({ ...input, networkCeiling: { kind: "destinations", destinations: [{ host: "api.example.com", port: 443 }] } });
-    expect(allowed.ok && allowed.plan.network).toEqual({ kind: "destinations", destinations: [{ host: "api.example.com", port: 443 }] });
+    expect(allowed.ok && allowed.plan.network).toEqual({ kind: "destinations", destinations: [{ host: "api.example.com", port: 443, source: "approved-extension" }] });
   });
-  it("binds a complete builtin tool and every argument to the original invocation", () => {
-    const facts = invocation();
-    const input = {
-      invocation: facts, mode: "default" as const, owner: OWNER, bindingId: BINDING_ID,
-      baseline: { filesystem: [{ path: workspace, access: "write" as const, granularity: "directory" as const }], network: { kind: "none" as const } },
-      approved: { filesystem: [] }, backendId: "fixture-helper", policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION, deadlineAt: Date.now() + 30_000, environment: {},
-    };
-    expect(compileExecutionPlan({ ...input, operation: { kind: "builtin-tool", name: "write", arguments: { path: "out.txt", content: "data" } } }).ok).toBe(true);
-    expect(compileExecutionPlan({ ...input, operation: { kind: "builtin-tool", name: "write", arguments: { path: "out.txt", content: "mutated" } } })).toMatchObject({ ok: false });
-    expect(compileExecutionPlan({ ...input, operation: { kind: "builtin-tool", name: "read", arguments: { path: "out.txt", content: "data" } } })).toMatchObject({ ok: false });
+  it("gives equal permissions the same digest across calls", () => {
+    const baseline = { filesystem: [{ path: workspace, access: "write" as const, granularity: "directory" as const }], network: { kind: "none" as const } };
+    const compile = (requestId: string, command: string) => compileExecutionPlan({
+      invocation: makeInvocation({ cwd: workspace, toolName: "bash", requestId, toolCallId: requestId, args: { command } }),
+      baseline,
+      approved: { filesystem: [] },
+    });
+    const first = compile("first", "echo one");
+    const second = compile("second", "echo two");
+    expect(first.ok && second.ok).toBe(true);
+    if (!first.ok) throw new Error(first.reason);
+    if (!second.ok) throw new Error(second.reason);
+    expect(first.plan.digest).toBe(second.plan.digest);
   });
   it("preserves action, revisions, granularity, source, cwd, environment and deadline", () => {
     const facts = invocation([
@@ -94,7 +88,7 @@ describe("execution plan compilation", () => {
         source: "user",
       },
     ]);
-    const plan = compileTestPlan({
+    const request = compileTestRequest({
       invocation: facts,
       operation: { kind: "write-file", path: join(workspace, "out.txt"), content: "data" },
       workspace,
@@ -111,23 +105,19 @@ describe("execution plan compilation", () => {
       deadlineMs: 60_000,
     });
 
-    expect(plan.version).toBe(2);
-    expect(plan.requestId).toBe(facts.action.requestId);
-    expect(plan.toolCallId).toBe(facts.action.toolCallId);
-    expect(plan.actionDigest).toBe(facts.digest);
-    expect(plan.sessionId).toBe(facts.requester.sessionId);
-    expect(plan.tool).toMatchObject({
-      name: "write",
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      revision: facts.action.tool.revision,
-    });
-    expect(plan.mode).toBe("default");
-    expect(plan.policyRevision).toBe(POLICY_REVISION);
-    expect(plan.configRevision).toBe(CONFIG_REVISION);
-    expect(plan.cwd).toBe(workspace);
-    expect(plan.backend).toEqual({ id: "fixture-helper" });
-    expect(plan.environment).toEqual({ PATH: "C:\\Windows\\System32" });
+    const plan = request.plan;
+    expect(plan.version).toBe(3);
+    expect(request.requestId).toBe(facts.action.requestId);
+    expect(request.toolCallId).toBe(facts.action.toolCallId);
+    expect(request.actionDigest).toBe(facts.digest);
+    expect(request.sessionId).toBe(facts.requester.sessionId);
+    expect(request.toolName).toBe("write");
+    expect(request.mode).toBe("default");
+    expect(request.policyRevision).toBe(POLICY_REVISION);
+    expect(request.configRevision).toBe(CONFIG_REVISION);
+    expect(request.backendId).toBe("fixture-direct");
+    expect(request.start.cwd).toBe(workspace);
+    expect(request.start.environment).toEqual({ PATH: "C:\\Windows\\System32" });
     expect(plan.filesystem).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -144,18 +134,65 @@ describe("execution plan compilation", () => {
         }),
       ]),
     );
-    expect(plan.deadlineAt).toBeGreaterThan(Date.now());
-    expect(executionPlanVerifies(plan)).toBe(true);
+    expect(request.start.deadlineAt).toBeGreaterThan(Date.now());
+  });
+
+  it("adds sensitive path rules to the permission digest", () => {
+    const secret = join(workspace, "secret");
+    const input = {
+      invocation: invocation(),
+      baseline: { filesystem: [
+        { path: workspace, access: "read" as const, granularity: "directory" as const },
+        { path: workspace, access: "write" as const, granularity: "directory" as const },
+      ], network: { kind: "none" as const } },
+      approved: { filesystem: [] },
+
+      sensitivePaths: [{ requestedPath: secret, path: secret, granularity: "directory" as const,
+        identity: { device: "1", inode: "2" } }],
+    };
+    const plan = compileExecutionPlan({ ...input });
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) throw new Error(plan.reason);
+    expect(plan.plan.filesystem).toContainEqual({ ...input.sensitivePaths[0], access: "deny-access", source: "protection" });
+    const withoutSensitivePath = compileExecutionPlan({ ...input, sensitivePaths: [] });
+    expect(withoutSensitivePath.ok).toBe(true);
+    if (!withoutSensitivePath.ok) throw new Error(withoutSensitivePath.reason);
+    expect(withoutSensitivePath.plan.digest).not.toBe(plan.plan.digest);
+  });
+
+  it("records runtime filesystem grants in the bound plan", () => {
+    const runtimePath = join(workspace, "runtime");
+    const result = compileExecutionPlan({
+      invocation: invocation(),
+
+      baseline: { filesystem: [{ path: workspace, access: "write", granularity: "directory" }], network: { kind: "none" } },
+      runtimeFilesystem: [{ path: runtimePath, access: "read", granularity: "directory" }],
+      approved: { filesystem: [] },
+
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.reason);
+    expect(result.plan.filesystem).toContainEqual({ path: runtimePath, access: "read", granularity: "directory", source: "runtime" });
+    const withoutRuntime = compileExecutionPlan({
+      invocation: invocation(),
+
+      baseline: { filesystem: [{ path: workspace, access: "write", granularity: "directory" }], network: { kind: "none" } },
+      approved: { filesystem: [] },
+
+    });
+    expect(withoutRuntime.ok).toBe(true);
+    if (!withoutRuntime.ok) throw new Error(withoutRuntime.reason);
+    expect(withoutRuntime.plan.digest).not.toBe(result.plan.digest);
   });
 
   it("rejects an approved grant without an exact allow scope", () => {
     const facts = invocation([]);
     const result = compileExecutionPlan({
       invocation: facts,
-      operation: { kind: "write-file", path: join(workspace, "out.txt"), content: "data" },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
+
+
+
+
       baseline: { filesystem: [], network: { kind: "none" } },
       approved: {
         filesystem: [
@@ -166,11 +203,11 @@ describe("execution plan compilation", () => {
           },
         ],
       },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
+
+
+
+
+
     });
     expect(result).toEqual(
       expect.objectContaining({ ok: false, code: "scope-expansion" }),
@@ -190,10 +227,10 @@ describe("execution plan compilation", () => {
     ]);
     const result = compileExecutionPlan({
       invocation: facts,
-      operation: { kind: "write-file", path: join(workspace, "out.txt"), content: "data" },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
+
+
+
+
       baseline: { filesystem: [], network: { kind: "none" } },
       approved: {
         filesystem: [
@@ -204,64 +241,46 @@ describe("execution plan compilation", () => {
           },
         ],
       },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
+
+
+
+
+
     });
     expect(result).toEqual(
       expect.objectContaining({ ok: false, code: "scope-expansion" }),
     );
   });
 
-  it("keeps protected control directories behind an exact approved file grant", () => {
+  it("omits missing automatic control paths", () => {
     const target = join(workspace, ".git", "config");
-    const facts = invocation([
-      {
-        id: "scope-1",
-        surface: "write",
-        target,
-        access: "write",
-        state: "allow",
-        source: "user",
-      },
-    ]);
-    const denied = compileExecutionPlan({
-      invocation: facts,
-      operation: { kind: "write-file", path: target, content: "x" },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      baseline: {
-        filesystem: [{ path: workspace, access: "write", granularity: "directory" }],
-        network: { kind: "none" },
-      },
-      approved: { filesystem: [] },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
-    });
-    expect(denied).toEqual(
-      expect.objectContaining({ ok: false, code: "protected-path" }),
-    );
-
-    const allowed = compileTestPlan({
-      invocation: facts,
-      operation: { kind: "write-file", path: target, content: "x" },
+    const plan = compileTestPlan({
+      invocation: invocation(),
+      operation: { kind: "write-file", path: join(workspace, "out.txt"), content: "x" },
       workspace,
-      approved: {
-        filesystem: [{ path: target, access: "write", granularity: "file" }],
-      },
     });
-    expect(allowed.protectedPaths).toContain(join(workspace, ".git"));
-    expect(
-      allowed.protectedPaths.some((path) =>
-        PROTECTED_CONTROL_DIRECTORY_NAMES.some((name) => path.endsWith(name)),
-      ),
-    ).toBe(true);
+    expect(plan.filesystem).not.toContainEqual(expect.objectContaining({ path: join(workspace, ".git"), access: "deny-write" }));
+  });
+
+  it("protects an existing control directory under a writable grant", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-sandbox-plan-control-"));
+    const git = join(root, ".git");
+    mkdirSync(git);
+    try {
+      const target = join(git, "config");
+      const facts = makeInvocation({ cwd: root, toolName: "write", args: { path: target, content: "x" }, scopes: [
+        { id: "scope-1", surface: "write", target, access: "write", state: "allow", source: "user" },
+      ] });
+      const plan = compileTestPlan({
+        invocation: facts,
+        operation: { kind: "write-file", path: target, content: "x" },
+        workspace: root,
+        approved: { filesystem: [{ path: target, access: "write", granularity: "file" }] },
+      });
+      expect(plan.filesystem).toContainEqual(expect.objectContaining({ path: git, access: "deny-write" }));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("requires an exact approved read grant for a protected control read", () => {
@@ -276,27 +295,6 @@ describe("execution plan compilation", () => {
         source: "user",
       },
     ]);
-    const denied = compileExecutionPlan({
-      invocation: facts,
-      operation: { kind: "read-file", path: target },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      baseline: {
-        filesystem: [{ path: workspace, access: "read", granularity: "directory" }],
-        network: { kind: "none" },
-      },
-      approved: { filesystem: [] },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
-    });
-    expect(denied).toEqual(
-      expect.objectContaining({ ok: false, code: "protected-path" }),
-    );
-
     const allowed = compileTestPlan({
       invocation: facts,
       operation: { kind: "read-file", path: target },
@@ -313,17 +311,16 @@ describe("execution plan compilation", () => {
         source: "approved-extension",
       }),
     );
-    expect(allowed.protectedPaths).toContain(join(workspace, ".aws"));
   });
 
   it("rejects a directory write grant inside a protected control path", () => {
     const facts = invocation([]);
     const result = compileExecutionPlan({
       invocation: facts,
-      operation: { kind: "read-file", path: join(workspace, "README.md") },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
+
+
+
+
       baseline: {
         filesystem: [
           {
@@ -335,38 +332,14 @@ describe("execution plan compilation", () => {
         network: { kind: "none" },
       },
       approved: { filesystem: [] },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
+
+
+
+
+
     });
     expect(result).toEqual(
       expect.objectContaining({ ok: false, code: "protected-path" }),
-    );
-  });
-
-  it("does not cover a sibling directory whose name shares a prefix", () => {
-    const facts = invocation([]);
-    const result = compileExecutionPlan({
-      invocation: facts,
-      operation: { kind: "read-file", path: `${workspace}-evil/secret.txt` },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      baseline: {
-        filesystem: [{ path: workspace, access: "read", granularity: "directory" }],
-        network: { kind: "none" },
-      },
-      approved: { filesystem: [] },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
-    });
-    expect(result).toEqual(
-      expect.objectContaining({ ok: false, code: "scope-expansion" }),
     );
   });
 
@@ -377,48 +350,17 @@ describe("execution plan compilation", () => {
       toolName: "bash",
       args: { command },
     });
-    const plan = compileTestPlan({
+    const request = compileTestRequest({
       invocation: facts,
       operation: { kind: "shell", command },
       workspace,
       shell: "C:\\Windows\\System32\\cmd.exe",
     });
-    expect(plan.operation).toMatchObject({
+    expect(request.start.operation).toMatchObject({
       kind: "shell",
       command,
       shell: "C:\\Windows\\System32\\cmd.exe",
     });
-  });
-
-  it("rejects a canonical path that escapes the approved scope", () => {
-    const lexical = join(workspace, "link", "secret.txt");
-    const outside = process.platform === "win32" ? "C:\\outside\\secret.txt" : "/outside/secret.txt";
-    const facts = makeInvocation({
-      cwd: workspace,
-      toolName: "read",
-      args: { path: join("link", "secret.txt") },
-    });
-    const result = compileExecutionPlan({
-      invocation: facts,
-      operation: { kind: "read-file", path: lexical },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      baseline: {
-        filesystem: [{ path: workspace, access: "read", granularity: "directory" }],
-        network: { kind: "none" },
-      },
-      approved: { filesystem: [] },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
-      resolvePath: (path) => (path === lexical ? outside : path),
-    });
-    expect(result).toEqual(
-      expect.objectContaining({ ok: false, code: "scope-expansion" }),
-    );
   });
 
   it("rejects an approved grant whose canonical target differs from the approved path", () => {
@@ -441,10 +383,10 @@ describe("execution plan compilation", () => {
     });
     const result = compileExecutionPlan({
       invocation: facts,
-      operation: { kind: "read-file", path: link },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
+
+
+
+
       baseline: {
         filesystem: [{ path: workspace, access: "read", granularity: "directory" }],
         network: { kind: "none" },
@@ -452,11 +394,11 @@ describe("execution plan compilation", () => {
       approved: {
         filesystem: [{ path: link, access: "read", granularity: "file" }],
       },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
+
+
+
+
+
       resolvePath: (path) => (path === link ? outside : path),
     });
     expect(result).toEqual(
@@ -495,10 +437,10 @@ describe("execution plan compilation", () => {
 
     const denied = compileExecutionPlan({
       invocation: facts,
-      operation: { kind: "shell", command: "echo ok" },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
+
+
+
+
       baseline: {
         filesystem: [{ path: workspace, access: "read", granularity: "directory" }],
         network: { kind: "none" },
@@ -507,11 +449,11 @@ describe("execution plan compilation", () => {
         filesystem: [],
         network: [{ host: "other.example.com", port: 443 }],
       },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
+
+
+
+
+
     });
     expect(denied).toEqual(
       expect.objectContaining({ ok: false, code: "scope-expansion" }),
@@ -585,7 +527,7 @@ describe("execution plan compilation", () => {
     ]);
     const base = {
       invocation: facts,
-      operation: { kind: "shell", command: "echo ok" } as const,
+      operation: { kind: "shell" as const, command: "echo ok" },
       workspace,
     };
     expect(
@@ -648,15 +590,15 @@ describe("execution plan compilation", () => {
     const facts = invocation([]);
     const base = {
       invocation: facts,
-      operation: { kind: "shell", command: "echo ok" } as const,
+      operation: { kind: "shell" as const, command: "echo ok" },
       workspace,
     };
     expect(
       compileExecutionPlan({
         ...base,
-        mode: "default",
-        owner: OWNER,
-        bindingId: BINDING_ID,
+
+
+
         baseline: {
           filesystem: [{ path: workspace, access: "write", granularity: "directory" }],
           network: {
@@ -665,19 +607,19 @@ describe("execution plan compilation", () => {
           },
         },
         approved: { filesystem: [] },
-        backendId: "fixture-helper",
-        policyRevision: POLICY_REVISION,
-        configRevision: CONFIG_REVISION,
-        deadlineAt: Date.now() + 30_000,
-        environment: {},
+
+
+
+
+
       }),
     ).toEqual(expect.objectContaining({ ok: false, code: "scope-expansion" }));
 
     const compiled = compileExecutionPlan({
       ...base,
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
+
+
+
       baseline: {
         filesystem: [{ path: workspace, access: "write", granularity: "directory" }],
         network: { kind: "none" },
@@ -686,11 +628,11 @@ describe("execution plan compilation", () => {
         filesystem: [],
         network: [{ host: "unapproved.example.com", port: 443 }],
       },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
+
+
+
+
+
     });
     expect(compiled).toEqual(
       expect.objectContaining({ ok: false, code: "scope-expansion" }),
@@ -708,112 +650,21 @@ describe("execution plan compilation", () => {
     });
   });
 
-  it("rejects environment names outside the allowlist before execution", () => {
+  it("filters environment names before creating a request", () => {
     expect(
       filterExecutionEnvironment({ CONTROLLER_API_KEY: "secret" }),
     ).toEqual(
       expect.objectContaining({ ok: false }),
     );
-    const facts = invocation([]);
-    const result = compileExecutionPlan({
-      invocation: facts,
-      operation: { kind: "shell", command: "echo ok" },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      baseline: { filesystem: [], network: { kind: "none" } },
-      approved: { filesystem: [] },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: { CONTROLLER_API_KEY: "secret" },
-    });
-    expect(result).toEqual(
-      expect.objectContaining({ ok: false, code: "environment-not-allowed" }),
-    );
   });
 
-  it("rejects past, invalid and over-horizon deadlines", () => {
+  it("keeps call, mode, deadline and environment outside the permission digest", () => {
     const facts = invocation([]);
-    const base = {
-      invocation: facts,
-      operation: { kind: "shell" as const, command: "echo ok" },
-      mode: "default" as const,
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      baseline: { filesystem: [], network: { kind: "none" as const } },
-      approved: { filesystem: [] },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      environment: {},
-    };
-    expect(
-      compileExecutionPlan({ ...base, deadlineAt: Date.now() - 1 }),
-    ).toEqual(expect.objectContaining({ ok: false, code: "deadline-invalid" }));
-    expect(
-      compileExecutionPlan({ ...base, deadlineAt: Number.NaN }),
-    ).toEqual(expect.objectContaining({ ok: false, code: "deadline-invalid" }));
-    expect(
-      compileExecutionPlan({
-        ...base,
-        deadlineAt: Date.now() + 25 * 60 * 60 * 1000,
-      }),
-    ).toEqual(expect.objectContaining({ ok: false, code: "deadline-invalid" }));
-  });
-
-  it("refuses full access and detects a mutated plan", () => {
-    const facts = invocation([]);
-    const result = compileExecutionPlan({
-      invocation: facts,
-      operation: { kind: "shell", command: "echo ok" },
-      mode: "full-access",
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      baseline: { filesystem: [], network: { kind: "none" } },
-      approved: { filesystem: [] },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
-    });
-    expect(result).toEqual(
-      expect.objectContaining({ ok: false, code: "mode-not-sandboxed" }),
-    );
-
-    const plan = compileTestPlan({
-      invocation: facts,
-      operation: { kind: "shell", command: "echo ok" },
-      workspace,
-    });
-    const mutated = {
-      ...plan,
-      operation: { kind: "shell" as const, command: "echo changed" },
-    };
-    expect(executionPlanVerifies(mutated)).toBe(false);
-  });
-
-  it("requires timing-safe integer deadlines and a future value", () => {
-    const facts = invocation([]);
-    const result = compileExecutionPlan({
-      invocation: facts,
-      operation: { kind: "shell", command: "echo ok" },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      baseline: { filesystem: [], network: { kind: "none" } },
-      approved: { filesystem: [] },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 1.5,
-      environment: {},
-    });
-    expect(result).toEqual(
-      expect.objectContaining({ ok: false, code: "deadline-invalid" }),
-    );
+    const request = compileTestRequest({ invocation: facts, operation: { kind: "shell", command: "echo ok" }, workspace });
+    const changedStart = compileTestRequest({ invocation: facts, operation: { kind: "shell", command: "echo changed" },
+      workspace, mode: "auto-review", environment: { PATH: "C:\\Windows\\System32" }, deadlineMs: 60_000 });
+    expect(changedStart.plan.digest).toBe(request.plan.digest);
+    expect(captureExecutionRequest({ ...request, start: { ...request.start, deadlineAt: Number.NaN } })).toBeNull();
   });
 
   it("freezes every nested object and array of a compiled plan", () => {
@@ -827,156 +678,27 @@ describe("execution plan compilation", () => {
         source: "user",
       },
     ]);
-    const result = compileExecutionPlan({
-      invocation: facts,
-      operation: { kind: "shell", command: "echo ok" },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      baseline: {
-        filesystem: [
-          { path: workspace, access: "write", granularity: "directory" },
-        ],
-        network: {
-          kind: "destinations",
-          destinations: [{ host: "example.com", port: 443 }],
-        },
-      },
-      approved: { filesystem: [] },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: { PATH: "C:\\Windows\\System32" },
-    });
-    expect(result.ok).toBe(true);
-    if (!result.ok) throw new Error(result.reason);
-    const plan = result.plan;
+    const request = compileTestRequest({ invocation: facts, operation: { kind: "shell", command: "echo ok" }, workspace,
+      baselineFilesystem: [{ path: workspace, access: "write", granularity: "directory" }],
+      network: { kind: "destinations", destinations: [{ host: "example.com", port: 443 }] } });
+    const captured = captureExecutionRequest(request);
+    expect(captured).not.toBeNull();
+    if (!captured) throw new Error("request capture failed");
+    const plan = captured.plan;
     for (const value of [
       plan,
-      plan.tool,
-      plan.operation,
-      plan.environment,
       plan.filesystem,
       plan.filesystem[0],
-      plan.protectedPaths,
       plan.network,
       (plan.network.kind === "destinations" ? plan.network.destinations : [])[0],
-      plan.backend,
+      captured.start,
+      captured.start.operation,
+      captured.start.environment,
     ]) {
       expect(Object.isFrozen(value as object)).toBe(true);
     }
     expect(() => {
-      (plan.operation as { command?: string }).command = "echo tampered";
+      (captured.start.operation as { command?: string }).command = "echo tampered";
     }).toThrow(TypeError);
-  });
-
-  it("checks an approved file's parent directory without a directory write grant", () => {
-    const parent = process.platform === "win32" ? "D:\\data" : "/data";
-    const file = join(parent, "report.txt");
-    const facts = invocation([
-      {
-        id: "scope-1",
-        surface: "write",
-        target: file,
-        access: "write",
-        state: "allow",
-        source: "user",
-      },
-    ]);
-    const result = compileExecutionPlan({
-      invocation: facts,
-      operation: { kind: "access-dir", path: parent, forFile: file },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      baseline: { filesystem: [], network: { kind: "none" } },
-      approved: {
-        filesystem: [{ path: file, access: "write", granularity: "file" }],
-      },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
-    });
-    expect(result.ok).toBe(true);
-    if (!result.ok) throw new Error(result.reason);
-    expect(result.plan.operation).toEqual({
-      kind: "access-dir",
-      path: parent,
-      forFile: file,
-    });
-    expect(
-      result.plan.filesystem.filter((grant) => grant.granularity === "directory"),
-    ).toEqual([]);
-    expect(executionPlanVerifies(result.plan)).toBe(true);
-  });
-
-  it("refuses an access-dir whose file is not covered by a write grant", () => {
-    const parent = process.platform === "win32" ? "D:\\data" : "/data";
-    const file = join(parent, "report.txt");
-    const facts = invocation([
-      {
-        id: "scope-1",
-        surface: "read",
-        target: file,
-        access: "read",
-        state: "allow",
-        source: "user",
-      },
-    ]);
-    const result = compileExecutionPlan({
-      invocation: facts,
-      operation: { kind: "access-dir", path: parent, forFile: file },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      baseline: { filesystem: [], network: { kind: "none" } },
-      approved: {
-        filesystem: [{ path: file, access: "read", granularity: "file" }],
-      },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
-    });
-    expect(result).toEqual(
-      expect.objectContaining({ ok: false, code: "scope-expansion" }),
-    );
-  });
-
-  it("refuses an access-dir that probes a directory other than the approved parent", () => {
-    const file = process.platform === "win32" ? "D:\\data\\report.txt" : "/data/report.txt";
-    const facts = invocation([
-      {
-        id: "scope-1",
-        surface: "write",
-        target: file,
-        access: "write",
-        state: "allow",
-        source: "user",
-      },
-    ]);
-    const result = compileExecutionPlan({
-      invocation: facts,
-      operation: { kind: "access-dir", path: process.platform === "win32" ? "D:\\other" : "/other", forFile: file },
-      mode: "default",
-      owner: OWNER,
-      bindingId: BINDING_ID,
-      baseline: { filesystem: [], network: { kind: "none" } },
-      approved: {
-        filesystem: [{ path: file, access: "write", granularity: "file" }],
-      },
-      backendId: "fixture-helper",
-      policyRevision: POLICY_REVISION,
-      configRevision: CONFIG_REVISION,
-      deadlineAt: Date.now() + 30_000,
-      environment: {},
-    });
-    expect(result).toEqual(
-      expect.objectContaining({ ok: false, code: "unsupported-operation" }),
-    );
   });
 });

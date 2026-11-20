@@ -53,6 +53,7 @@ export const shellExecutionPermissionsSchema = z.strictObject({
 export const executionConfigSchema = z.strictObject({
   network: networkScopeSchema.optional(),
   shell: shellExecutionPermissionsSchema.optional(),
+  denyPaths: z.array(nonEmptyStringSchema).optional(),
 });
 
 export type NetworkScope = z.infer<typeof networkScopeSchema>;
