@@ -562,6 +562,7 @@ export function validateOperationPermissions(input: {
   const readable: string[] = [];
   const writable: string[] = [];
   const operation = input.operation;
+  let accessDirForFile: string | undefined;
   if (operation.kind === "builtin-tool") {
     if (operation.name === "bash" || operation.name === "powershell") return { ok: true, additionalProtectedPaths: [] };
     const path = operation.arguments.path;
@@ -576,12 +577,7 @@ export function validateOperationPermissions(input: {
     readable.push(operation.path);
     if (operation.mode === "read-write") writable.push(operation.path);
   } else if (operation.kind === "write-file" || operation.kind === "mkdir") writable.push(operation.path);
-  else if (operation.kind === "access-dir") {
-    const grants = [...input.baseline.filesystem, ...input.approved.filesystem, ...input.runtime];
-    if (!grants.some(grant => grant.access === "write" && grantCoversTarget(grant, operation.forFile))) {
-      return { ok: false, code: "scope-expansion", reason: `parent directory check has no write grant for its approved file: ${operation.forFile}` };
-    }
-  }
+  else if (operation.kind === "access-dir") accessDirForFile = operation.forFile;
 
   const canonicalize = (source: readonly FilesystemGrantInput[]): FilesystemGrantInput[] | null => {
     const result: FilesystemGrantInput[] = [];
@@ -599,17 +595,26 @@ export function validateOperationPermissions(input: {
   const runtime = canonicalize(input.runtime);
   if (!baseline || !approved || !runtime) return { ok: false, code: "invalid-plan", reason: "filesystem grant is invalid or cannot be resolved" };
   const grants = [...baseline, ...approved, ...runtime];
+  if (operation.kind === "access-dir") {
+    const forFile = resolveExecutionPath(accessDirForFile ?? "", ".", input.resolvePath);
+    if (!forFile) return { ok: false, code: "invalid-plan", reason: "parent directory check file path cannot be resolved" };
+    if (!grants.some(grant => grant.access === "write" && grantCoversTarget(grant, forFile))) {
+      return { ok: false, code: "scope-expansion", reason: `parent directory check has no write grant for its approved file: ${forFile}` };
+    }
+  }
   const protectedNames = input.protectedControlNames ?? PROTECTED_CONTROL_DIRECTORY_NAMES;
   const additionalProtectedPaths = new Set<string>();
   for (const { targets, access } of [{ targets: readable, access: "read" as const }, { targets: writable, access: "write" as const }]) {
     for (const target of targets) {
-      if (!grants.some(grant => grant.access === access && grantCoversTarget(grant, target))) {
-        return { ok: false, code: "scope-expansion", reason: `${access} target is outside the approved scope: ${target}` };
+      const canonicalTarget = resolveExecutionPath(target, ".", input.resolvePath);
+      if (!canonicalTarget) return { ok: false, code: "invalid-plan", reason: `${access} target cannot be resolved` };
+      if (!grants.some(grant => grant.access === access && grantCoversTarget(grant, canonicalTarget))) {
+        return { ok: false, code: "scope-expansion", reason: `${access} target is outside the approved scope: ${canonicalTarget}` };
       }
-      const protectedRoot = findProtectedControlRoot(target, protectedNames);
+      const protectedRoot = findProtectedControlRoot(canonicalTarget, protectedNames);
       if (!protectedRoot) continue;
       const exactApprovedFile = approved.some(grant => grant.access === access && grant.granularity === "file" &&
-        isSamePath(grant.path, target));
+        isSamePath(grant.path, canonicalTarget));
       if (!exactApprovedFile) return { ok: false, code: "protected-path", reason: `protected control path requires an explicit ${access} approval: ${protectedRoot}` };
       if (access === "write") additionalProtectedPaths.add(protectedRoot);
     }

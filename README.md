@@ -55,7 +55,7 @@ OS 沙箱默认关闭。安装、加载扩展和打开设置不会下载或启�
 }
 ```
 
-Linux 和 Windows 的运行文件与全局审批链配置共用目录：`<agentDir>/extensions/pi-sandbox/runtimes/<platform>-<arch>/`（macOS 没有运行包目录）。每个平台架构只保留一个运行目录，运行时版本记录在 `runtime.json`。默认 `agentDir` 为 `~/.pi/agent`；设置 `PI_CODING_AGENT_DIR` 后使用自定义 agent 目录。手动下载的运行包也放在此处，不放进 npm 包目录或项目配置目录。Sandbox 启用时会按扩展随附的可信目录检查兼容版本；缺少运行时仍需确认下载，已安装运行时的更新会在暂存目录验证并探测后替换。若本地没有兼容运行时，且可信目录也没有兼容条目，状态会显示 unavailable。Linux x64 和 ARM64 运行包使用 musl 静态原生文件，并自带 `bwrap` 作为回退；助手优先使用 `PATH` 中位于工作区外、通过所需参数和 user namespace 探测的系统 `bwrap`，不兼容时再用随包版本。内核仍须允许 user namespace，并满足 Landlock、seccomp 能力。
+Linux 和 Windows 的运行文件与全局审批链配置共用目录：`<agentDir>/extensions/pi-sandbox/runtimes/<platform>-<arch>/`（macOS 没有运行包目录）。每个平台架构只保留一个运行目录，运行时版本记录在 `runtime.json`。默认 `agentDir` 为 `~/.pi/agent`；设置 `PI_CODING_AGENT_DIR` 后使用自定义 agent 目录。手动下载的运行包也放在此处，不放进 npm 包目录或项目配置目录。Sandbox 启用时会按扩展随附的可信目录检查兼容版本；缺少运行时仍需确认下载，已安装运行时的更新会在暂存目录验证并探测后替换。若本地没有兼容运行时，且可信目录也没有兼容条目，状态会显示 unavailable。Linux x64 和 ARM64 运行包使用 musl 静态原生文件，并自带 `bwrap` 作为回退；Linux 后端优先使用 `PATH` 中位于工作区外、通过所需参数和 user namespace 探测的系统 `bwrap`，不兼容时再用随包版本。内核仍须允许 user namespace，并满足 Landlock、seccomp 能力。
 
 
 ## 从哪个文件开始读

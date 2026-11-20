@@ -65,6 +65,7 @@ export function collectSensitivePaths(input: {
   readonly home?: string;
   readonly environment?: NodeJS.ProcessEnv;
   readonly platform?: NodeJS.Platform;
+  readonly systemPaths?: readonly string[];
 }): readonly SensitivePath[] {
   const home = input.home ?? homedir();
   const env = input.environment ?? process.env;
@@ -81,7 +82,7 @@ export function collectSensitivePaths(input: {
     ...(platform === "darwin" ? [
       ...[".azure", ".config", ".docker", ".kube", ".npmrc", ".pypirc", ".pi/agent/auth.json",
         "Library/Keychains", "Library/Application Support/com.apple.TCC/TCC.db"].map(name => join(home, name)),
-      ...MACOS_SYSTEM_PATHS.map(entry => entry.path),
+      ...(input.systemPaths ?? MACOS_SYSTEM_PATHS.map(entry => entry.path)),
     ] : []),
   ];
   const records: SensitivePath[] = [];

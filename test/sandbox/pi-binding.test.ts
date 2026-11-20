@@ -54,17 +54,21 @@ describe("operation binding to the approved action", () => {
     const controlFile = join(root, ".git", "config");
     mkdirSync(dirname(controlFile), { recursive: true });
     writeFileSync(controlFile, "fixture");
+    const canonicalRoot = `${root}-canonical`;
+    const resolvePath = (path: string) => path.startsWith(root)
+      ? `${canonicalRoot}${path.slice(root.length)}`
+      : resolveHostPathIdentity(path);
     try {
       const operation: ExecutionOperation = { kind: "read-file", path: controlFile };
       const baseline = { filesystem: [{ path: root, access: "read" as const, granularity: "directory" as const }], network: { kind: "none" as const } };
-      const denied = validateOperationPermissions({ operation, baseline, approved: { filesystem: [] }, runtime: [], resolvePath: resolveHostPathIdentity });
+      const denied = validateOperationPermissions({ operation, baseline, approved: { filesystem: [] }, runtime: [], resolvePath });
       expect(denied).toMatchObject({ ok: false, code: "protected-path" });
       const approved = validateOperationPermissions({ operation, baseline,
         approved: { filesystem: [{ path: controlFile, access: "read", granularity: "file" }] }, runtime: [],
-        resolvePath: resolveHostPathIdentity });
+        resolvePath });
       expect(approved).toEqual({ ok: true, additionalProtectedPaths: [] });
       const outside = validateOperationPermissions({ operation: { kind: "read-file", path: join(root, "..", "outside.txt") },
-        baseline, approved: { filesystem: [] }, runtime: [], resolvePath: resolveHostPathIdentity });
+        baseline, approved: { filesystem: [] }, runtime: [], resolvePath });
       expect(outside).toMatchObject({ ok: false, code: "scope-expansion" });
     } finally {
       rmSync(root, { recursive: true, force: true });

@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { collectSensitivePaths, sensitivePathIdentityMatches } from "#sandbox/sensitive-paths";
+import { normalizeHostPath } from "#sandbox/path";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -16,7 +17,11 @@ function fixture() {
   const agentDirectory = join(root, "agent");
   mkdirSync(home);
   mkdirSync(agentDirectory);
-  return { root, home, agentDirectory, cwd: root, environment: {} };
+  return { root, home, agentDirectory, cwd: root, environment: {}, systemPaths: [] };
+}
+
+function canonical(path: string): string {
+  return normalizeHostPath(realpathSync.native(path))!;
 }
 
 describe("sensitive path collection", () => {
@@ -30,13 +35,22 @@ describe("sensitive path collection", () => {
     const paths = collectSensitivePaths({ ...input, environment: { GH_CONFIG_DIR: github },
       denyPaths: ["~/private.txt", join(input.home, ".ssh")] });
     expect(paths.map(({ path, granularity }) => ({ path, granularity }))).toEqual(expect.arrayContaining([
-      { path: join(input.agentDirectory, "auth.json"), granularity: "file" },
-      { path: join(input.home, ".ssh"), granularity: "directory" },
-      { path: join(input.home, "private.txt"), granularity: "file" },
-      { path: github, granularity: "directory" },
+      { path: canonical(join(input.agentDirectory, "auth.json")), granularity: "file" },
+      { path: canonical(join(input.home, ".ssh")), granularity: "directory" },
+      { path: canonical(join(input.home, "private.txt")), granularity: "file" },
+      { path: canonical(github), granularity: "directory" },
     ]));
     expect(paths).toHaveLength(4);
     expect(paths.every(entry => /^\d+$/u.test(entry.identity.device) && /^\d+$/u.test(entry.identity.inode))).toBe(true);
+  });
+
+  it("uses the supplied macOS system path list", () => {
+    const input = fixture();
+    const systemFile = join(input.root, "system-auth.db");
+    writeFileSync(systemFile, "fixture");
+    const [entry] = collectSensitivePaths({ ...input, platform: "darwin",
+      systemPaths: [systemFile] });
+    expect(entry).toMatchObject({ path: canonical(systemFile), granularity: "file" });
   });
 
   it("omits absent built-ins and reports a missing explicitly configured path", () => {
@@ -48,12 +62,16 @@ describe("sensitive path collection", () => {
   it("detects replacement of a protected object after collection", () => {
     const input = fixture();
     const target = join(input.root, "secret");
+    const replacement = join(input.root, "replacement");
     writeFileSync(target, "first");
+    writeFileSync(replacement, "replacement");
     const [entry] = collectSensitivePaths({ ...input, denyPaths: [target] });
+    const [replacementEntry] = collectSensitivePaths({ ...input, denyPaths: [replacement] });
     expect(entry).toBeDefined();
+    expect(replacementEntry?.identity).not.toEqual(entry?.identity);
     expect(sensitivePathIdentityMatches(entry!)).toBe(true);
     renameSync(target, join(input.root, "previous"));
-    writeFileSync(target, "replacement");
+    renameSync(replacement, target);
     expect(sensitivePathIdentityMatches(entry!)).toBe(false);
   });
 
