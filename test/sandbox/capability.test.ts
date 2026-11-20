@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import { shellSandboxCapability } from "#sandbox/capability";
-import type { RequiredCapabilities } from "#sandbox/helper";
-import type { HelperProbeResult } from "#sandbox/lifecycle";
+import type { RequiredCapabilities } from "#sandbox/backend/capabilities";
+import type { BackendProbeResult } from "#sandbox/lifecycle";
 import type { BackendCapabilities } from "#sandbox/types";
 import { makeInvocation } from "./fixtures/harness";
 
@@ -12,6 +12,7 @@ const requirements: RequiredCapabilities = {
   fileGranularity: true,
   protectedPaths: true,
   environment: true,
+  metadataRead: "all",
   network: "domains",
   cancel: true,
   streamOutput: true,
@@ -26,6 +27,7 @@ const capabilities: BackendCapabilities = {
     granularity: "file",
     protectedPaths: true,
     environment: true,
+    metadataRead: "all",
   },
   network: "domains",
   cancel: true,
@@ -55,9 +57,8 @@ describe("assessment capability adapter", () => {
     const result = shellSandboxCapability({
       probe: {
         status: "available",
-        backend: { id: "fixture-helper", version: "1.0.0" },
+        backend: { id: "fixture-direct", version: "1.0.0" },
         capabilities,
-        protocolVersion: 2,
       },
       requirements,
       boundary: "windows-restricted-token",
@@ -77,12 +78,11 @@ describe("assessment capability adapter", () => {
     const coarse = shellSandboxCapability({
       probe: {
         status: "available",
-        backend: { id: "fixture-helper", version: "1.0.0" },
+        backend: { id: "fixture-direct", version: "1.0.0" },
         capabilities: { ...capabilities, processTree: false },
-        protocolVersion: 2,
       },
       requirements,
-      boundary: "fixture-helper",
+      boundary: "fixture-direct",
       ...proof,
     });
     expect(coarse).toMatchObject({
@@ -92,9 +92,9 @@ describe("assessment capability adapter", () => {
     });
     expect(coarse.reason).toContain("process-tree");
 
-    const missing: HelperProbeResult = {
-      status: "missing",
-      reason: "helper installation directory is missing",
+    const missing: BackendProbeResult = {
+      status: "unavailable",
+      reason: "native backend is unavailable",
     };
     expect(
       shellSandboxCapability({
@@ -117,9 +117,8 @@ describe("assessment capability adapter", () => {
       shellSandboxCapability({
         probe: {
           status: "available",
-          backend: { id: "fixture-helper", version: "1.0.0" },
+          backend: { id: "fixture-direct", version: "1.0.0" },
           capabilities,
-          protocolVersion: 2,
         },
         requirements,
         boundary: " ",

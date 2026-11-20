@@ -59,7 +59,7 @@ manifest = {
     "stable": True,
     "platform": "linux",
     "arch": arch,
-    "protocolVersion": 2,
+    "protocolVersion": 3,
     "minPluginVersion": min_plugin,
     "maxPluginVersionExclusive": max_plugin,
     "backendId": "linux-bwrap-landlock-seccomp",

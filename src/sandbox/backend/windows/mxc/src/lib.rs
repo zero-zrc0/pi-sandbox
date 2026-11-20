@@ -64,7 +64,7 @@ pub fn compile_policy_with_proxy(plan: &Value, proxy_port: Option<u16>) -> Resul
                 .get("access")
                 .and_then(Value::as_str)
                 .ok_or("invalid grant access")?;
-            if access != "read" && access != "write" {
+            if access != "read" && access != "write" && access != "deny-write" && access != "deny-access" {
                 return Err("invalid grant access");
             }
             let directory = match value.get("granularity").and_then(Value::as_str) {
@@ -97,7 +97,7 @@ pub fn compile_policy_with_proxy(plan: &Value, proxy_port: Option<u16>) -> Resul
         network_proxy: ProxyConfig { address: proxy_port.map(|port| ProxyAddress::new("127.0.0.1".into(), port)) },
         ..Default::default()
     };
-    for grant in &grants {
+    for grant in grants.iter().filter(|grant| grant.access == "read" || grant.access == "write") {
         if grant.access == "write" {
             if !grants
                 .iter()
@@ -110,32 +110,20 @@ pub fn compile_policy_with_proxy(plan: &Value, proxy_port: Option<u16>) -> Resul
             policy.readonly_paths.push(grant.path.to_owned());
         }
     }
-    for value in plan
-        .get("protectedPaths")
-        .and_then(Value::as_array)
-        .ok_or("missing protected paths")?
-    {
-        let path = value.as_str().ok_or("invalid protected path")?;
-        if !valid_path(path) {
-            return Err("invalid protected path");
+    for restriction in grants.iter().filter(|grant| grant.access == "deny-write")
+        .chain(grants.iter().filter(|grant| grant.access == "deny-access")) {
+        if restriction.access == "deny-write" && !grants.iter().any(|grant| grant.access == "write" &&
+            (contains(grant, restriction.path, restriction.directory) || contains(restriction, grant.path, grant.directory))) {
+            continue;
         }
-        let protected = Grant {
-            path,
-            access: "read",
-            directory: true,
-        };
-        if grants.iter().any(|grant| {
-            grant.access == "write" && contains(&protected, grant.path, grant.directory)
-        }) {
-            return Err("write grant conflicts with protected path");
-        }
-        if grants
-            .iter()
-            .any(|grant| grant.access == "read" && contains(grant, path, false))
-        {
-            policy.readonly_paths.push(path.to_owned());
+        policy.readwrite_paths.retain(|path| !contains(restriction, path, false));
+        if restriction.access == "deny-access" {
+            policy.readonly_paths.retain(|path| !contains(restriction, path, false));
+            policy.denied_paths.push(restriction.path.to_owned());
+        } else if grants.iter().any(|grant| grant.access == "read" && contains(grant, restriction.path, false)) {
+            policy.readonly_paths.push(restriction.path.to_owned());
         } else {
-            policy.denied_paths.push(path.to_owned());
+            policy.denied_paths.push(restriction.path.to_owned());
         }
     }
     policy.readonly_paths.retain(|path| {

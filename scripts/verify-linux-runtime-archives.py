@@ -58,7 +58,7 @@ for arch in ("x64", "arm64"):
             fail(f"{arch} runtime manifest sidecar differs from the archive")
         if manifest.get("schemaVersion") != 1 or manifest.get("stable") is not True or \
            manifest.get("version") != runtime_version or manifest.get("platform") != "linux" or \
-           manifest.get("arch") != arch or manifest.get("protocolVersion") != 2 or \
+           manifest.get("arch") != arch or manifest.get("protocolVersion") != 3 or \
            manifest.get("minPluginVersion") != min_plugin or \
            manifest.get("maxPluginVersionExclusive") != max_plugin or \
            manifest.get("backendId") != "linux-bwrap-landlock-seccomp" or \

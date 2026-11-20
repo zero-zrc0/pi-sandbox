@@ -29,6 +29,7 @@
 
 #define MAX_RULES 256
 #define MAX_BINDS 128
+#define MAX_MASKS 128
 #define MAX_ENV 128
 #define MAX_ARGS 2048
 #define MAX_FILE_BYTES (4U * 1024U * 1024U)
@@ -93,6 +94,13 @@ struct Bind {
   int readonly;
 };
 
+struct Mask {
+  char *path;
+  int fd;
+  int directory;
+  int placeholder_fd;
+};
+
 struct Options {
   char *cwd;
   char *network;
@@ -100,6 +108,8 @@ struct Options {
   size_t rule_count;
   struct Bind binds[MAX_BINDS];
   size_t bind_count;
+  struct Mask masks[MAX_MASKS];
+  size_t mask_count;
   char *env[MAX_ENV * 2];
   size_t env_count;
   /** 0 = allow sockets, 1 = block sockets, 2 = proxy mode (family filter). */
@@ -108,6 +118,7 @@ struct Options {
   int egress_ctrl_fd;
   int deny_process_spawn;
   int quiet_ready;
+  int virtual_dev;
   char **command;
 };
 
@@ -156,6 +167,31 @@ static int open_verified_path(const char *path, int want_directory) {
     return -1;
   }
   return fd;
+}
+
+static int parse_identity_value(const char *value, unsigned long long *identity) {
+  if (!value || !value[0]) { errno = EINVAL; return -1; }
+  for (const char *digit = value; *digit; digit++) {
+    if (*digit < '0' || *digit > '9') { errno = EINVAL; return -1; }
+  }
+  char *end = NULL;
+  errno = 0;
+  unsigned long long parsed = strtoull(value, &end, 10);
+  if (errno || end == value || *end) { if (!errno) errno = EINVAL; return -1; }
+  *identity = parsed;
+  return 0;
+}
+
+static int fd_matches_identity(int fd, unsigned long long device,
+                               unsigned long long inode) {
+  struct stat info;
+  if (fstat(fd, &info) != 0) return -1;
+  if ((unsigned long long)info.st_dev != device ||
+      (unsigned long long)info.st_ino != inode) {
+    errno = ESTALE;
+    return -1;
+  }
+  return 0;
 }
 
 static uint64_t write_file_access(int abi) {
@@ -215,23 +251,87 @@ static int add_rule(struct Options *options, const char *path,
 }
 
 static int add_bind(struct Options *options, const char *path, int readonly,
-                    int want_directory) {
+                    int want_directory, const char *device,
+                    const char *inode) {
+  int verify_identity = device || inode;
+  unsigned long long expected_device = 0, expected_inode = 0;
+  if (verify_identity && (!device || !inode ||
+      parse_identity_value(device, &expected_device) != 0 ||
+      parse_identity_value(inode, &expected_inode) != 0)) return -1;
+  int fd = -1;
+  if (verify_identity) {
+    fd = open_verified_path(path, want_directory);
+    if (fd < 0 || fd_matches_identity(fd, expected_device, expected_inode) != 0) {
+      int saved = errno;
+      if (fd >= 0) close(fd);
+      errno = saved;
+      return -1;
+    }
+  }
   for (size_t i = 0; i < options->bind_count; i++) {
     if (strcmp(options->binds[i].path, path) == 0) {
+      if (verify_identity && fd_matches_identity(options->binds[i].fd,
+          expected_device, expected_inode) != 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+      }
       if (readonly) options->binds[i].readonly = 1;
       else if (!options->binds[i].readonly) options->binds[i].readonly = 0;
+      if (fd >= 0) close(fd);
       return 0;
     }
   }
   if (options->bind_count == MAX_BINDS) {
+    if (fd >= 0) close(fd);
     errno = E2BIG;
     return -1;
   }
-  int fd = open_verified_path(path, want_directory);
+  if (fd < 0) fd = open_verified_path(path, want_directory);
   if (fd < 0) return -1;
-  options->binds[options->bind_count++] = (struct Bind){
-      .path = strdup(path), .fd = fd, .readonly = readonly};
-  return options->binds[options->bind_count - 1].path ? 0 : -1;
+  char *copy = strdup(path);
+  if (!copy) { close(fd); return -1; }
+  options->binds[options->bind_count++] = (struct Bind){copy, fd, readonly};
+  return 0;
+}
+
+static int add_mask(struct Options *options, const char *path, int directory,
+                    const char *device, const char *inode) {
+  if (options->mask_count == MAX_MASKS) { errno = E2BIG; return -1; }
+  unsigned long long expected_device, expected_inode;
+  if (parse_identity_value(device, &expected_device) != 0 ||
+      parse_identity_value(inode, &expected_inode) != 0) return -1;
+  int fd = open_verified_path(path, directory);
+  if (fd < 0) return -1;
+  if (fd_matches_identity(fd, expected_device, expected_inode) != 0) {
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return -1;
+  }
+  char *copy = strdup(path);
+  if (!copy) { close(fd); return -1; }
+  options->masks[options->mask_count++] = (struct Mask){copy, fd, directory, -1};
+  return 0;
+}
+
+static int compare_masks(const void *left, const void *right) {
+  const struct Mask *a = left, *b = right;
+  size_t a_length = strlen(a->path), b_length = strlen(b->path);
+  return a_length < b_length ? -1 : a_length > b_length ? 1 : strcmp(a->path, b->path);
+}
+
+static int mask_is_covered(const struct Options *options, size_t index) {
+  const char *path = options->masks[index].path;
+  for (size_t i = 0; i < index; i++) {
+    const char *parent = options->masks[i].path;
+    size_t length = strlen(parent);
+    if (strcmp(parent, path) == 0 || (options->masks[i].directory &&
+        strncmp(parent, path, length) == 0 &&
+        (parent[length - 1] == '/' || path[length] == '/'))) return 1;
+  }
+  return 0;
 }
 
 static int add_runtime_rule(struct Options *options, const char *path,
@@ -277,7 +377,7 @@ static int parse_rule(struct Options *options, const char *flag,
   }
   if (add_rule(options, path, kind, access) != 0) return -1;
   if (parent_mode && (kind == RULE_WRITE_DIR || kind == RULE_WRITE_FILE)) {
-    return add_bind(options, path, 0, directory);
+    return add_bind(options, path, 0, directory, NULL, NULL);
   }
   return 0;
 }
@@ -649,7 +749,7 @@ static int seccomp_probe(void) {
 static int probe(void) {
   int abi = landlock_abi();
   int seccomp = seccomp_probe();
-  printf("{\"landlockAbi\":%d,\"seccomp\":%s}\n", abi,
+  printf("{\"landlockAbi\":%d,\"seccomp\":%s,\"planVersion\":3}\n", abi,
          seccomp ? "true" : "false");
   return abi >= 3 && seccomp ? 0 : 1;
 }
@@ -968,6 +1068,7 @@ static int parse_parent_options(int argc, char **argv, struct Options *options) 
     }
     else if (strcmp(flag, "--cwd") == 0) options->cwd = (char *)value;
     else if (strcmp(flag, "--network") == 0) options->network = (char *)value;
+    else if (strcmp(flag, "--virtual-dev") == 0 && strcmp(value, "yes") == 0) options->virtual_dev = 1;
     else if (strcmp(flag, "--env") == 0) {
       if (i + 1 >= argc || options->env_count >= MAX_ENV * 2) {
         errno = E2BIG;
@@ -976,7 +1077,17 @@ static int parse_parent_options(int argc, char **argv, struct Options *options) 
       options->env[options->env_count++] = (char *)value;
       options->env[options->env_count++] = argv[++i];
     } else if (strcmp(flag, "--protected") == 0) {
-      if (add_bind(options, value, 1, 2) != 0) return -1;
+      if (i + 3 >= argc) { errno = EINVAL; return -1; }
+      int directory;
+      if (strcmp(argv[i + 1], "directory") == 0) directory = 1;
+      else if (strcmp(argv[i + 1], "file") == 0) directory = 0;
+      else { errno = EINVAL; return -1; }
+      if (add_bind(options, value, 1, directory, argv[i + 2], argv[i + 3]) != 0) return -1;
+      i += 3;
+    } else if (strcmp(flag, "--mask-file") == 0 || strcmp(flag, "--mask-dir") == 0) {
+      if (i + 2 >= argc) { errno = EINVAL; return -1; }
+      if (add_mask(options, value, strcmp(flag, "--mask-dir") == 0, argv[i + 1], argv[i + 2]) != 0) return -1;
+      i += 2;
     } else if (parse_rule(options, flag, value, abi, 1) != 0) {
       return -1;
     }
@@ -1010,13 +1121,6 @@ static int parse_parent_options(int argc, char **argv, struct Options *options) 
       return -1;
     }
   }
-  add_runtime_rule(options, "/usr", RULE_READ_DIR,
-                   LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE |
-                       LANDLOCK_ACCESS_FS_READ_DIR);
-  add_runtime_rule(options, "/etc/ld.so.cache", RULE_READ_FILE,
-                   LANDLOCK_ACCESS_FS_READ_FILE);
-  add_runtime_rule(options, "/etc/ssl/openssl.cnf", RULE_READ_FILE,
-                   LANDLOCK_ACCESS_FS_READ_FILE);
   return 0;
 }
 
@@ -1118,14 +1222,6 @@ static int run_parent(int argc, char **argv) {
       return 125;
     }
   }
-  if (add_runtime_rule(&options, "/dev", RULE_READ_DIR,
-                       LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR) != 0 ||
-      add_runtime_rule(&options, "/dev", RULE_WRITE_DIR,
-                       write_dir_access(landlock_abi())) != 0) {
-    fail("device policy setup failed");
-    return 125;
-  }
-
   char bwrap[PATH_MAX];
   if (selected_bwrap_path(bwrap) != 0) {
     fail("selected bubblewrap is unavailable");
@@ -1159,6 +1255,26 @@ static int run_parent(int argc, char **argv) {
     add_arg(bwrap_args, &count, number);
     add_arg(bwrap_args, &count, options.binds[i].path);
   }
+  qsort(options.masks, options.mask_count, sizeof(options.masks[0]), compare_masks);
+  for (size_t i = 0; i < options.mask_count; i++) {
+    if (mask_is_covered(&options, i)) continue;
+    if (options.masks[i].directory) {
+      add_arg(bwrap_args, &count, "--tmpfs");
+      add_arg(bwrap_args, &count, options.masks[i].path);
+      add_arg(bwrap_args, &count, "--remount-ro");
+      add_arg(bwrap_args, &count, options.masks[i].path);
+    } else {
+      options.masks[i].placeholder_fd = (int)syscall(SYS_memfd_create, "sandbox-mask", MFD_CLOEXEC);
+      if (options.masks[i].placeholder_fd < 0) return 125;
+      char *number = fd_string(options.masks[i].placeholder_fd);
+      if (!number) return 125;
+      add_arg(bwrap_args, &count, "--perms");
+      add_arg(bwrap_args, &count, "0000");
+      add_arg(bwrap_args, &count, "--ro-bind-data");
+      add_arg(bwrap_args, &count, number);
+      add_arg(bwrap_args, &count, options.masks[i].path);
+    }
+  }
   if (content_fd >= 0) {
     char *number = fd_string(content_fd);
     if (!number) return 125;
@@ -1185,7 +1301,7 @@ static int run_parent(int argc, char **argv) {
 
   char executable[PATH_MAX];
   if (!realpath(argv[0], executable)) {
-    fail("native helper path could not be resolved");
+    fail("native launcher path could not be resolved");
     return 125;
   }
   add_arg(bwrap_args, &count, executable);
@@ -1193,6 +1309,7 @@ static int run_parent(int argc, char **argv) {
   add_arg(bwrap_args, &count, "--process-spawn");
   add_arg(bwrap_args, &count, options.deny_process_spawn ? "deny" : "allow");
   if (options.quiet_ready) add_arg(bwrap_args, &count, "--quiet-ready");
+  if (options.virtual_dev) add_arg(bwrap_args, &count, "--virtual-dev");
   if (strcmp(options.network, "none") == 0)
     add_arg(bwrap_args, &count, "--block-sockets");
   if (destinations) {
@@ -1223,6 +1340,12 @@ static int run_parent(int argc, char **argv) {
     return 125;
   }
   if (child == 0) {
+    for (size_t i = 0; i < options.mask_count; i++) {
+      int fd = options.masks[i].placeholder_fd;
+      if (fd < 0) continue;
+      int flags = fcntl(fd, F_GETFD);
+      if (flags >= 0) fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
+    }
     if (content_fd >= 0) {
       int flags = fcntl(content_fd, F_GETFD);
       if (flags >= 0) fcntl(content_fd, F_SETFD, flags & ~FD_CLOEXEC);
@@ -1269,6 +1392,7 @@ static int parse_inner_options(int argc, char **argv, struct Options *options) {
       break;
     }
     if (strcmp(argv[i], "--quiet-ready") == 0) { options->quiet_ready = 1; continue; }
+    if (strcmp(argv[i], "--virtual-dev") == 0) { options->virtual_dev = 1; continue; }
     if (strcmp(argv[i], "--block-sockets") == 0) {
       options->socket_mode = 1;
       continue;
@@ -1298,17 +1422,9 @@ static int parse_inner_options(int argc, char **argv, struct Options *options) {
     errno = EINVAL;
     return -1;
   }
-  add_runtime_rule(options, "/usr", RULE_READ_DIR,
-                   LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE |
-                       LANDLOCK_ACCESS_FS_READ_DIR);
-  add_runtime_rule(options, "/etc/ld.so.cache", RULE_READ_FILE,
-                   LANDLOCK_ACCESS_FS_READ_FILE);
-  add_runtime_rule(options, "/etc/ssl/openssl.cnf", RULE_READ_FILE,
-                   LANDLOCK_ACCESS_FS_READ_FILE);
-  add_runtime_rule(options, "/dev", RULE_READ_DIR,
-                   LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR);
-  add_runtime_rule(options, "/dev", RULE_WRITE_DIR,
-                   write_dir_access(abi));
+  if (options->virtual_dev &&
+      (add_runtime_rule(options, "/dev", RULE_READ_DIR, LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR) != 0 ||
+       add_runtime_rule(options, "/dev", RULE_WRITE_DIR, write_dir_access(abi)) != 0)) return -1;
   if (strcmp(options->command[0], "write-file") == 0 &&
       add_runtime_rule(options, "/run/plan13/content", RULE_READ_FILE,
                        LANDLOCK_ACCESS_FS_READ_FILE) != 0) {
@@ -1450,7 +1566,7 @@ static int run_file_operation(char **command) {
       total += (size_t)count;
       if (total > MAX_FILE_BYTES) {
         close(fd);
-        dprintf(STDERR_FILENO, "PI-LINUX-OP-ERROR:unsupported:file exceeds the helper result limit\n");
+        dprintf(STDERR_FILENO, "PI-LINUX-OP-ERROR:unsupported:file exceeds the native result limit\n");
         return 1;
       }
       size_t offset = 0;
@@ -1495,7 +1611,7 @@ static int run_file_operation(char **command) {
         close(source);
         close(target);
         errno = EFBIG;
-        return operation_error("approved content exceeds the helper limit");
+        return operation_error("approved content exceeds the native result limit");
       }
       size_t offset = 0;
       while (offset < (size_t)count) {

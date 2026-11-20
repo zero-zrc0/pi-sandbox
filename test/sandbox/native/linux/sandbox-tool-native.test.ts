@@ -6,9 +6,14 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { ExecutionController } from "#sandbox/lifecycle";
+import { createLinuxDirectBackend } from "#sandbox/backend/linux/direct";
+import { findSystemBubblewrap } from "#sandbox/backend/linux/bwrap-selection.mjs";
 import { PROTECTED_CONTROL_DIRECTORY_NAMES } from "#sandbox/path";
-import type { ExecutionPlan } from "#sandbox/types";
-import { compileTestPlan, makeInvocation } from "../../fixtures/harness";
+import { linuxRuntimeFilesystem } from "#sandbox/runtime-filesystem";
+import { parseRuntimeManifest } from "#sandbox/runtime-manifest";
+import type { ResolvedRuntimeFiles } from "#sandbox/runtime-store";
+import type { ExecutionRequest } from "#sandbox/types";
+import { compileTestRequest as compileBaseTestPlan, makeInvocation } from "../../fixtures/harness";
 import { installLinuxTestRuntime } from "../../fixtures/runtime";
 import {
   COUNTER_MODULE,
@@ -29,8 +34,8 @@ const TOOL_NAME = "native_probe_tool";
 interface LinuxLayout {
   readonly root: string;
   readonly installRoot: string;
-  readonly helperDir: string;
-  readonly helperCwd: string;
+  readonly runtimeDirectory: string;
+  readonly hostCwd: string;
   readonly workspace: string;
   readonly modules: string;
   readonly stateDirectory: string;
@@ -38,30 +43,27 @@ interface LinuxLayout {
 }
 
 /**
- * Build the native launcher and install the helper in a package-shaped layout:
- * the helper resolves its runner (`../../sandbox-tool-worker.mjs`) and the
- * read-only package root from its own location, exactly like the real install.
+ * Build the native launcher and install the worker in a package-shaped layout.
  */
 function createLinuxLayout(prefix: string): LinuxLayout {
   const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   const installRoot = join(root, "trusted-install");
-  const helperDir = join(installRoot, "src", "sandbox", "backend", "linux");
-  const helperCwd = join(root, "helper-cwd");
+  const runtimeDirectory = join(installRoot, "src", "sandbox", "backend", "linux");
+  const hostCwd = join(root, "native-cwd");
   const workspace = join(root, "workspace");
   const modules = join(root, "modules");
   const stateDirectory = join(workspace, ".pi", "sandbox-tools", TOOL_NAME);
   const outside = join(root, "outside");
-  for (const directory of [helperDir, helperCwd, workspace, modules, stateDirectory, outside]) {
+  for (const directory of [runtimeDirectory, hostCwd, workspace, modules, stateDirectory, outside]) {
     mkdirSync(directory, { recursive: true });
   }
   for (const name of PROTECTED_CONTROL_DIRECTORY_NAMES) {
     mkdirSync(join(workspace, name), { recursive: true });
   }
-  execFileSync("bash", [join(backendSource, "build.sh"), join(helperDir, "linux-sandbox")]);
-  copyFileSync(join(backendSource, "helper.mjs"), join(helperDir, "helper.mjs"));
-  installLinuxTestRuntime(helperDir);
+  execFileSync("bash", [join(backendSource, "build.sh"), join(runtimeDirectory, "linux-sandbox")]);
+  installLinuxTestRuntime(runtimeDirectory);
   copyFileSync(workerSource, join(installRoot, "src", "sandbox", "sandbox-tool-worker.mjs"));
-  return { root, installRoot, helperDir, helperCwd, workspace, modules, stateDirectory, outside };
+  return { root, installRoot, runtimeDirectory, hostCwd, workspace, modules, stateDirectory, outside };
 }
 
 const PING_MODULE = `export async function execute(args, ctx) {
@@ -73,20 +75,40 @@ describe.skipIf(process.platform !== "linux")("native Linux sandbox tool", () =>
   let layout: LinuxLayout;
   let controller: ExecutionController;
 
+  function compileTestRequest(options: Parameters<typeof compileBaseTestPlan>[0]) {
+    const runtime = linuxRuntimeFilesystem({ installRoot: layout.installRoot, operation: options.operation });
+    return compileBaseTestPlan({ ...options, runtimeFilesystem: runtime.grants, protectedPaths: runtime.protectedPaths });
+  }
+
   beforeAll(() => {
     layout = createLinuxLayout("plan13-linux-sandbox-tool-");
+    const runtimeManifestPath = join(layout.runtimeDirectory, "runtime.json");
+    const manifest = parseRuntimeManifest(JSON.parse(readFileSync(runtimeManifestPath, "utf8")) as unknown);
+    const runtime: ResolvedRuntimeFiles = {
+      directory: layout.runtimeDirectory,
+      storageRoot: layout.installRoot,
+      source: "manual",
+      manifest,
+      files: Object.freeze(Object.fromEntries([
+        ...manifest.files.map(file => [file.role, join(layout.runtimeDirectory, file.path)] as const),
+        ["runtimeManifest", runtimeManifestPath],
+      ])),
+    };
+    const hostEnvironment = { HOME: "/nonexistent", LANG: "C.UTF-8", PATH: "/usr/bin:/bin",
+      PI_SANDBOX_RUNTIME_DIR: layout.runtimeDirectory, PI_SANDBOX_RUNTIME_ROOT: layout.installRoot,
+      PI_SANDBOX_WORKSPACE_ROOT: layout.workspace };
+    const systemBubblewrapPath = findSystemBubblewrap(hostEnvironment.PATH, layout.workspace);
     controller = new ExecutionController({
-      installation: {
+      directBackend: createLinuxDirectBackend({
+        runtime,
         installRoot: layout.installRoot,
-        executable: process.execPath,
-        args: [join(layout.helperDir, "helper.mjs")],
-        expectedBackendId: backendId,
-        expectedBackendVersion: backendVersion,
-      },
-      helperCwd: layout.helperCwd,
-      workspace: layout.workspace,
-      helperEnvironment: { HOME: "/nonexistent", LANG: "C.UTF-8", PATH: "/usr/bin:/bin",
-        PI_SANDBOX_RUNTIME_DIR: layout.helperDir, PI_SANDBOX_WORKSPACE_ROOT: layout.workspace },
+        hostCwd: layout.hostCwd,
+        hostEnvironment: {
+          ...hostEnvironment,
+          ...(systemBubblewrapPath === undefined ? {} : { PI_SANDBOX_SYSTEM_BWRAP_PATH: systemBubblewrapPath }),
+        },
+        ...(systemBubblewrapPath === undefined ? {} : { systemBubblewrapPath }),
+      }),
       startTimeoutMs: 5_000,
       cancelGraceMs: 250,
     });
@@ -104,7 +126,7 @@ describe.skipIf(process.platform !== "linux")("native Linux sandbox tool", () =>
     readonly arguments?: Record<string, string>;
     readonly config?: Record<string, string>;
     readonly deadlineMs?: number;
-  }): ExecutionPlan {
+  }): ExecutionRequest {
     const invocation = makeInvocation({
       cwd: layout.workspace,
       toolName: TOOL_NAME,
@@ -116,7 +138,7 @@ describe.skipIf(process.platform !== "linux")("native Linux sandbox tool", () =>
         { id: "sandbox-tool:state", surface: "path_write", target: layout.stateDirectory, access: "write", state: "allow", source: "native-test" },
       ],
     });
-    return compileTestPlan({
+    return compileTestRequest({
       invocation,
       operation: {
         kind: "sandbox-tool",
@@ -141,7 +163,7 @@ describe.skipIf(process.platform !== "linux")("native Linux sandbox tool", () =>
   it("executes a declared third-party tool inside the native boundary", async () => {
     const modulePath = writeModule(layout, "counter.mjs", COUNTER_MODULE);
     const first = await controller.execute({
-      plan: sandboxToolPlan({
+      request: sandboxToolPlan({
         modulePath, requestId: "tool-1", toolCallId: "tool-1",
         arguments: { value: "one" }, config: { mode: "native" },
       }),
@@ -157,7 +179,7 @@ describe.skipIf(process.platform !== "linux")("native Linux sandbox tool", () =>
 
     // A second one-shot worker sees the state the first call persisted.
     const second = await controller.execute({
-      plan: sandboxToolPlan({
+      request: sandboxToolPlan({
         modulePath, requestId: "tool-2", toolCallId: "tool-2",
         arguments: { value: "two" },
       }),
@@ -173,7 +195,7 @@ describe.skipIf(process.platform !== "linux")("native Linux sandbox tool", () =>
     const modulePath = writeModule(layout, "writer.mjs", WRITER_MODULE);
     const target = join(layout.outside, "escaped.txt");
     const denied = await controller.execute({
-      plan: sandboxToolPlan({
+      request: sandboxToolPlan({
         modulePath, requestId: "outside-write", toolCallId: "outside-write",
         arguments: { target },
       }),
@@ -188,9 +210,9 @@ describe.skipIf(process.platform !== "linux")("native Linux sandbox tool", () =>
     expect(errorTextOf(denied)).toContain(target);
     expect(existsSync(target)).toBe(false);
 
-    // The denial is one tool result: the session and the helper continue.
+    // The denial is one tool result: the session and native runner continue.
     const next = await controller.execute({
-      plan: sandboxToolPlan({
+      request: sandboxToolPlan({
         modulePath: writeModule(layout, "ping.mjs", PING_MODULE),
         requestId: "outside-write-next", toolCallId: "outside-write-next",
         arguments: { value: "after-denial" },
@@ -206,7 +228,7 @@ describe.skipIf(process.platform !== "linux")("native Linux sandbox tool", () =>
     const target = join(protectedDirectory, "config");
     writeFileSync(target, "protected-original");
     const denied = await controller.execute({
-      plan: sandboxToolPlan({
+      request: sandboxToolPlan({
         modulePath, requestId: "protected-write", toolCallId: "protected-write",
         arguments: { target },
       }),
@@ -226,7 +248,7 @@ describe.skipIf(process.platform !== "linux")("native Linux sandbox tool", () =>
   it("returns a readable error when the tool throws and keeps the session usable", async () => {
     const modulePath = writeModule(layout, "throwing.mjs", THROWING_MODULE);
     const thrown = await controller.execute({
-      plan: sandboxToolPlan({ modulePath, requestId: "throwing", toolCallId: "throwing" }),
+      request: sandboxToolPlan({ modulePath, requestId: "throwing", toolCallId: "throwing" }),
     });
     expect(thrown.state, JSON.stringify(thrown)).toBe("failed");
     expect(thrown.state === "failed" ? thrown.code : undefined).toBe("execution-failed");
@@ -234,7 +256,7 @@ describe.skipIf(process.platform !== "linux")("native Linux sandbox tool", () =>
     expect(errorTextOf(thrown)).toContain("native sandbox tool boom");
 
     const next = await controller.execute({
-      plan: sandboxToolPlan({
+      request: sandboxToolPlan({
         modulePath: writeModule(layout, "ping.mjs", PING_MODULE),
         requestId: "throwing-next", toolCallId: "throwing-next",
         arguments: { value: "after-throw" },
@@ -248,7 +270,7 @@ describe.skipIf(process.platform !== "linux")("native Linux sandbox tool", () =>
     const modulePath = writeModule(layout, "slow.mjs", SLOW_MODULE);
     const startedAt = Date.now();
     const outcome = await controller.execute({
-      plan: sandboxToolPlan({
+      request: sandboxToolPlan({
         modulePath, requestId: "deadline", toolCallId: "deadline", deadlineMs: 2_000,
       }),
     });
@@ -261,7 +283,7 @@ describe.skipIf(process.platform !== "linux")("native Linux sandbox tool", () =>
 
     // The same controller still runs the next declared tool call.
     const next = await controller.execute({
-      plan: sandboxToolPlan({
+      request: sandboxToolPlan({
         modulePath: writeModule(layout, "ping.mjs", PING_MODULE),
         requestId: "deadline-next", toolCallId: "deadline-next",
         arguments: { value: "after-timeout" },

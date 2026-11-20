@@ -11,10 +11,14 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ExecutionController, type EgressProvider } from "#sandbox/lifecycle";
 import { EgressService } from "#sandbox/egress/index";
 import type { EgressNetworkEvent } from "#sandbox/egress/types";
-import type { TrustedHelperInstallation } from "#sandbox/helper";
+import { createLinuxDirectBackend } from "#sandbox/backend/linux/direct";
+import { findSystemBubblewrap } from "#sandbox/backend/linux/bwrap-selection.mjs";
 import { PROTECTED_CONTROL_DIRECTORY_NAMES } from "#sandbox/path";
+import { linuxRuntimeFilesystem } from "#sandbox/runtime-filesystem";
+import { parseRuntimeManifest } from "#sandbox/runtime-manifest";
+import type { ResolvedRuntimeFiles } from "#sandbox/runtime-store";
 import {
-  compileTestPlan,
+  compileTestRequest as compileBaseTestPlan,
   makeInvocation,
 } from "../../fixtures/harness";
 import { installLinuxTestRuntime } from "../../fixtures/runtime";
@@ -28,23 +32,45 @@ const backendSource = fileURLToPath(
 describe.skipIf(process.platform !== "linux")("native Linux execution backend", () => {
   let root: string | undefined;
   let installRoot: string;
-  let helperCwd: string;
+  let hostCwd: string;
   let workspace: string;
   let sessionWorkspace: string;
   let outside: string;
   let nativeBinary: string;
   let processSpawnProbe: string;
   let controller: ExecutionController | undefined;
+  let runtimeFiles: ResolvedRuntimeFiles | undefined;
+  let backendEnvironment: Record<string, string> | undefined;
+  let systemBubblewrapPath: string | undefined;
+
+  function createDirectBackend(): ReturnType<typeof createLinuxDirectBackend> {
+    if (!runtimeFiles || !backendEnvironment) throw new Error("Linux direct backend runtime was not prepared");
+    return createLinuxDirectBackend({
+      runtime: runtimeFiles,
+      installRoot,
+      hostCwd,
+      hostEnvironment: backendEnvironment,
+      ...(systemBubblewrapPath === undefined ? {} : { systemBubblewrapPath }),
+    });
+  }
+
+  function compileTestRequest(options: Parameters<typeof compileBaseTestPlan>[0]) {
+    const runtime = linuxRuntimeFilesystem({ installRoot, operation: options.operation });
+    return compileBaseTestPlan({ ...options, runtimeFilesystem: runtime.grants, protectedPaths: runtime.protectedPaths });
+  }
+
+  const runtimeFlags = () => ["--virtual-dev", "yes", "--execute-dir", "/usr", "--read-file", realpathSync("/etc/ld.so.cache"),
+    "--read-file", realpathSync("/etc/ssl/openssl.cnf")];
 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "plan13-linux-native-"));
     installRoot = join(root, "trusted-install");
-    helperCwd = join(root, "helper-cwd");
+    hostCwd = join(root, "native-cwd");
     workspace = join(root, "workspace");
     sessionWorkspace = join(root, "agent", "workspaces", "pi-sandbox", "session-hash");
     outside = join(root, "outside.txt");
     mkdirSync(installRoot, { recursive: true });
-    mkdirSync(helperCwd, { recursive: true });
+    mkdirSync(hostCwd, { recursive: true });
     mkdirSync(workspace, { recursive: true });
     mkdirSync(join(sessionWorkspace, "tmp"), { recursive: true });
     for (const name of PROTECTED_CONTROL_DIRECTORY_NAMES) {
@@ -55,26 +81,33 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     processSpawnProbe = join(installRoot, "process-spawn-probe");
     execFileSync("cc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread",
       fileURLToPath(new URL("./process-spawn-probe.c", import.meta.url)), "-o", processSpawnProbe]);
-    copyFileSync(join(backendSource, "helper.mjs"), join(installRoot, "helper.mjs"));
     installLinuxTestRuntime(installRoot);
-    const installation: TrustedHelperInstallation = {
-      installRoot,
-      executable: process.execPath,
-      args: [join(installRoot, "helper.mjs")],
-      expectedBackendId: backendId,
-      expectedBackendVersion: backendVersion,
+    const runtimeManifestPath = join(installRoot, "runtime.json");
+    const manifest = parseRuntimeManifest(JSON.parse(readFileSync(runtimeManifestPath, "utf8")) as unknown);
+    runtimeFiles = {
+      directory: installRoot,
+      storageRoot: root,
+      source: "manual",
+      manifest,
+      files: Object.freeze(Object.fromEntries([
+        ...manifest.files.map(file => [file.role, join(installRoot, file.path)] as const),
+        ["runtimeManifest", runtimeManifestPath],
+      ])),
     };
+    backendEnvironment = {
+      HOME: "/nonexistent",
+      LANG: "C.UTF-8",
+      PATH: "/usr/bin:/bin",
+      PI_SANDBOX_RUNTIME_DIR: installRoot,
+      PI_SANDBOX_RUNTIME_ROOT: root,
+      PI_SANDBOX_WORKSPACE_ROOT: workspace,
+    };
+    systemBubblewrapPath = findSystemBubblewrap(backendEnvironment.PATH, workspace);
+    if (systemBubblewrapPath !== undefined) {
+      backendEnvironment.PI_SANDBOX_SYSTEM_BWRAP_PATH = systemBubblewrapPath;
+    }
     controller = new ExecutionController({
-      installation,
-      helperCwd,
-      workspace,
-      helperEnvironment: {
-        HOME: "/nonexistent",
-        LANG: "C.UTF-8",
-        PATH: "/usr/bin:/bin",
-        PI_SANDBOX_RUNTIME_DIR: installRoot,
-        PI_SANDBOX_WORKSPACE_ROOT: workspace,
-      },
+      directBackend: createDirectBackend(),
       startTimeoutMs: 5_000,
       cancelGraceMs: 250,
     });
@@ -86,12 +119,12 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
   });
 
   function getController(): ExecutionController {
-    if (!controller) throw new Error("Linux helper was not installed");
+    if (!controller) throw new Error("Linux direct backend was not installed");
     return controller;
   }
 
   function runProcessProbe(spawn: "allow" | "deny" | undefined, mode: string, marker: string): string {
-    const args = ["run", "--ready", "none"];
+    const args = ["run", "--ready", "none", ...runtimeFlags()];
     if (spawn) args.push("--process-spawn", spawn);
     args.push("--network", "all", "--cwd", workspace, "--write-dir", workspace,
       "--execute-file", processSpawnProbe, "--", processSpawnProbe, mode, marker);
@@ -104,7 +137,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
       toolName: "bash",
       args: { command },
     });
-    return compileTestPlan({
+    return compileTestRequest({
       invocation,
       operation: { kind: "shell", command, shell: "/bin/sh" },
       workspace,
@@ -114,7 +147,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     });
   }
 
-  it("probes the installed helper and reports only its negotiated Linux capabilities", async () => {
+  it("probes the installed native launcher and reports Linux capabilities", async () => {
     const probe = await getController().probe();
 
     expect(probe).toMatchObject({
@@ -143,7 +176,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
   it("executes a non-system Node runtime only with an explicit executable grant", () => {
     const runtime = join(installRoot, "node-runtime");
     copyFileSync(process.execPath, runtime);
-    const flags = ["run", "--ready", "none", "--network", "none", "--cwd", workspace, "--read-dir", workspace, "--read-file", runtime];
+    const flags = ["run", "--ready", "none", ...runtimeFlags(), "--network", "none", "--cwd", workspace, "--read-dir", workspace, "--read-file", runtime];
     const command = ["--", runtime, "-e", "const child = require('node:child_process').spawnSync('/usr/bin/true', [], { stdio: 'pipe' }); if (child.error) throw child.error; process.stdout.write('restricted-node')"];
     const binary = join(installRoot, "linux-sandbox");
     expect(() => execFileSync(binary, [...flags, ...command], { stdio: "pipe" })).toThrow();
@@ -198,7 +231,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
       "worker.once('error', () => { process.exitCode = 1; workerDone = true; finish(); });",
       "pbkdf2('secret', 'salt', 1, 16, 'sha256', error => { if (error) process.exitCode = 1; poolDone = true; finish(); });",
     ].join("\n");
-    const nodeOutput = execFileSync(nativeBinary, ["run", "--ready", "none", "--process-spawn", "deny",
+    const nodeOutput = execFileSync(nativeBinary, ["run", "--ready", "none", ...runtimeFlags(), "--process-spawn", "deny",
       "--network", "all", "--cwd", workspace, "--write-dir", workspace,
       "--execute-file", nodeExecutable, "--", nodeExecutable, "-e", nodeProgram], { encoding: "utf8" });
     expect(nodeOutput).toContain("node-threads-ok");
@@ -217,7 +250,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
       "    raise SystemExit(f'unexpected process result: {result}')",
       "print('python-threads-ok')",
     ].join("\n");
-    const pythonOutput = execFileSync(nativeBinary, ["run", "--ready", "none", "--process-spawn", "deny",
+    const pythonOutput = execFileSync(nativeBinary, ["run", "--ready", "none", ...runtimeFlags(), "--process-spawn", "deny",
       "--network", "all", "--cwd", workspace, "--execute-file", pythonExecutable,
       "--", pythonExecutable, "-c", pythonProgram], { encoding: "utf8" });
     expect(pythonOutput).toContain("python-threads-ok");
@@ -226,7 +259,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
   it("runs an approved workspace write while the OS blocks a sibling write", async () => {
     const inside = join(workspace, "inside.txt");
     const command = `printf allowed > '${inside}'; printf denied > '${outside}'`;
-    const result = await getController().execute({ plan: shellPlan(command) });
+    const result = await getController().execute({ request: shellPlan(command) });
 
     expect(result.state, JSON.stringify(result)).toBe("completed");
     expect(result.state === "completed" ? result.exitCode : undefined).not.toBe(0);
@@ -246,11 +279,12 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
       `cat '${outside}' > '${inaccessibleCopy}'`,
     ].join("; ");
     const result = await getController().execute({
-      plan: compileTestPlan({
+      request: compileTestRequest({
         invocation: makeInvocation({ cwd: workspace, toolName: "bash", args: { command } }),
         operation: { kind: "shell", command, shell: "/bin/sh" },
         workspace,
         baselineFilesystem: [
+          { path: workspace, access: "read", granularity: "directory" },
           { path: sessionWorkspace, access: "read", granularity: "directory" },
           { path: sessionWorkspace, access: "write", granularity: "directory" },
         ],
@@ -290,7 +324,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     ].join("; ");
     try {
       const result = await getController().execute({
-        plan: compileTestPlan({
+        request: compileTestRequest({
           invocation: makeInvocation({ cwd: workspace, toolName: "bash", args: { command } }),
           operation: { kind: "shell", command, shell: "/bin/sh" },
           workspace,
@@ -326,7 +360,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     const target = join(workspace, "read-bytes.bin");
     const content = Buffer.from([0x00, 0x80, 0xff, 0x41]);
     writeFileSync(target, content);
-    const plan = compileTestPlan({
+    const plan = compileTestRequest({
       invocation: makeInvocation({
         cwd: workspace,
         toolName: "read",
@@ -337,7 +371,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
       backendId,
     });
 
-    const result = await getController().execute({ plan });
+    const result = await getController().execute({ request: plan });
 
     expect(result.state, JSON.stringify(result)).toBe("completed");
     expect(result.state === "completed" ? result.dataBase64 : undefined).toBe(
@@ -348,7 +382,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
   it("writes an approved file through the native sandbox", async () => {
     const target = join(workspace, "written.txt");
     const content = "native write bytes";
-    const plan = compileTestPlan({
+    const plan = compileTestRequest({
       invocation: makeInvocation({
         cwd: workspace,
         toolName: "write",
@@ -359,7 +393,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
       backendId,
     });
 
-    const result = await getController().execute({ plan });
+    const result = await getController().execute({ request: plan });
 
     expect(result.state, JSON.stringify(result)).toBe("completed");
     expect(readFileSync(target, "utf8")).toBe(content);
@@ -368,7 +402,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
   it("keeps protected control directories read-only under a workspace write grant", async () => {
     const protectedFile = join(workspace, ".git", "config");
     const result = await getController().execute({
-      plan: shellPlan(`printf denied > '${protectedFile}'`),
+      request: shellPlan(`printf denied > '${protectedFile}'`),
     });
 
     expect(result.state, JSON.stringify(result)).toBe("completed");
@@ -376,13 +410,14 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     expect(existsSync(protectedFile)).toBe(false);
   });
 
-  it("fails closed before start when a protected control directory is missing", async () => {
+  it("fails closed before start when a protected control directory is removed after planning", async () => {
     const missing = join(workspace, PROTECTED_CONTROL_DIRECTORY_NAMES[0]);
     const marker = join(workspace, "missing-protection-started.txt");
+    const plan = shellPlan(`printf started > '${marker}'`);
     rmSync(missing, { recursive: true, force: true });
     try {
       const result = await getController().execute({
-        plan: shellPlan(`printf started > '${marker}'`),
+        request: plan,
       });
 
       expect(result.state).toBe("failed");
@@ -400,7 +435,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     const file = join(workspace, "access.txt");
     writeFileSync(file, "read-write");
     const accessResult = await getController().execute({
-      plan: compileTestPlan({
+      request: compileTestRequest({
         invocation: makeInvocation({
           cwd: workspace,
           toolName: "edit",
@@ -416,7 +451,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     const directory = join(workspace, "nested", "created");
     const target = join(directory, "output.txt");
     const mkdirResult = await getController().execute({
-      plan: compileTestPlan({
+      request: compileTestRequest({
         invocation: makeInvocation({
           cwd: workspace,
           toolName: "write",
@@ -431,7 +466,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     expect(existsSync(directory)).toBe(true);
 
     const accessDirResult = await getController().execute({
-      plan: compileTestPlan({
+      request: compileTestRequest({
         invocation: makeInvocation({
           cwd: workspace,
           toolName: "write",
@@ -447,7 +482,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
 
   it("blocks direct IP egress in the no-network namespace", async () => {
     const result = await getController().execute({
-      plan: shellPlan(
+      request: shellPlan(
         "/usr/bin/python3 -c 'import socket; s=socket.socket(); s.settimeout(1); s.connect((\"1.1.1.1\", 443))'",
       ),
     });
@@ -461,7 +496,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     "rejects x32 ABI syscall numbers on x86_64, including the socket bypass",
     async () => {
       const result = await getController().execute({
-        plan: shellPlan(
+        request: shellPlan(
           "/usr/bin/python3 -c 'import ctypes; libc=ctypes.CDLL(None, use_errno=True); libc.syscall.restype=ctypes.c_long; libc.syscall.argtypes=[ctypes.c_long, ctypes.c_long, ctypes.c_long, ctypes.c_long]; ctypes.set_errno(0); pid=libc.syscall(0x40000027, 0, 0, 0); pidError=ctypes.get_errno(); ctypes.set_errno(0); sock=libc.syscall(0x40000029, 2, 1, 0); sockError=ctypes.get_errno(); print(pid, pidError, sock, sockError)'",
         ),
       });
@@ -474,7 +509,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
 
   it("keeps the ordinary syscall deny list effective", async () => {
     const result = await getController().execute({
-      plan: shellPlan(
+      request: shellPlan(
         "/usr/bin/python3 -c 'import ctypes; libc=ctypes.CDLL(None, use_errno=True); libc.ptrace.restype=ctypes.c_int; libc.ptrace.argtypes=[ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]; ctypes.set_errno(0); print(libc.ptrace(0, 0, None, None), ctypes.get_errno())'",
       ),
     });
@@ -493,7 +528,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     });
     try {
       const result = await getController().execute({
-        plan: shellPlan(
+        request: shellPlan(
           `/usr/bin/python3 -c 'import socket; s=socket.socket(socket.AF_UNIX); s.settimeout(1); s.connect("${socketPath}"); print(s.recv(64).decode())'`,
         ),
       });
@@ -504,7 +539,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
       expect(result.stdout).not.toContain("host-visible");
 
       const pairResult = await getController().execute({
-        plan: shellPlan(
+        request: shellPlan(
           "/usr/bin/python3 -c 'import socket; a,b=socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM); a.sendall(b\"internal\"); print(b.recv(8).decode())'",
         ),
       });
@@ -514,18 +549,18 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
       expect(pairResult.stdout).toContain("internal");
 
       const reconnectResult = await getController().execute({
-        plan: shellPlan(`/usr/bin/python3 -c 'import socket; a,b=socket.socketpair(); a.connect("${socketPath}")'`),
+        request: shellPlan(`/usr/bin/python3 -c 'import socket; a,b=socket.socketpair(); a.connect("${socketPath}")'`),
       });
       expect(reconnectResult.state === "completed" ? reconnectResult.exitCode : undefined).not.toBe(0);
       expect(reconnectResult.stderr).toMatch(/Operation not permitted/u);
       const datagramResult = await getController().execute({
-        plan: shellPlan("/usr/bin/python3 -c 'import socket; socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)'"),
+        request: shellPlan("/usr/bin/python3 -c 'import socket; socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)'"),
       });
       expect(datagramResult.state === "completed" ? datagramResult.exitCode : undefined).not.toBe(0);
       expect(datagramResult.stderr).toMatch(/Operation not permitted/u);
 
       const vsockResult = await getController().execute({
-        plan: shellPlan(
+        request: shellPlan(
           "/usr/bin/python3 -c 'import socket; socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)'",
         ),
       });
@@ -535,7 +570,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
       expect(vsockResult.stderr).toMatch(/Operation not permitted/u);
 
       const allowedResult = await getController().execute({
-        plan: shellPlan(
+        request: shellPlan(
           `/usr/bin/python3 -c 'import socket; s=socket.socket(socket.AF_UNIX); s.settimeout(1); s.connect("${socketPath}"); print(s.recv(64).decode())'`,
           "all",
         ),
@@ -554,7 +589,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
   it("rejects domain allowlists before running without an egress proxy", async () => {
     const marker = join(workspace, "domain-plan-started.txt");
     const command = `printf started > '${marker}'`;
-    const plan = compileTestPlan({
+    const plan = compileTestRequest({
       invocation: makeInvocation({
         cwd: workspace,
         toolName: "bash",
@@ -573,7 +608,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
       backendId,
       approved: { network: [{ host: "example.com", port: 443 }] },
     });
-    const result = await getController().execute({ plan });
+    const result = await getController().execute({ request: plan });
 
     expect(result.state).toBe("failed");
     expect(result.started).toBe(false);
@@ -583,9 +618,9 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     expect(existsSync(marker)).toBe(false);
   });
 
-  it("does not inherit helper environment values or file descriptors", async () => {
+  it("does not inherit controller environment values or file descriptors", async () => {
     const command = "/usr/bin/env; /usr/bin/python3 -c 'import os; f=[]; exec(\"for fd in range(3,64):\\n try: os.fstat(fd); f.append(fd)\\n except OSError: pass\"); print(f)'";
-    const result = await getController().execute({ plan: shellPlan(command) });
+    const result = await getController().execute({ request: shellPlan(command) });
 
     expect(result.state, JSON.stringify(result)).toBe("completed");
     expect(result.state === "completed" ? result.exitCode : undefined).toBe(0);
@@ -599,7 +634,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
     let markOutput!: () => void;
     const output = new Promise<void>((resolve) => { markOutput = resolve; });
     const execution = getController().execute({
-      plan: shellPlan("/usr/bin/sleep 23991 & wait"),
+      request: shellPlan("/usr/bin/sleep 23991 & wait"),
       signal: abort.signal,
       onOutput: markOutput,
     });
@@ -638,7 +673,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
           },
         ],
       });
-      return compileTestPlan({
+      return compileTestRequest({
         invocation,
         operation: { kind: "shell", command },
         workspace,
@@ -662,17 +697,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
         },
       };
       egressController = new ExecutionController({
-        installation: {
-          installRoot,
-          executable: process.execPath,
-          args: [join(installRoot, "helper.mjs")],
-          expectedBackendId: backendId,
-          expectedBackendVersion: backendVersion,
-        },
-        helperCwd,
-        workspace,
-        helperEnvironment: { HOME: "/nonexistent", LANG: "C.UTF-8", PATH: "/usr/bin:/bin",
-          PI_SANDBOX_RUNTIME_DIR: installRoot, PI_SANDBOX_WORKSPACE_ROOT: workspace },
+        directBackend: createDirectBackend(),
         startTimeoutMs: 5_000,
         cancelGraceMs: 250,
         egress: provider,
@@ -708,7 +733,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
 
     it("NET-01: proxies an allowed destination through the bridge and the Pi policy proxy", async () => {
       const result = await egressController!.execute({
-        plan: destinationPlan(`/usr/bin/curl -s http://127.0.0.1:${httpPort}/hello`, httpPort),
+        request: destinationPlan(`/usr/bin/curl -s http://127.0.0.1:${httpPort}/hello`, httpPort),
       });
       expect(result.state, JSON.stringify(result)).toBe("completed");
       expect(result.state === "completed" ? result.stdout : "").toContain("native-egress-ok");
@@ -720,7 +745,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
       // through it exercises the SOCKS5 path the bridge forwards segment by
       // segment (greeting arrives after the auth frame).
       const result = await egressController!.execute({
-        plan: destinationPlan(
+        request: destinationPlan(
           `/usr/bin/curl -s --proxy "$ALL_PROXY" http://127.0.0.1:${httpPort}/hello`,
           httpPort,
         ),
@@ -741,7 +766,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
       const deniedAddress = deniedListener!.address();
       if (typeof deniedAddress === "string" || deniedAddress === null) throw new Error("no address");
       const result = await egressController!.execute({
-        plan: destinationPlan(
+        request: destinationPlan(
           `/usr/bin/curl -s -m 5 -o /dev/null -w "%{http_code}" http://127.0.0.1:${deniedAddress.port}/`,
           httpPort,
         ),
@@ -755,7 +780,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
 
     it("NET-03: direct connections cannot bypass the proxy", async () => {
       const result = await egressController!.execute({
-        plan: destinationPlan(
+        request: destinationPlan(
           `/usr/bin/curl -s -m 5 --noproxy '*' http://127.0.0.1:${httpPort}/hello`,
           httpPort,
         ),
@@ -767,7 +792,7 @@ describe.skipIf(process.platform !== "linux")("native Linux execution backend", 
 
     it("NET-05: the tool environment carries no lease, credential or proxy secret", async () => {
       const result = await egressController!.execute({
-        plan: destinationPlan("/usr/bin/env | /usr/bin/sort", httpPort),
+        request: destinationPlan("/usr/bin/env | /usr/bin/sort", httpPort),
       });
       expect(result.state, JSON.stringify(result)).toBe("completed");
       const stdout = result.state === "completed" ? result.stdout : "";

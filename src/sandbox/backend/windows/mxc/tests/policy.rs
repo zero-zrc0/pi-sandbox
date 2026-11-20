@@ -3,13 +3,32 @@ use pi_sandbox_windows_mxc::{compile_policy, compile_policy_with_proxy};
 use serde_json::json;
 
 #[test]
+fn keeps_parent_write_and_applies_narrower_deny_rules() {
+    let plan = json!({
+        "filesystem": [
+            {"path": "C:\\workspace", "access": "read", "granularity": "directory"},
+            {"path": "C:\\workspace", "access": "write", "granularity": "directory"},
+            {"path": "C:\\workspace\\readonly", "access": "deny-write", "granularity": "directory"},
+            {"path": "C:\\workspace\\secret.txt", "access": "deny-access", "granularity": "file"},
+            {"path": "C:\\workspace\\secret.txt", "access": "read", "granularity": "file"}
+        ],
+        "protectedPaths": [], "network": {"kind": "none"}
+    });
+    let policy = compile_policy(&plan).expect("supported policy");
+    assert_eq!(policy.readwrite_paths, ["C:\\workspace"]);
+    assert!(policy.readonly_paths.contains(&"C:\\workspace\\readonly".to_owned()));
+    assert!(!policy.readonly_paths.contains(&"C:\\workspace\\secret.txt".to_owned()));
+    assert!(policy.denied_paths.contains(&"C:\\workspace\\secret.txt".to_owned()));
+}
+
+#[test]
 fn translates_read_write_roots_and_protects_control_paths() {
     let plan = json!({
         "filesystem": [
             {"path": "C:\\workspace", "access": "read", "granularity": "directory"},
-            {"path": "C:\\workspace", "access": "write", "granularity": "directory"}
+            {"path": "C:\\workspace", "access": "write", "granularity": "directory"},
+            {"path": "C:\\workspace\\.git", "access": "deny-write", "granularity": "directory"}
         ],
-        "protectedPaths": ["C:\\workspace\\.git"],
         "network": {"kind": "none"}
     });
     let policy = compile_policy(&plan).expect("supported policy");
@@ -64,8 +83,9 @@ fn requires_a_trusted_port_for_proxy_only_policy() {
 fn translates_none_and_all_network_scopes_without_changing_file_permissions() {
     for (kind, expected) in [("none", NetworkAction::Deny), ("all", NetworkAction::Allow)] {
         let policy = compile_policy(&json!({
-            "filesystem": [{"path": "C:\\workspace", "access": "read", "granularity": "directory"}],
-            "protectedPaths": ["C:\\workspace\\.git"], "network": {"kind": kind}
+            "filesystem": [{"path": "C:\\workspace", "access": "read", "granularity": "directory"},
+              {"path": "C:\\workspace\\.git", "access": "deny-write", "granularity": "directory"}],
+            "network": {"kind": kind}
         }))
         .expect("supported network scope");
         assert_eq!(policy.network_egress.unwrap().default, expected);
@@ -74,27 +94,27 @@ fn translates_none_and_all_network_scopes_without_changing_file_permissions() {
         assert_eq!(ingress.host_loopback, expected);
         assert_eq!(
             policy.readonly_paths,
-            ["C:\\workspace", "C:\\workspace\\.git"]
+            ["C:\\workspace"]
         );
         assert!(policy.readwrite_paths.is_empty());
     }
 }
 
 #[test]
-fn rejects_a_write_grant_equal_to_a_protected_path() {
+fn denies_a_write_grant_equal_to_a_protected_path() {
     let plan = json!({
         "filesystem": [
             {"path": "C:\\workspace\\.git", "access": "read", "granularity": "directory"},
-            {"path": "C:\\workspace\\.git", "access": "write", "granularity": "directory"}
+            {"path": "C:\\workspace\\.git", "access": "write", "granularity": "directory"},
+            {"path": "C:\\workspace\\.git", "access": "deny-write", "granularity": "directory"}
         ],
-        "protectedPaths": ["C:\\workspace\\.git"],
         "network": {"kind": "none"}
     });
-    assert!(compile_policy(&plan).is_err());
+    assert!(compile_policy(&plan).unwrap().readwrite_paths.is_empty());
 }
 
 #[test]
-fn rejects_write_grants_beneath_protected_paths() {
+fn denies_write_grants_beneath_protected_paths() {
     for (path, granularity) in [
         ("C:\\workspace\\.git\\config", "file"),
         ("C:\\workspace\\.GIT\\hooks", "directory"),
@@ -102,12 +122,12 @@ fn rejects_write_grants_beneath_protected_paths() {
         let plan = json!({
             "filesystem": [
                 {"path": "C:\\workspace", "access": "read", "granularity": "directory"},
-                {"path": path, "access": "write", "granularity": granularity}
+                {"path": path, "access": "write", "granularity": granularity},
+                {"path": "C:\\workspace\\.git", "access": "deny-write", "granularity": "directory"}
             ],
-            "protectedPaths": ["C:\\workspace\\.git"],
             "network": {"kind": "none"}
         });
-        assert!(compile_policy(&plan).is_err(), "write grant: {path}");
+        assert!(compile_policy(&plan).unwrap().readwrite_paths.is_empty(), "write grant: {path}");
     }
 }
 
@@ -116,9 +136,9 @@ fn does_not_confuse_a_sibling_with_a_protected_path() {
     let plan = json!({
         "filesystem": [
             {"path": "C:\\workspace", "access": "read", "granularity": "directory"},
-            {"path": "C:\\workspace\\.github", "access": "write", "granularity": "directory"}
+            {"path": "C:\\workspace\\.github", "access": "write", "granularity": "directory"},
+            {"path": "C:\\workspace\\.git", "access": "deny-write", "granularity": "directory"}
         ],
-        "protectedPaths": ["C:\\workspace\\.git"],
         "network": {"kind": "none"}
     });
     assert!(compile_policy(&plan).is_ok());

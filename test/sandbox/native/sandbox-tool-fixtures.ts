@@ -2,7 +2,7 @@
  * Shared fixtures for the native sandbox-tool suites (design §6).
  *
  * Both platform suites drive the same one-shot worker contract: a declared
- * module exports `execute(args, ctx)`, the helper relays the worker's result
+ * module exports `execute(args, ctx)`, the native runner returns the worker's result
  * envelope in `dataBase64`, and the host decodes it. These module sources are
  * the T1/T5/T8/T9 contract, so they live here instead of drifting apart in two
  * verbatim copies.
@@ -10,22 +10,22 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-/** The result envelope the one-shot worker prints and the helper relays. */
+/** The result envelope the one-shot worker prints and the native runner returns. */
 export interface SandboxToolEnvelope {
   result?: { content?: { type?: string; text?: string }[] };
   error?: unknown;
 }
 
-/** A helper message or execution outcome that may carry the base64 envelope. */
+/** An execution outcome that may carry the base64 envelope. */
 export interface EnvelopeSource {
   readonly dataBase64?: unknown;
 }
 
-/** Decode the worker envelope, failing loudly when the helper relayed none. */
+/** Decode the worker envelope, failing loudly when the native result carries none. */
 export function decodeEnvelope(source: EnvelopeSource): SandboxToolEnvelope {
   const dataBase64 = source.dataBase64;
   if (typeof dataBase64 !== "string" || dataBase64.length === 0) {
-    throw new Error(`helper result carries no dataBase64 envelope (got ${typeof dataBase64})`);
+    throw new Error(`native result carries no dataBase64 envelope (got ${typeof dataBase64})`);
   }
   return JSON.parse(Buffer.from(dataBase64, "base64").toString("utf8")) as SandboxToolEnvelope;
 }
@@ -35,11 +35,11 @@ export function textOf(source: EnvelopeSource): string {
   return decodeEnvelope(source).result?.content?.map(part => part.text).join("\n") ?? "";
 }
 
-/** The error text of a failed helper result, failing readably when it carries none. */
+/** The error text of a failed native result, failing readably when it carries none. */
 export function errorTextOf(source: EnvelopeSource): string {
   const error = decodeEnvelope(source).error;
   if (typeof error !== "string") {
-    throw new Error(`helper result carries no string error (got ${typeof error})`);
+    throw new Error(`native result carries no string error (got ${typeof error})`);
   }
   return error;
 }

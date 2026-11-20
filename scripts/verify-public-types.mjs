@@ -2,16 +2,18 @@ import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync,
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const npmCli = process.env.npm_execpath;
 if (!npmCli) throw new Error("Run this script with npm run verify:public-types.");
 const verifyWindowsMxc = process.argv.includes("--windows-mxc");
+const windowsMxcSource = process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE ??
+  path.join(root, "src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe");
 if (verifyWindowsMxc && process.platform !== "win32") throw new Error("Windows MXC package verification requires Windows.");
-if (verifyWindowsMxc && !existsSync(path.join(root, "src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe"))) {
-  throw new Error("Build the Windows MXC runtime before package verification.");
+if (verifyWindowsMxc && !existsSync(windowsMxcSource)) {
+  throw new Error("Build the Windows MXC runtime or set PI_SANDBOX_TEST_MXC_EXECUTABLE before package verification.");
 }
 const cache = path.join(root, ".cache");
 mkdirSync(cache, { recursive: true });
@@ -109,23 +111,27 @@ getPermissionsService();
   }
   if (verifyWindowsMxc) {
     const installed = path.join(consumer, "node_modules/@sirzero/pi-sandbox");
-    const helper = path.join(installed, "src/sandbox/backend/windows/helper.mjs");
     const runtimeDirectory = path.join(installed, "runtimes/1.0.0/win32-x64");
     mkdirSync(runtimeDirectory, { recursive: true });
-    const nativeSource = path.join(root, "src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe");
+    const nativeSource = windowsMxcSource;
     const mxcManifestSource = path.join(root, "src/sandbox/backend/windows/mxc/mxc-runtime.json");
     const nativePath = path.join(runtimeDirectory, "pi-sandbox-windows-mxc.exe");
     const mxcManifestPath = path.join(runtimeDirectory, "mxc-runtime.json");
     copyFileSync(nativeSource, nativePath);
-    copyFileSync(mxcManifestSource, mxcManifestPath);
     const sha256 = file => createHash("sha256").update(readFileSync(file)).digest("hex");
+    if (process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE) {
+      writeFileSync(mxcManifestPath, JSON.stringify({ schemaVersion: 1, backend: "windows-mxc", version: "1.0.0",
+        sdkRevision: "b21120168d70befe12356411423266bfef168446", sha256: sha256(nativePath) }));
+    } else {
+      copyFileSync(mxcManifestSource, mxcManifestPath);
+    }
     writeFileSync(path.join(runtimeDirectory, "runtime.json"), JSON.stringify({
       schemaVersion: 1,
       version: "1.0.0",
       stable: true,
       platform: "win32",
       arch: process.arch,
-      protocolVersion: 2,
+      protocolVersion: 3,
       minPluginVersion: "1.0.0",
       maxPluginVersionExclusive: "2.0.0",
       backendId: "windows-mxc",
@@ -136,41 +142,27 @@ getPermissionsService();
     }));
     const workspace = path.join(work, "native-workspace");
     mkdirSync(workspace);
-    writeFileSync(path.join(workspace, "sample.txt"), "packaged-native-read");
-    const child = spawn(process.execPath, [helper], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, PI_SANDBOX_RUNTIME_DIR: runtimeDirectory },
+    const agentDirectory = path.join(work, "agent");
+    mkdirSync(agentDirectory);
+    const probe = spawnSync(nativePath, ["probe"], {
+      encoding: "utf8",
+      timeout: 15_000,
+      env: {
+        ...process.env,
+        PI_MXC_AGENT_DIR: agentDirectory,
+        PI_SANDBOX_RUNTIME_DIR: runtimeDirectory,
+        PI_SANDBOX_RUNTIME_ROOT: path.join(installed, "runtimes"),
+        PI_SANDBOX_WORKSPACE_ROOT: workspace,
+      },
     });
-    try {
-      const message = await new Promise((resolve, reject) => {
-        let buffer = "";
-        const timer = setTimeout(() => reject(new Error("Packaged Windows helper timed out.")), 15_000);
-        child.stdout.setEncoding("utf8");
-        child.stdout.on("data", chunk => {
-          buffer += chunk;
-          for (;;) {
-            const end = buffer.indexOf("\n");
-            if (end < 0) break;
-            const packet = JSON.parse(buffer.slice(0, end));
-            buffer = buffer.slice(end + 1);
-            if (packet.type === "ready") child.stdin.write(JSON.stringify({ type: "start", requestId: "packaged", generation: 1,
-              plan: { backend: { id: "windows-mxc" }, cwd: workspace, toolCallId: "packaged",
-                filesystem: [{ path: workspace, access: "read", granularity: "directory" }], protectedPaths: [],
-                network: { kind: "none" }, environment: { SystemRoot: process.env.SystemRoot, PATH: process.env.PATH },
-                operation: { kind: "builtin-tool", name: "read", arguments: { path: "sample.txt" } } } }) + "\n");
-            if (["result", "rejected", "error"].includes(packet.type)) { clearTimeout(timer); resolve(packet); }
-          }
-        });
-        child.on("error", reject);
-        child.on("exit", code => reject(new Error(`Packaged Windows helper exited: ${code}`)));
-        child.stdin.write(JSON.stringify({ type: "hello", protocolVersion: 2, requestId: "packaged", generation: 1 }) + "\n");
-      });
-      if (message.type !== "result" || message.exitCode !== 0 ||
-          !Buffer.from(message.dataBase64 ?? "", "base64").toString("utf8").includes("packaged-native-read")) {
-        throw new Error(`Packaged Windows builtin failed: ${JSON.stringify(message)}`);
-      }
-    } finally { child.kill(); }
-    console.log("Packaged Windows MXC runtime executed a builtin in the isolated consumer.");
+    if (probe.error || probe.status !== 0) throw new Error(`Packaged Windows MXC probe failed: ${probe.stderr ?? probe.error}`);
+    let capabilities;
+    try { capabilities = JSON.parse(probe.stdout); }
+    catch { throw new Error(`Packaged Windows MXC probe returned invalid data: ${probe.stdout}`); }
+    if (capabilities.available !== true || capabilities.planVersion !== 3) {
+      throw new Error(`Packaged Windows MXC runtime is incompatible: ${probe.stdout}`);
+    }
+    console.log("Packaged Windows MXC runtime passed its host-native probe.");
   }
   console.log("Packaged public types compile in an isolated consumer; Pi loads the single permission extension.");
 } finally {

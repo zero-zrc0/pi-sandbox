@@ -1,10 +1,12 @@
 import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, isAbsolute, join, parse } from "node:path";
+import { createHash } from "node:crypto";
+import { dirname, isAbsolute, parse } from "node:path";
 
-import type { TrustedHelperInstallation } from "#sandbox/helper";
 import { resolveHostPathIdentity, normalizeHostPath } from "#sandbox/path";
 import type { ExecutionPlan } from "#sandbox/types";
+import { MACOS_SYSTEM_PATHS, sensitivePathIdentityMatches } from "#sandbox/sensitive-paths";
+import { MACOS_SYSTEM_READ_FILES, MACOS_SYSTEM_READ_PATHS } from "#sandbox/runtime-filesystem";
 
 export const MACOS_SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
 
@@ -21,71 +23,12 @@ const VOLUME_ROOT_READ_RULE = '(allow file-read* (literal "/"))';
  * reported as EPERM before the grant is ever matched.
  */
 const METADATA_READ_RULE = '(allow file-read-metadata (subpath "/"))';
-const SYSTEM_READ_PATHS = [
-  "/System/Library",
-  "/System/Volumes/Preboot",
-  "/bin",
-  "/private/var/db/dyld",
-  "/sbin",
-  "/usr/bin",
-  "/usr/lib",
-  "/usr/libexec",
-  "/usr/share",
-] as const;
-
-const SYSTEM_READ_FILES = [
-  "/dev/null",
-  "/dev/random",
-  "/dev/urandom",
-  "/etc/group",
-  "/etc/hosts",
-  "/etc/localtime",
-  "/etc/passwd",
-  "/private/etc/group",
-  "/private/etc/hosts",
-  "/private/etc/localtime",
-  "/private/etc/passwd",
-] as const;
-
-const HOME_SECRET_DIRECTORIES = [
-  ".aws",
-  ".azure",
-  ".config",
-  ".docker",
-  ".gnupg",
-  ".kube",
-  ".ssh",
-  "Library/Keychains",
-] as const;
-
-const HOME_SECRET_FILES = [
-  ".git-credentials",
-  ".netrc",
-  ".npmrc",
-  ".pypirc",
-  ".pi/agent/auth.json",
-  "Library/Application Support/com.apple.TCC/TCC.db",
-] as const;
-
 /*
  * System credential stores: the OS protects most of them with POSIX modes, but
  * some (DarwinDirectory, System.keychain, TCC) are world-readable, so the
  * sandbox layer must deny them explicitly instead of relying on DAC. These
  * rules are emitted last because a later rule overrides an earlier one.
  */
-const SYSTEM_DENY_PATHS = [
-  { path: "/private/var/db/dslocal", granularity: "directory" },
-  { path: "/private/var/db/DarwinDirectory", granularity: "directory" },
-  { path: "/private/var/db/auth.db", granularity: "file" },
-  { path: "/private/etc/master.passwd", granularity: "file" },
-  { path: "/private/etc/sudoers", granularity: "file" },
-  { path: "/private/etc/sudoers.d", granularity: "directory" },
-  { path: "/private/var/db/sudo", granularity: "directory" },
-  { path: "/private/var/db/SystemPolicyConfiguration", granularity: "directory" },
-  { path: "/Library/Keychains/System.keychain", granularity: "file" },
-  { path: "/Library/Application Support/com.apple.TCC/TCC.db", granularity: "file" },
-] as const;
-
 export type MacOSSeatbeltProbe =
   | {
       readonly status: "candidate-present";
@@ -99,10 +42,17 @@ export type MacOSSeatbeltProbe =
     };
 
 let cachedProbe: MacOSSeatbeltProbe | undefined;
+const seatbeltProfileCache = new Map<string, string>();
 
 export type SeatbeltProfileResult =
   | { readonly ok: true; readonly profile: string }
   | SeatbeltPolicyError;
+
+export interface SeatbeltInstallation {
+  readonly installRoot: string;
+  readonly executable: string;
+  readonly args?: readonly string[];
+}
 
 type SeatbeltPolicyError = {
   readonly ok: false;
@@ -229,36 +179,63 @@ function probeMacOSSeatbeltOnce(): MacOSSeatbeltProbe {
 }
 
 export function buildSeatbeltProfile(input: {
-  readonly installation: TrustedHelperInstallation;
-  readonly helperHome?: string;
+  readonly installation: SeatbeltInstallation;
+  readonly executionHome?: string;
   readonly plan?: ExecutionPlan;
+  readonly cwd?: string;
 }): SeatbeltProfileResult {
+  if (input.plan) {
+    for (const grant of input.plan.filesystem) {
+      if (grant.access !== "deny-write" && grant.access !== "deny-access") continue;
+      if ((grant.access === "deny-access" || grant.identity !== undefined) && (!grant.requestedPath || !grant.identity ||
+          !sensitivePathIdentityMatches({ requestedPath: grant.requestedPath, path: grant.path,
+            granularity: grant.granularity, identity: grant.identity }))) {
+        return unsupported(`sensitive path identity changed: ${grant.path}`);
+      }
+    }
+  }
+  const cacheKey = input.plan === undefined ? undefined : createHash("sha256").update(JSON.stringify({
+    plan: input.plan,
+    cwd: input.cwd,
+    executionHome: input.executionHome,
+    installation: { installRoot: input.installation.installRoot, executable: input.installation.executable,
+      args: input.installation.args ?? [] },
+  })).digest("hex");
+  if (cacheKey) {
+    const cached = seatbeltProfileCache.get(cacheKey);
+    if (cached !== undefined) return { ok: true, profile: cached };
+  }
+  if (input.plan && (!input.cwd || !isAbsolute(input.cwd))) {
+    return unsupported("execution cwd must be absolute");
+  }
   const rules = [
     "(version 1)",
     "(deny default)",
     VOLUME_ROOT_READ_RULE,
-    METADATA_READ_RULE,
+    ...(!input.plan || input.plan.metadataRead === "all" ? [METADATA_READ_RULE] : []),
     "(allow process-exec)",
     "(allow process-fork)",
     "(allow sysctl-read)",
   ];
 
-  for (const path of SYSTEM_READ_PATHS) {
+  for (const path of input.plan ? [] : MACOS_SYSTEM_READ_PATHS) {
     const rule = pathRule("allow", "file-read*", path, "directory");
     if (!rule.ok) return rule;
     rules.push(rule.value);
   }
-  for (const path of SYSTEM_READ_FILES) {
+  for (const path of input.plan ? [] : MACOS_SYSTEM_READ_FILES) {
     const readRule = pathRule("allow", "file-read*", path, "file");
     if (!readRule.ok) return readRule;
     rules.push(readRule.value);
   }
-  const nullWrite = pathRule("allow", "file-write*", "/dev/null", "file");
-  if (!nullWrite.ok) return nullWrite;
-  rules.push(nullWrite.value);
+  if (!input.plan) {
+    const nullWrite = pathRule("allow", "file-write*", "/dev/null", "file");
+    if (!nullWrite.ok) return nullWrite;
+    rules.push(nullWrite.value);
+  }
 
   /*
-   * The helper is node itself, and an nvm install lives outside /usr and
+   * A Node target may live outside /usr and
    * /System: dyld needs the canonical binary plus its directory readable.
    */
   const nodeExecutable = canonicalPath(process.execPath);
@@ -272,38 +249,74 @@ export function buildSeatbeltProfile(input: {
     "directory",
   );
   if (!nodeDirectoryRead.ok) return nodeDirectoryRead;
-  rules.push(nodeFileRead.value, nodeDirectoryRead.value);
+  if (!input.plan) rules.push(nodeFileRead.value, nodeDirectoryRead.value);
 
   const installRoot = canonicalPath(input.installation.installRoot);
   if (!installRoot.ok) return installRoot;
   const installRead = pathRule("allow", "file-read*", installRoot.path, "directory");
   if (!installRead.ok) return installRead;
-  rules.push(installRead.value);
+  if (!input.plan) rules.push(installRead.value);
 
-  const helperExecutable = canonicalPath(input.installation.executable);
-  if (!helperExecutable.ok) return helperExecutable;
-  const executableParent = parentMetadataRule(helperExecutable.path);
+  const executionExecutable = canonicalPath(input.installation.executable);
+  if (!executionExecutable.ok) return executionExecutable;
+  const executableParent = parentMetadataRule(executionExecutable.path);
   if (!executableParent.ok) return executableParent;
   rules.push(executableParent.value);
 
   for (const arg of input.installation.args ?? []) {
     if (!isAbsolute(arg)) continue;
-    const helperArgument = canonicalPath(arg);
-    if (!helperArgument.ok) return helperArgument;
-    const argumentParent = parentMetadataRule(helperArgument.path);
+    const executionArgument = canonicalPath(arg);
+    if (!executionArgument.ok) return executionArgument;
+    const argumentParent = parentMetadataRule(executionArgument.path);
     if (!argumentParent.ok) return argumentParent;
     rules.push(argumentParent.value);
   }
 
-  const protectedPaths = [installRoot.path];
+  const protectedPaths = input.plan ? [] : [installRoot.path];
+  const restrictions: string[] = [];
   if (input.plan) {
-    if (input.plan.mode === "full-access") {
-      return unsupported("full-access does not use the macOS restricted backend");
-    }
     if (input.plan.network.kind !== "none") {
       return unsupported("Seatbelt candidate only supports a profile with no network access");
     }
+    const ancestors = new Set<string>();
+    for (const value of [input.cwd!, input.installation.executable, ...(input.installation.args ?? []),
+      ...input.plan.filesystem.map(rule => rule.path), ...MACOS_SYSTEM_READ_PATHS, ...MACOS_SYSTEM_READ_FILES]) {
+      if (!isAbsolute(value)) continue;
+      let current = dirname(value);
+      for (;;) {
+        ancestors.add(current);
+        const parent = dirname(current);
+        if (parent === current) break;
+        current = parent;
+      }
+    }
+    for (const path of ancestors) {
+      const rule = pathRule("allow", "file-read-metadata", path, "file");
+      if (!rule.ok) return rule;
+      rules.push(rule.value);
+    }
     for (const grant of input.plan.filesystem) {
+      if (grant.granularity !== "file" && grant.granularity !== "directory") return unsupported("unknown filesystem granularity");
+      if (grant.access === "deny-write" || grant.access === "deny-access") {
+        if ((grant.access === "deny-access" || grant.identity !== undefined) && (!grant.requestedPath || !grant.identity ||
+            !sensitivePathIdentityMatches({ requestedPath: grant.requestedPath, path: grant.path,
+              granularity: grant.granularity, identity: grant.identity }))) {
+          return unsupported(`sensitive path identity changed: ${grant.path}`);
+        }
+        const target = canonicalPath(grant.path);
+        if (!target.ok) return target;
+        const paths = new Set([target.path, ...(grant.requestedPath ? [grant.requestedPath] : [])]);
+        for (const path of paths) {
+          for (const operation of grant.access === "deny-access"
+            ? ["file-read-metadata", "file-read*", "file-write*"] : ["file-write*"]) {
+            const rule = pathRule("deny", operation, path, grant.granularity);
+            if (!rule.ok) return rule;
+            restrictions.push(rule.value);
+          }
+        }
+        continue;
+      }
+      if (grant.access !== "read" && grant.access !== "write") return unsupported("unknown filesystem rule");
       const canonical = canonicalPath(grant.path);
       if (!canonical.ok) return canonical;
       if (parse(canonical.path).root === canonical.path) {
@@ -313,6 +326,11 @@ export function buildSeatbeltProfile(input: {
       const rule = pathRule("allow", access, canonical.path, grant.granularity);
       if (!rule.ok) return rule;
       rules.push(rule.value);
+      if (grant.access === "read") {
+        const metadata = pathRule("allow", "file-read-metadata", canonical.path, grant.granularity);
+        if (!metadata.ok) return metadata;
+        rules.push(metadata.value);
+      }
       if (grant.granularity === "file") {
         const parent = pathRule(
           "allow",
@@ -325,38 +343,6 @@ export function buildSeatbeltProfile(input: {
       }
     }
 
-    for (const path of input.plan.protectedPaths) {
-      const protectedPath = canonicalPath(path);
-      if (!protectedPath.ok) return protectedPath;
-      protectedPaths.push(protectedPath.path);
-    }
-
-    const homePaths = new Set(
-      [input.plan.environment.HOME, input.helperHome, process.env.HOME]
-        .filter((value): value is string => typeof value === "string" && value.length > 0)
-        .map((value) => normalizeHostPath(value))
-        .filter((value): value is string => value !== null),
-    );
-    for (const home of homePaths) {
-      for (const name of HOME_SECRET_DIRECTORIES) {
-        const protectedPath = canonicalPath(join(home, name));
-        if (!protectedPath.ok) return protectedPath;
-        const readDeny = pathRule("deny", "file-read*", protectedPath.path, "directory");
-        const writeDeny = pathRule("deny", "file-write*", protectedPath.path, "directory");
-        if (!readDeny.ok) return readDeny;
-        if (!writeDeny.ok) return writeDeny;
-        rules.push(readDeny.value, writeDeny.value);
-      }
-      for (const name of HOME_SECRET_FILES) {
-        const protectedPath = canonicalPath(join(home, name));
-        if (!protectedPath.ok) return protectedPath;
-        const readDeny = pathRule("deny", "file-read*", protectedPath.path, "file");
-        const writeDeny = pathRule("deny", "file-write*", protectedPath.path, "file");
-        if (!readDeny.ok) return readDeny;
-        if (!writeDeny.ok) return writeDeny;
-        rules.push(readDeny.value, writeDeny.value);
-      }
-    }
   }
 
   for (const path of protectedPaths) {
@@ -365,7 +351,7 @@ export function buildSeatbeltProfile(input: {
     rules.push(rule.value);
   }
 
-  for (const entry of SYSTEM_DENY_PATHS) {
+  for (const entry of input.plan ? [] : MACOS_SYSTEM_PATHS) {
     const target = canonicalPath(entry.path);
     if (!target.ok) return target;
     /*
@@ -382,9 +368,15 @@ export function buildSeatbeltProfile(input: {
     rules.push(metadataDeny.value, readDeny.value, writeDeny.value);
   }
 
+  rules.push(...restrictions);
+
   const profile = `${rules.join("\n")}\n`;
   if (Buffer.byteLength(profile, "utf8") > MAX_PROFILE_BYTES) {
     return unsupported("compiled Seatbelt profile exceeds the argument size limit");
+  }
+  if (cacheKey) {
+    seatbeltProfileCache.set(cacheKey, profile);
+    if (seatbeltProfileCache.size > 64) seatbeltProfileCache.delete(seatbeltProfileCache.keys().next().value!);
   }
   return { ok: true, profile };
 }

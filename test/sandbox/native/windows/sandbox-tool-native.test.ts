@@ -1,4 +1,3 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,9 +5,12 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { ExecutionController } from "#sandbox/lifecycle";
+import { createWindowsDirectBackend } from "#sandbox/backend/windows/direct";
 import { PROTECTED_CONTROL_DIRECTORY_NAMES } from "#sandbox/path";
-import type { ExecutionPlan } from "#sandbox/types";
-import { compileTestPlan, makeInvocation, runtimeEnvironment } from "../../fixtures/harness";
+import { windowsRuntimeFilesystem } from "#sandbox/runtime-filesystem";
+import type { ExecutionRequest } from "#sandbox/types";
+import type { ResolvedRuntimeFiles } from "#sandbox/runtime-store";
+import { compileTestRequest, makeInvocation, runtimeEnvironment, waitFor } from "../../fixtures/harness";
 import { installWindowsTestRuntime } from "../../fixtures/runtime";
 import {
   COUNTER_MODULE,
@@ -20,97 +22,50 @@ import {
   writeModule,
 } from "../sandbox-tool-fixtures";
 
-const helper = fileURLToPath(new URL("../../../../src/sandbox/backend/windows/helper.mjs", import.meta.url));
 const executable = fileURLToPath(new URL("../../../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url));
 const packageRoot = realpathSync(fileURLToPath(new URL("../../../../", import.meta.url)));
 const TOOL_NAME = "native_probe_tool";
-let runtimeDirectory: string | undefined;
+let runtime: ResolvedRuntimeFiles | undefined;
 
 beforeAll(() => {
-  if (process.platform === "win32" && existsSync(executable)) runtimeDirectory = installWindowsTestRuntime().directory;
+  if (process.platform === "win32" && existsSync(executable)) runtime = installWindowsTestRuntime();
 });
 afterAll(() => {
-  if (runtimeDirectory) rmSync(runtimeDirectory, { recursive: true, force: true });
+  if (runtime) rmSync(runtime.directory, { recursive: true, force: true });
 });
 
 /** The Windows runtime environment a sandboxed node worker needs. */
 function toolEnvironment(): Record<string, string> {
   const environment: Record<string, string> = {};
-  for (const name of ["SystemRoot", "PATH"]) {
+  for (const name of ["SystemRoot", "SystemDrive", "LOCALAPPDATA", "PATH"]) {
     const value = process.env[name];
     if (typeof value === "string") environment[name] = value;
   }
   return environment;
 }
 
-/** Helper process environment; the native launcher resolves its AppContainer from LOCALAPPDATA. */
-function helperEnvironment(): Record<string, string> {
+/** Host environment for the native launcher; it resolves its AppContainer from LOCALAPPDATA. */
+function nativeEnvironment(): Record<string, string> {
   const environment: Record<string, string> = { ...runtimeEnvironment() };
   const localAppData = process.env.LOCALAPPDATA;
   if (typeof localAppData === "string") environment.LOCALAPPDATA = localAppData;
-  if (runtimeDirectory) environment.PI_SANDBOX_RUNTIME_DIR = runtimeDirectory;
+  if (runtime) environment.PI_SANDBOX_RUNTIME_DIR = runtime.directory;
   return environment;
 }
 
-interface HelperCall {
-  readonly started: Promise<Record<string, unknown>>;
-  readonly result: Promise<Record<string, unknown>>;
-}
-
-interface HelperClient {
-  readonly ready: () => Promise<Record<string, unknown>>;
-  readonly start: (requestId: string, plan: Record<string, unknown>) => HelperCall;
-  readonly cancel: (requestId: string) => void;
-  readonly close: () => void;
-}
-
-/** Drive the helper's one-shot JSON protocol, as the execution controller does. */
-function createHelperClient(): HelperClient {
-  const child: ChildProcessWithoutNullStreams = spawn(process.execPath, [helper], {
-    stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PI_SANDBOX_RUNTIME_DIR: runtimeDirectory },
+function createController(layout: NativeLayout): ExecutionController {
+  if (!runtime) throw new Error("Windows native runtime is unavailable");
+  const environment = nativeEnvironment();
+  return new ExecutionController({
+    directBackend: createWindowsDirectBackend({
+      runtime,
+      installRoot: packageRoot,
+      hostCwd: layout.hostCwd,
+      hostEnvironment: environment,
+    }),
+    startTimeoutMs: 5_000,
+    cancelGraceMs: 500,
   });
-  let buffer = "";
-  let readyResolve!: (message: Record<string, unknown>) => void;
-  let fail!: (error: Error) => void;
-  const ready = new Promise<Record<string, unknown>>((resolve, reject) => {
-    readyResolve = resolve;
-    fail = reject;
-  });
-  const started = new Map<string, (message: Record<string, unknown>) => void>();
-  const results = new Map<string, (message: Record<string, unknown>) => void>();
-  child.stdout.setEncoding("utf8");
-  child.stdout.on("data", (chunk: string) => {
-    buffer += chunk;
-    for (;;) {
-      const end = buffer.indexOf("\n");
-      if (end < 0) break;
-      const message = JSON.parse(buffer.slice(0, end)) as Record<string, unknown>;
-      buffer = buffer.slice(end + 1);
-      const requestId = String(message.requestId ?? "");
-      if (message.type === "ready") readyResolve(message);
-      else if (message.type === "started") started.get(requestId)?.(message);
-      else if (message.type === "result" || message.type === "rejected" || message.type === "error" || message.type === "cancelled") results.get(requestId)?.(message);
-      else if (message.type !== "output") fail(new Error(`unexpected helper message: ${JSON.stringify(message)}`));
-    }
-  });
-  child.on("error", fail);
-  child.on("exit", code => fail(new Error(`helper exited before a response: ${String(code)}`)));
-  child.stdin.write(JSON.stringify({ type: "hello", protocolVersion: 2, requestId: "hello", generation: 1 }) + "\n");
-  return {
-    ready: () => ready,
-    start: (requestId, plan) => {
-      let startedResolve!: (message: Record<string, unknown>) => void;
-      let resultResolve!: (message: Record<string, unknown>) => void;
-      const startedPromise = new Promise<Record<string, unknown>>(resolve => { startedResolve = resolve; });
-      const resultPromise = new Promise<Record<string, unknown>>((resolve) => { resultResolve = resolve; });
-      started.set(requestId, startedResolve);
-      results.set(requestId, resultResolve);
-      child.stdin.write(JSON.stringify({ type: "start", requestId, generation: 1, plan }) + "\n");
-      return { started: startedPromise, result: resultPromise };
-    },
-    cancel: requestId => child.stdin.write(JSON.stringify({ type: "cancel", requestId, generation: 1 }) + "\n"),
-    close: () => child.kill(),
-  };
 }
 
 interface NativeLayout {
@@ -119,7 +74,7 @@ interface NativeLayout {
   readonly modules: string;
   readonly stateDirectory: string;
   readonly outside: string;
-  readonly helperCwd: string;
+  readonly hostCwd: string;
 }
 
 function createLayout(prefix: string): NativeLayout {
@@ -128,41 +83,52 @@ function createLayout(prefix: string): NativeLayout {
   const modules = join(root, "modules");
   const stateDirectory = join(workspace, ".pi", "sandbox-tools", TOOL_NAME);
   const outside = join(root, "outside");
-  const helperCwd = join(root, "helper-cwd");
-  for (const directory of [workspace, modules, stateDirectory, outside, helperCwd]) mkdirSync(directory, { recursive: true });
+  const hostCwd = join(root, "native-cwd");
+  for (const directory of [workspace, modules, stateDirectory, outside, hostCwd]) mkdirSync(directory, { recursive: true });
   for (const name of PROTECTED_CONTROL_DIRECTORY_NAMES) mkdirSync(join(workspace, name), { recursive: true });
-  return { root, workspace, modules, stateDirectory, outside, helperCwd };
+  return { root, workspace, modules, stateDirectory, outside, hostCwd };
 }
 
-/** One raw helper plan with exactly the grants a declared sandbox tool needs. */
+/** One host request with exactly the grants a declared sandbox tool needs. */
 function toolPlan(options: {
   readonly layout: NativeLayout;
   readonly modulePath: string;
   readonly arguments?: Record<string, string>;
   readonly config?: Record<string, string>;
   readonly protectedPaths?: readonly string[];
-}): Record<string, unknown> {
+}): ExecutionRequest {
+  const operation = {
+    kind: "sandbox-tool" as const, name: TOOL_NAME, modulePath: options.modulePath,
+    stateDirectory: options.layout.stateDirectory, arguments: options.arguments ?? {},
+    ...(options.config === undefined ? {} : { config: options.config }),
+  };
+  const runtime = windowsRuntimeFilesystem({ cwd: options.layout.workspace, installRoot: packageRoot,
+    agentDirectory: options.layout.root, operation, environment: toolEnvironment() });
+  const filesystem = [
+    { path: options.layout.workspace, access: "read" as const, granularity: "directory" as const, source: "baseline" as const },
+    { path: options.layout.workspace, access: "write" as const, granularity: "directory" as const, source: "baseline" as const },
+    { path: options.layout.modules, access: "read" as const, granularity: "directory" as const, source: "approved-extension" as const },
+    { path: options.layout.stateDirectory, access: "write" as const, granularity: "directory" as const, source: "approved-extension" as const },
+    ...runtime.grants.map(grant => ({ ...grant, source: "runtime" as const })),
+    ...[...(options.protectedPaths ?? []), ...runtime.protectedPaths].map(path => ({ path,
+      access: "deny-write" as const, granularity: path === realpathSync.native(process.execPath) ? "file" as const : "directory" as const,
+      source: "protection" as const })),
+  ];
+  const environment = toolEnvironment();
+  const plan = { version: 3 as const, filesystem, network: { kind: "none" as const }, metadataRead: "none" as const,
+    digest: "0".repeat(64) };
   return {
-    backend: { id: "windows-mxc" },
-    cwd: options.layout.workspace,
+    plan,
+    requestId: "native-sandbox-tool",
     toolCallId: TOOL_NAME,
-    filesystem: [
-      { path: options.layout.workspace, access: "read", granularity: "directory" },
-      { path: options.layout.workspace, access: "write", granularity: "directory" },
-      { path: options.layout.modules, access: "read", granularity: "directory" },
-      { path: options.layout.stateDirectory, access: "write", granularity: "directory" },
-    ],
-    protectedPaths: [...(options.protectedPaths ?? [])],
-    network: { kind: "none" },
-    environment: toolEnvironment(),
-    operation: {
-      kind: "sandbox-tool",
-      name: TOOL_NAME,
-      modulePath: options.modulePath,
-      stateDirectory: options.layout.stateDirectory,
-      arguments: options.arguments ?? {},
-      ...(options.config === undefined ? {} : { config: options.config }),
-    },
+    actionDigest: "0".repeat(64),
+    sessionId: "native-sandbox-tool-session",
+    toolName: TOOL_NAME,
+    mode: "default",
+    policyRevision: "native-test-policy",
+    configRevision: "native-test-config",
+    backendId: "windows-mxc",
+    start: { cwd: options.layout.workspace, operation, environment, deadlineAt: Date.now() + 30_000 },
   };
 }
 
@@ -170,13 +136,12 @@ describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Window
   it("executes a declared third-party tool inside the native boundary", async () => {
     const layout = createLayout("mxc-sandbox-tool-");
     const modulePath = writeModule(layout, "counter.mjs", COUNTER_MODULE);
-    const client = createHelperClient();
+    const controller = createController(layout);
     try {
-      await client.ready();
-      const first = await client.start("counter-1", toolPlan({
+      const first = await controller.execute({ request: toolPlan({
         layout, modulePath, arguments: { value: "one" }, config: { mode: "native" },
-      })).result;
-      expect(first, JSON.stringify(first)).toMatchObject({ type: "result", started: true, exitCode: 0 });
+      }) });
+      expect(first, JSON.stringify(first)).toMatchObject({ state: "completed", started: true, exitCode: 0 });
       const firstText = JSON.parse(textOf(first)) as Record<string, unknown>;
       expect(firstText).toMatchObject({
         count: "1",
@@ -187,42 +152,39 @@ describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Window
       });
 
       // A second one-shot worker sees the state the first call persisted.
-      const second = await client.start("counter-2", toolPlan({
+      const second = await controller.execute({ request: toolPlan({
         layout, modulePath, arguments: { value: "two" },
-      })).result;
-      expect(second, JSON.stringify(second)).toMatchObject({ type: "result", started: true, exitCode: 0 });
+      }) });
+      expect(second, JSON.stringify(second)).toMatchObject({ state: "completed", started: true, exitCode: 0 });
       expect(JSON.parse(textOf(second))).toMatchObject({ count: "2", value: "two" });
       expect(readFileSync(join(layout.stateDirectory, "count.txt"), "utf8")).toBe("2");
     } finally {
-      client.close();
+      await controller.dispose();
       rmSync(layout.root, { recursive: true, force: true });
     }
   }, 30_000);
 
-  it("denies a tool write outside the granted directories and keeps the helper usable", async () => {
+  it("denies a tool write outside the granted directories and keeps the controller usable", async () => {
     const layout = createLayout("mxc-sandbox-tool-outside-");
     const modulePath = writeModule(layout, "writer.mjs", WRITER_MODULE);
     const target = join(layout.outside, "escaped.txt");
-    const client = createHelperClient();
+    const controller = createController(layout);
     try {
-      await client.ready();
-      const denied = await client.start("outside-write", toolPlan({
+      const denied = await controller.execute({ request: toolPlan({
         layout, modulePath, arguments: { target },
-      })).result;
-      expect(denied, JSON.stringify(denied)).toMatchObject({ type: "result", started: true, exitCode: 1, errorCode: "tool" });
-      expect(String(denied.error)).toMatch(/EPERM|EACCES|permission denied/iu);
-      expect(String(denied.error)).toContain(target);
+      }) });
+      expect(denied, JSON.stringify(denied)).toMatchObject({ state: "failed", started: true, code: "execution-failed" });
       expect(errorTextOf(denied)).toContain(target);
       expect(existsSync(target)).toBe(false);
 
-      // The denial is one tool result: the helper and the session continue.
-      const next = await client.start("outside-write-next", toolPlan({
+      // Each call gets a fresh native process while the controller remains usable.
+      const next = await controller.execute({ request: toolPlan({
         layout, modulePath: writeModule(layout, "counter.mjs", COUNTER_MODULE), arguments: { value: "after-denial" },
-      })).result;
-      expect(next, JSON.stringify(next)).toMatchObject({ type: "result", started: true, exitCode: 0 });
+      }) });
+      expect(next, JSON.stringify(next)).toMatchObject({ state: "completed", started: true, exitCode: 0 });
       expect(JSON.parse(textOf(next))).toMatchObject({ count: "1", value: "after-denial" });
     } finally {
-      client.close();
+      await controller.dispose();
       rmSync(layout.root, { recursive: true, force: true });
     }
   }, 30_000);
@@ -233,65 +195,68 @@ describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Window
     const protectedDirectory = join(layout.workspace, ".git");
     const target = join(protectedDirectory, "config");
     writeFileSync(target, "protected-original");
-    const client = createHelperClient();
+    const controller = createController(layout);
     try {
-      await client.ready();
-      const denied = await client.start("protected-write", toolPlan({
+      const denied = await controller.execute({ request: toolPlan({
         layout, modulePath, arguments: { target }, protectedPaths: [protectedDirectory],
-      })).result;
-      expect(denied, JSON.stringify(denied)).toMatchObject({ type: "result", started: true, exitCode: 1, errorCode: "tool" });
-      expect(String(denied.error)).toMatch(/EPERM|EACCES|permission denied/iu);
-      expect(String(denied.error)).toContain(target);
+      }) });
+      expect(denied, JSON.stringify(denied)).toMatchObject({ state: "failed", started: true, code: "execution-failed" });
+      expect(errorTextOf(denied)).toContain(target);
       expect(readFileSync(target, "utf8")).toBe("protected-original");
     } finally {
-      client.close();
+      await controller.dispose();
       rmSync(layout.root, { recursive: true, force: true });
     }
   }, 30_000);
 
-  it("returns a readable error when the tool throws and keeps the helper usable", async () => {
+  it("returns a readable error when the tool throws and keeps the controller usable", async () => {
     const layout = createLayout("mxc-sandbox-tool-throw-");
     const modulePath = writeModule(layout, "throwing.mjs", THROWING_MODULE);
-    const client = createHelperClient();
+    const controller = createController(layout);
     try {
-      await client.ready();
-      const thrown = await client.start("throwing", toolPlan({ layout, modulePath })).result;
-      expect(thrown, JSON.stringify(thrown)).toMatchObject({ type: "result", started: true, exitCode: 1, errorCode: "tool" });
-      expect(String(thrown.error)).toContain("native sandbox tool boom");
+      const thrown = await controller.execute({ request: toolPlan({ layout, modulePath }) });
+      expect(thrown, JSON.stringify(thrown)).toMatchObject({ state: "failed", started: true, code: "execution-failed" });
       expect(errorTextOf(thrown)).toContain("native sandbox tool boom");
 
-      const next = await client.start("throwing-next", toolPlan({
+      const next = await controller.execute({ request: toolPlan({
         layout, modulePath: writeModule(layout, "counter.mjs", COUNTER_MODULE), arguments: { value: "after-throw" },
-      })).result;
-      expect(next, JSON.stringify(next)).toMatchObject({ type: "result", started: true, exitCode: 0 });
+      }) });
+      expect(next, JSON.stringify(next)).toMatchObject({ state: "completed", started: true, exitCode: 0 });
       expect(JSON.parse(textOf(next))).toMatchObject({ count: "1", value: "after-throw" });
     } finally {
-      client.close();
+      await controller.dispose();
       rmSync(layout.root, { recursive: true, force: true });
     }
   }, 30_000);
 
-  it("terminates a cancelled slow tool and keeps the helper usable", async () => {
+  it("terminates a cancelled slow tool and keeps the controller usable", async () => {
     const layout = createLayout("mxc-sandbox-tool-cancel-");
-    const modulePath = writeModule(layout, "slow.mjs", SLOW_MODULE);
-    const client = createHelperClient();
+    const marker = join(layout.stateDirectory, "slow-started.txt");
+    const modulePath = writeModule(layout, "slow.mjs", `import { writeFileSync } from "node:fs";
+export async function execute(_args, ctx) {
+  writeFileSync(ctx.stateDirectory + "/slow-started.txt", "started");
+  await new Promise(resolve => setTimeout(resolve, 600_000));
+  return { content: [] };
+}
+`);
+    const controller = createController(layout);
     try {
-      await client.ready();
-      const call = client.start("slow", toolPlan({ layout, modulePath }));
-      await call.started;
+      const request = toolPlan({ layout, modulePath });
+      const pending = controller.execute({ request });
+      await waitFor(() => existsSync(marker), 15_000);
       const startedAt = Date.now();
-      client.cancel("slow");
-      const cancelled = await call.result;
-      expect(cancelled, JSON.stringify(cancelled)).toMatchObject({ type: "cancelled", started: true });
+      await controller.cancel(request.requestId);
+      const cancelled = await pending;
+      expect(cancelled, JSON.stringify(cancelled)).toMatchObject({ state: "cancelled", started: true });
       expect(Date.now() - startedAt).toBeLessThan(15_000);
 
-      const next = await client.start("slow-next", toolPlan({
+      const next = await controller.execute({ request: toolPlan({
         layout, modulePath: writeModule(layout, "counter.mjs", COUNTER_MODULE), arguments: { value: "after-cancel" },
-      })).result;
-      expect(next, JSON.stringify(next)).toMatchObject({ type: "result", started: true, exitCode: 0 });
+      }) });
+      expect(next, JSON.stringify(next)).toMatchObject({ state: "completed", started: true, exitCode: 0 });
       expect(JSON.parse(textOf(next))).toMatchObject({ count: "1", value: "after-cancel" });
     } finally {
-      client.close();
+      await controller.dispose();
       rmSync(layout.root, { recursive: true, force: true });
     }
   }, 30_000);
@@ -310,7 +275,7 @@ describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Window
     readonly toolCallId: string;
     readonly arguments?: Record<string, string>;
     readonly deadlineMs: number;
-  }): ExecutionPlan {
+  }): ExecutionRequest {
     const invocation = makeInvocation({
       cwd: options.layout.workspace,
       toolName: TOOL_NAME,
@@ -322,15 +287,15 @@ describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Window
         { id: "sandbox-tool:state", surface: "path_write", target: options.layout.stateDirectory, access: "write", state: "allow", source: "native-test" },
       ],
     });
-    return compileTestPlan({
+    const operation = { kind: "sandbox-tool" as const, name: TOOL_NAME, modulePath: options.modulePath,
+      stateDirectory: options.layout.stateDirectory, arguments: options.arguments ?? {} };
+    const runtime = windowsRuntimeFilesystem({ cwd: options.layout.workspace, installRoot: packageRoot,
+      agentDirectory: options.layout.root, operation, environment: toolEnvironment() });
+    return compileTestRequest({
       invocation,
-      operation: {
-        kind: "sandbox-tool",
-        name: TOOL_NAME,
-        modulePath: options.modulePath,
-        stateDirectory: options.layout.stateDirectory,
-        arguments: options.arguments ?? {},
-      },
+      operation,
+      runtimeFilesystem: runtime.grants,
+      protectedPaths: runtime.protectedPaths,
       workspace: options.layout.workspace,
       backendId: "windows-mxc",
       approved: {
@@ -348,23 +313,11 @@ describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Window
     const layout = createLayout("mxc-sandbox-tool-deadline-");
     const slowPath = writeModule(layout, "slow.mjs", SLOW_MODULE);
     const counterPath = writeModule(layout, "counter.mjs", COUNTER_MODULE);
-    const controller = new ExecutionController({
-      installation: {
-        installRoot: packageRoot,
-        executable: process.execPath,
-        args: [helper],
-        expectedBackendId: "windows-mxc",
-      },
-      helperCwd: layout.helperCwd,
-      workspace: layout.workspace,
-      helperEnvironment: helperEnvironment(),
-      startTimeoutMs: 5_000,
-      cancelGraceMs: 500,
-    });
+    const controller = createController(layout);
     try {
       const startedAt = Date.now();
       const outcome = await controller.execute({
-        plan: controllerPlan({ layout, modulePath: slowPath, requestId: "deadline", toolCallId: "deadline", deadlineMs: 2_000 }),
+        request: controllerPlan({ layout, modulePath: slowPath, requestId: "deadline", toolCallId: "deadline", deadlineMs: 2_000 }),
       });
       const elapsed = Date.now() - startedAt;
       expect(outcome.state, JSON.stringify(outcome)).toBe("cancelled");
@@ -375,7 +328,7 @@ describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Window
 
       // The same controller still runs the next declared tool call.
       const next = await controller.execute({
-        plan: controllerPlan({
+        request: controllerPlan({
           layout, modulePath: counterPath, requestId: "deadline-next", toolCallId: "deadline-next",
           arguments: { value: "after-timeout" }, deadlineMs: 20_000,
         }),

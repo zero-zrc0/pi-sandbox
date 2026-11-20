@@ -205,16 +205,17 @@ fn fixed_environment(values: &Value) -> Result<Vec<String>, Box<dyn std::error::
         if !names.insert(key.clone()) {
             return Err("duplicate environment name".into());
         }
-        if key != "SYSTEMROOT" && key != "SYSTEMDRIVE" && key != "LOCALAPPDATA" {
-            output.push(format!("{name}={value}"));
-        }
-    }
-    for name in ["SystemRoot", "SystemDrive", "LOCALAPPDATA"] {
-        let value = std::env::var(name)?;
-        if value.is_empty() || value.contains('\0') {
-            return Err("required system environment is unavailable".into());
+        if matches!(key.as_str(), "SYSTEMROOT" | "SYSTEMDRIVE" | "LOCALAPPDATA") {
+            if value.is_empty() || std::env::var(&key).ok().as_deref() != Some(value) {
+                return Err("required system environment differs from the host".into());
+            }
         }
         output.push(format!("{name}={value}"));
+    }
+    for name in ["SYSTEMROOT", "SYSTEMDRIVE", "LOCALAPPDATA"] {
+        if !names.contains(name) {
+            return Err("required system environment is unavailable".into());
+        }
     }
     Ok(output)
 }
@@ -273,16 +274,19 @@ fn is_canonical_path(path: &str) -> io::Result<bool> {
 }
 
 fn lock_grants(plan: &Value) -> Result<Vec<std::fs::File>, Box<dyn std::error::Error>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
     let mut grant_handles = Vec::new();
     for grant in plan["filesystem"]
         .as_array()
         .ok_or("missing filesystem grants")?
     {
         let path = grant["path"].as_str().ok_or("invalid grant path")?;
+        let access = grant["access"].as_str().ok_or("invalid grant access")?;
         match lock_path(path) {
             Ok(handle) => {
-                let metadata = handle.metadata()?;
-                if !is_canonical_path(path)? {
+                let metadata = handle.metadata().map_err(|error| format!("grant handle metadata is unavailable for {path}: {error}"))?;
+                if !is_canonical_path(path).map_err(|error| format!("grant path identity is unavailable for {path}: {error}"))? {
                     return Err("grant path identity changed".into());
                 }
                 let expected = if metadata.is_dir() {
@@ -293,9 +297,25 @@ fn lock_grants(plan: &Value) -> Result<Vec<std::fs::File>, Box<dyn std::error::E
                 if grant["granularity"].as_str() != Some(expected) {
                     return Err("grant type mismatch".into());
                 }
+                if access == "deny-access" || grant.get("identity").is_some() {
+                    let requested = grant["requestedPath"].as_str().ok_or("missing sensitive path")?;
+                    if path_key(&canonical_path(requested)?.to_string_lossy()) != path_key(path) {
+                        return Err("sensitive path changed".into());
+                    }
+                    let device = grant["identity"]["device"].as_str().ok_or("missing sensitive device")?;
+                    let inode = grant["identity"]["inode"].as_str().ok_or("missing sensitive inode")?;
+                    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+                    if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &mut info) } == 0 {
+                        return Err("sensitive path identity unavailable".into());
+                    }
+                    let file_index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+                    if info.dwVolumeSerialNumber.to_string() != device || file_index.to_string() != inode {
+                        return Err("sensitive path identity changed".into());
+                    }
+                }
                 grant_handles.push(handle);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && access != "deny-access" && grant.get("identity").is_none() => {}
             Err(_) => return Err("grant type unavailable".into()),
         }
     }
@@ -312,13 +332,20 @@ fn launch(request: Value, stdio: bool) -> Result<i32, Box<dyn std::error::Error>
         return Err("Codemode Runtime requires inherited stdio".into());
     }
     let plan = request.get("plan").ok_or("missing plan")?;
+    if plan.get("version").and_then(Value::as_u64) != Some(3) {
+        return Err("unsupported execution plan version".into());
+    }
+    if plan.get("metadataRead").and_then(Value::as_str) != Some("none") {
+        return Err("unsupported metadata read rule".into());
+    }
+    let operation = request.get("operation").ok_or("missing operation")?;
+    let environment = request.get("environment").ok_or("missing environment")?;
     if codemode_runtime && plan.pointer("/network/kind").and_then(Value::as_str) != Some("none") {
         return Err("Codemode Runtime network must be disabled".into());
     }
     if codemode_runtime
-        && plan
-            .get("environment")
-            .and_then(Value::as_object)
+        && environment
+            .as_object()
             .ok_or("missing environment")?
             .keys()
             .any(|name| {
@@ -332,8 +359,8 @@ fn launch(request: Value, stdio: bool) -> Result<i32, Box<dyn std::error::Error>
         Some(value) => Some(u16::try_from(value.as_u64().ok_or("invalid proxy port")?)?),
     };
     let mut policy = compile_policy_with_proxy(plan, proxy_port)?;
-    if plan.pointer("/operation/kind").and_then(Value::as_str) == Some("builtin-tool")
-        && plan["environment"]
+    if operation.get("kind").and_then(Value::as_str) == Some("builtin-tool")
+        && environment
             .as_object()
             .ok_or("missing environment")?
             .keys()
@@ -343,51 +370,25 @@ fn launch(request: Value, stdio: bool) -> Result<i32, Box<dyn std::error::Error>
     {
         return Err("builtin runtime injection environment is unsupported".into());
     }
-    let arbitrary_process = stdio
-        || plan.pointer("/operation/kind").and_then(Value::as_str) == Some("shell")
-        || (plan.pointer("/operation/kind").and_then(Value::as_str) == Some("builtin-tool")
-            && matches!(
-                plan.pointer("/operation/name").and_then(Value::as_str),
-                Some("bash" | "powershell" | "grep" | "find")
-            ));
-    let mut protected_handles = Vec::new();
-    if arbitrary_process {
-        for path in plan["protectedPaths"]
-            .as_array()
-            .ok_or("missing protected paths")?
-        {
-            let path = path.as_str().ok_or("invalid protected path")?;
-            match lock_path(path) {
-                Ok(handle) => {
-                    if !is_canonical_path(path)? {
-                        return Err("protected path identity changed".into());
-                    }
-                    protected_handles.push(handle);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if !is_canonical_path(path)? {
-                        return Err("protected path identity changed".into());
-                    }
-                    policy
-                        .readonly_paths
-                        .retain(|candidate| path_key(candidate) != path_key(path));
-                    if !policy
-                        .denied_paths
-                        .iter()
-                        .any(|candidate| path_key(candidate) == path_key(path))
-                    {
-                        policy.denied_paths.push(path.to_owned());
-                    }
-                }
-                Err(_) => return Err("required protected path is unavailable".into()),
+    for rule in plan["filesystem"].as_array().ok_or("missing filesystem rules")? {
+        if rule["access"].as_str() != Some("deny-write") { continue; }
+        let path = rule["path"].as_str().ok_or("invalid protected path")?;
+        if !policy.readonly_paths.iter().any(|candidate| path_key(candidate) == path_key(path)) { continue; }
+        match std::fs::metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !is_canonical_path(path)? { return Err("protected path identity changed".into()); }
+                policy.readonly_paths.retain(|candidate| path_key(candidate) != path_key(path));
+                policy.denied_paths.push(path.to_owned());
             }
+            Err(_) => return Err("required protected path is unavailable".into()),
         }
     }
     let grant_handles = lock_grants(plan)?;
     if !policy.denied_paths.is_empty() && !BaseContainerRunner::supports_native_denied_paths() {
         return Err("native deny paths are unavailable".into());
     }
-    let cwd = plan
+    let cwd = request
         .get("cwd")
         .and_then(Value::as_str)
         .ok_or("missing cwd")?;
@@ -404,25 +405,7 @@ fn launch(request: Value, stdio: bool) -> Result<i32, Box<dyn std::error::Error>
     if args.is_empty() {
         return Err("empty command".into());
     }
-    let environment = fixed_environment(plan.get("environment").ok_or("missing environment")?)?;
-    let system_root = std::env::var("SystemRoot")?;
-    policy.readonly_paths.push(system_root);
-    let volume_root = std::path::Path::new(cwd)
-        .ancestors()
-        .last()
-        .ok_or("invalid cwd")?
-        .to_string_lossy()
-        .into_owned();
-    if !codemode_runtime
-        && !policy
-            .readwrite_paths
-            .iter()
-            .chain(&policy.readonly_paths)
-            .chain(&policy.denied_paths)
-            .any(|path| path_key(path) == path_key(&volume_root))
-    {
-        policy.readonly_paths.push(volume_root);
-    }
+    let environment = fixed_environment(environment)?;
     policy.capabilities.push("registryRead".into());
     policy.ui = UiPolicy {
         disable: false,
@@ -432,7 +415,7 @@ fn launch(request: Value, stdio: bool) -> Result<i32, Box<dyn std::error::Error>
         isolation: "desktop".into(),
         ..Default::default()
     };
-    let is_cmd_shell = plan.pointer("/operation/kind").and_then(Value::as_str) == Some("shell")
+    let is_cmd_shell = operation.get("kind").and_then(Value::as_str) == Some("shell")
         && args.len() == 5
         && std::path::Path::new(&args[0])
             .file_name()
@@ -479,11 +462,9 @@ fn launch(request: Value, stdio: bool) -> Result<i32, Box<dyn std::error::Error>
             },
         )
         .map_err(|_| {
-            if codemode_runtime {
-                let diagnostics = logger.get_buffer().to_string();
-                if !diagnostics.is_empty() {
-                    eprint!("{diagnostics}");
-                }
+            let diagnostics = logger.get_buffer().to_string();
+            if !diagnostics.is_empty() {
+                eprint!("{diagnostics}");
             }
             if proxy_port.is_some() {
                 "native proxy-only sandbox launch failed"
@@ -492,7 +473,6 @@ fn launch(request: Value, stdio: bool) -> Result<i32, Box<dyn std::error::Error>
             }
         })?;
     drop(grant_handles);
-    drop(protected_handles);
     if stdio {
         return Ok(child.wait()?);
     }
@@ -567,7 +547,11 @@ fn main() {
         let request = ExecutionRequest {
             script_code: format!("\"{root}\\System32\\cmd.exe\" /d /c exit 0"),
             working_directory: root,
-            env: fixed_environment(&serde_json::json!({})).ok(),
+            env: fixed_environment(&serde_json::json!({
+                "SystemRoot": std::env::var("SystemRoot").unwrap_or_default(),
+                "SystemDrive": std::env::var("SystemDrive").unwrap_or_default(),
+                "LOCALAPPDATA": std::env::var("LOCALAPPDATA").unwrap_or_default()
+            })).ok(),
             policy,
             ..Default::default()
         };
@@ -582,7 +566,7 @@ fn main() {
             == Some(0);
         let enumerate = BaseContainerRunner::supports_enumerate_paths();
         let deny = BaseContainerRunner::supports_native_denied_paths();
-        println!("{{\"available\":{available},\"enumerate\":{enumerate},\"deny\":{deny}}}");
+        println!("{{\"available\":{available},\"enumerate\":{enumerate},\"deny\":{deny},\"planVersion\":3}}");
         if !available {
             std::process::exit(1);
         }
@@ -617,8 +601,8 @@ mod tests {
         std::fs::write(&file, b"original").unwrap();
         std::fs::create_dir(&directory).unwrap();
         let plan = serde_json::json!({ "filesystem": [
-            { "path": file, "granularity": "file" },
-            { "path": directory, "granularity": "directory" }
+            { "path": file, "access": "read", "granularity": "file" },
+            { "path": directory, "access": "read", "granularity": "directory" }
         ] });
         let handles = lock_grants(&plan).unwrap();
         let moved_file = root.join("moved-file");

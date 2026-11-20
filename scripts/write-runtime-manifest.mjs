@@ -59,7 +59,7 @@ const manifest = {
   stable: true,
   platform,
   arch,
-  protocolVersion: 2,
+  protocolVersion: 3,
   minPluginVersion,
   maxPluginVersionExclusive,
   backendId: platform === "linux" ? "linux-bwrap-landlock-seccomp" : "windows-mxc",
