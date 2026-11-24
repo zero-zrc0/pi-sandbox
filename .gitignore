@@ -11,3 +11,4 @@ drafts/
 /runtimes/
 target/
 *.exe
+/.scratch/

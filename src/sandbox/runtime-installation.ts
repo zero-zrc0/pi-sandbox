@@ -7,7 +7,7 @@ import { downloadRuntimeArchive, type RuntimeDownloadProgress } from "./runtime-
 import { extractRuntimeArchive } from "./runtime-archive";
 import { scanInstalledRuntimes, validateInstalledRuntime, type InstalledRuntimeCandidate, type ResolvedRuntimeFiles } from "./runtime-store";
 
-const installing = new Map<string, Promise<ResolvedRuntimeFiles>>();
+const installing = new Map<string, Promise<void>>();
 
 function pathExists(path: string): boolean {
   try { lstatSync(path); return true; }
@@ -71,8 +71,8 @@ function acquireLock(lockPath: string): () => void {
   };
 }
 
-function targetName(entry: Pick<RuntimeResourceEntry, "platform" | "arch">): string {
-  return `${entry.platform}-${entry.arch}`;
+function targetName(entry: Pick<RuntimeResourceEntry, "platform" | "arch" | "version">): string {
+  return `${entry.platform}-${entry.arch}-${entry.version}`;
 }
 
 function installLockPath(runtimesRoot: string, target: string): string {
@@ -126,9 +126,10 @@ export async function acquireRuntimeUseLease(input: {
   readonly storageRoot: string;
   readonly platform: string;
   readonly arch: string;
+  readonly version: string;
 }): Promise<() => void> {
   const runtimesRoot = ensureDirectory(input.storageRoot, join(input.storageRoot, "runtimes"));
-  const target = `${input.platform}-${input.arch}`;
+  const target = `${input.platform}-${input.arch}-${input.version}`;
   if (commitIsLocked(runtimesRoot, target)) throw new Error("runtime update is being committed");
   const directory = ensureDirectory(input.storageRoot, leaseDirectory(runtimesRoot, target));
   const path = join(directory, `${process.pid}-${randomUUID()}.json`);
@@ -353,12 +354,25 @@ export function installRuntimeEntry(input: {
   readonly onProgress?: (progress: RuntimeDownloadProgress) => void;
 }): Promise<ResolvedRuntimeFiles> {
   const key = `${resolve(input.pluginRoot)}:${targetName(input.entry)}`;
-  const current = installing.get(key);
-  if (current) return current;
-  const run = installRuntimeEntryImpl(input);
-  installing.set(key, run);
-  void run.finally(() => {
-    if (installing.get(key) === run) installing.delete(key);
-  }).catch(() => undefined);
+  const previous = installing.get(key);
+  const run = (async () => {
+    if (previous !== undefined) {
+      await new Promise<void>((resolveWait, rejectWait) => {
+        const stop = () => { cleanup(); rejectWait(input.signal?.reason ?? new Error("runtime installation was cancelled")); };
+        const cleanup = () => input.signal?.removeEventListener("abort", stop);
+        if (input.signal?.aborted) { stop(); return; }
+        input.signal?.addEventListener("abort", stop, { once: true });
+        void previous.then(() => { cleanup(); resolveWait(); }, () => { cleanup(); resolveWait(); });
+      });
+    }
+    input.signal?.throwIfAborted();
+    return installRuntimeEntryImpl(input);
+  })();
+  const settled = run.then(() => undefined, () => undefined);
+  const tail = previous === undefined ? settled : Promise.all([previous, settled]).then(() => undefined);
+  installing.set(key, tail);
+  void tail.then(() => {
+    if (installing.get(key) === tail) installing.delete(key);
+  });
   return run;
 }

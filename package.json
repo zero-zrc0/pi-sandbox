@@ -58,6 +58,7 @@
     ]
   },
   "scripts": {
+    "prepare": "husky",
     "check": "tsc --noEmit",
     "build": "npm run build:codemode-worker && npm run build:builtin-worker && npm run build:types",
     "build:codemode-worker": "node scripts/build-codemode-worker.mjs",
@@ -69,6 +70,7 @@
     "test": "vitest run --configLoader native",
     "test:watch": "vitest --configLoader native",
     "test:integration": "vitest run --configLoader native test/integration",
+    "test:regression": "vitest run --configLoader native test/integration test/approve-core/host/pi-extension.test.ts test/sandbox/production.test.ts test/sandbox/codemode/host-execution.test.ts test/sandbox/runtime-manager.test.ts test/service.test.ts test/sdk.test.ts",
     "gen:schema": "node --experimental-strip-types --import ./scripts/register-ts-resolve.mjs scripts/generate-permissions-schema.ts",
     "verify:public-types": "node scripts/verify-public-types.mjs",
     "verify:windows-mxc-package": "node scripts/verify-public-types.mjs --windows-mxc"
@@ -92,6 +94,7 @@
     "@earendil-works/pi-tui": "1.5.0",
     "@types/node": "24.13.3",
     "esbuild": "0.28.2",
+    "husky": "^9.1.7",
     "rollup": "4.63.1",
     "rollup-plugin-dts": "6.5.1",
     "typescript": "6.0.3",

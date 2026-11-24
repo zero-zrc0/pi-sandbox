@@ -129,6 +129,9 @@ describe("completion boundaries", () => {
     const call = prepared("printf x > ../result.txt");
     const n = normalizer();
     const provider = createBashProgramProvider([call], { normalizer: n });
+    const program = await provider(call);
+    expect(program!.externalAccesses().map((access) => [access.path.value(), access.effect.effect]))
+      .toContainEqual(["/work/result.txt", "write"]);
     const bashPrograms = await collectStepBashFacts({ calls: [call], provider });
     const run = async (mode: "default" | "auto-review" | "read-only") => {
       const node = createDecisionNode({

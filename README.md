@@ -67,4 +67,10 @@ Linux 和 Windows 的运行文件与全局审批链配置共用目录：`<agentD
 
 ## 贡献方式与 License
 
+在开发仓库运行 `npm ci` 安装依赖并启用 Git 钩子。普通 `git commit` 会先运行 `npm run check`，再运行 `npm test`，任一失败都会中止提交。钩子检查当前工作树；部分暂存时，未暂存的修改也会参与测试。
+
+`npm run test:regression` 运行主要功能回归，覆盖 Pi 会话、审批与重载、受控工具执行、MCP、CodeMode、运行包管理及公开 SDK。`npm run test:integration` 可单独运行真实 Pi 会话，用离线模型检查只读模式、允许写入、显式拒绝和会话清理。
+
+Windows 开发机运行 `npm run build:windows-mxc` 可从当前源码准备原生运行文件。全量测试会标记因平台或运行文件条件而跳过的用例。
+
 欢迎一起开发：先提 issue，维护者同意后再提 PR。MIT License 见 [LICENSE](LICENSE)。

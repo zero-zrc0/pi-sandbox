@@ -1,5 +1,5 @@
 import { accessSync, constants, realpathSync, statSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, parse } from "node:path";
 
@@ -41,7 +41,6 @@ export type MacOSSeatbeltProbe =
       readonly reason: string;
     };
 
-let cachedProbe: MacOSSeatbeltProbe | undefined;
 const seatbeltProfileCache = new Map<string, string>();
 
 export type SeatbeltProfileResult =
@@ -68,13 +67,8 @@ type SeatbeltPathResult =
   | { readonly ok: true; readonly path: string }
   | SeatbeltPolicyError;
 
-export function probeMacOSSeatbelt(): MacOSSeatbeltProbe {
-  if (cachedProbe) return { ...cachedProbe };
-  cachedProbe = probeMacOSSeatbeltOnce();
-  return { ...cachedProbe };
-}
-
-function probeMacOSSeatbeltOnce(): MacOSSeatbeltProbe {
+export async function probeMacOSSeatbelt(signal?: AbortSignal): Promise<MacOSSeatbeltProbe> {
+  if (signal?.aborted) return { status: "unavailable", reason: "Seatbelt probe was cancelled" };
   if (process.platform !== "darwin") {
     return {
       status: "unavailable",
@@ -146,25 +140,45 @@ function probeMacOSSeatbeltOnce(): MacOSSeatbeltProbe {
     passwdDeny.value,
     lexicalPasswdDeny.value,
   ].join("\n");
-  const result = spawnSync(
-    MACOS_SANDBOX_EXEC_PATH,
-    [
+  const passed = await new Promise<boolean>(resolve => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(MACOS_SANDBOX_EXEC_PATH, [
       "-p",
       probeProfile,
       "/bin/sh",
       "-c",
       "if test -r /etc/passwd; then printf allowed; else printf denied; fi",
-    ],
-    {
+      ], {
       cwd: "/",
       env: { PATH: "/usr/bin:/bin" },
-      encoding: "utf8",
-      maxBuffer: 4096,
-      timeout: 3_000,
+      stdio: ["ignore", "pipe", "ignore"],
       windowsHide: true,
-    },
-  );
-  if (result.error || result.status !== 0 || result.stdout !== "denied") {
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+    let output = "";
+    let failed = false;
+    const stop = () => { failed = true; child.kill("SIGKILL"); };
+    const timer = setTimeout(stop, 3_000);
+    timer.unref?.();
+    signal?.addEventListener("abort", stop, { once: true });
+    if (signal?.aborted) stop();
+    child.stdout?.on("data", (chunk: Buffer) => {
+      output += chunk.toString("utf8");
+      if (output.length > 4096) stop();
+    });
+    child.once("error", () => { failed = true; });
+    child.once("close", code => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", stop);
+      resolve(!failed && code === 0 && output === "denied");
+    });
+  });
+  if (signal?.aborted) return { status: "unavailable", reason: "Seatbelt probe was cancelled" };
+  if (!passed) {
     return {
       status: "unavailable",
       reason: "sandbox-exec did not pass the default-deny file probe",

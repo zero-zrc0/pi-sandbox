@@ -27,7 +27,7 @@ export const REVIEW_MEMORY_LIMITS = Object.freeze({
   maxAuthorizationEntries: 2_048,
   /** Bytes of frozen views plus step manifests for one owner. */
   maxViewBytes: 16 * 1024 * 1024,
-  /** Distinct tool call/result identities tracked for reconciliation. */
+  /** Distinct call IDs tracked with their results as one record. */
   maxToolEvents: 8_192,
   /** Entries walked from the old leaf to the new leaf before a full rebuild. */
   maxIncrementalEntries: 4_096,

@@ -55,7 +55,7 @@ export interface PolicyLoaderView {
   readonly stamp: string;
 }
 
-export type PolicyLoader = () => PolicyLoaderView;
+export type PolicyLoader = (agent?: string) => PolicyLoaderView;
 
 export interface PermissionManagerOptions {
   readonly flavor: PathFlavor;
@@ -135,8 +135,12 @@ export class PermissionManager {
   }
 
   /** Check one resolved intent against the active combined view. */
-  check(intent: AccessIntent, context: CheckContext = {}): PermissionCheckResult {
-    const active = this.activeView(intent.agent);
+  check(
+    intent: AccessIntent,
+    context: CheckContext = {},
+    loader: PolicyLoaderView = this.loadPolicy(intent.agent),
+  ): PermissionCheckResult {
+    const active = this.activeView(intent.agent, loader);
     switch (intent.kind) {
       case "raw-tool":
         return this.evaluateRaw(intent, active, context);
@@ -155,8 +159,9 @@ export class PermissionManager {
     input: unknown,
     agent?: string,
     context: CheckContext = {},
+    loader: PolicyLoaderView = this.loadPolicy(agent),
   ): PermissionCheckResult {
-    const active = this.activeView(agent);
+    const active = this.activeView(agent, loader);
     return this.evaluateRaw(
       { kind: "raw-tool", toolName, input, ...(agent === undefined ? {} : { agent }) },
       active,
@@ -195,17 +200,17 @@ export class PermissionManager {
   }
 
   /** Tool-level state: no session rules, no yolo rewrite. */
-  toolState(toolName: string): RuleAction {
-    const loader = this.loadPolicy();
-    const view = this.configViewFor(loader, undefined);
+  toolState(toolName: string, agent?: string): RuleAction {
+    const loader = this.loadPolicy(agent);
+    const view = this.configViewFor(loader, agent);
     const active = this.configSurface(toolName, view, loader);
     return active.evaluator.evaluateAnyValue(active.surface, active.values).rule.action;
   }
 
   /** Conservative reachability probe for one tool; no session or yolo. */
-  isToolFullyDenied(toolName: string): boolean {
-    const loader = this.loadPolicy();
-    const view = this.configViewFor(loader, undefined);
+  isToolFullyDenied(toolName: string, agent?: string): boolean {
+    const loader = this.loadPolicy(agent);
+    const view = this.configViewFor(loader, agent);
     const active = this.configSurface(toolName, view, loader);
     return active.evaluator.isSurfaceFullyDenied(active.surface);
   }
@@ -265,11 +270,14 @@ export class PermissionManager {
   }
 
   private configView(agent: string | undefined): ConfigView {
-    return this.configViewFor(this.loadPolicy(), agent);
+    return this.configViewFor(this.loadPolicy(agent), agent);
   }
 
-  private activeView(agent: string | undefined): ActiveView {
-    const loader = this.loadPolicy();
+  loadPolicyView(agent?: string): PolicyLoaderView {
+    return this.loadPolicy(agent);
+  }
+
+  private activeView(agent: string | undefined, loader = this.loadPolicy(agent)): ActiveView {
     const config = this.configViewFor(loader, agent);
     const session = this.session.snapshot();
     const yolo = this.readYolo?.() === true;

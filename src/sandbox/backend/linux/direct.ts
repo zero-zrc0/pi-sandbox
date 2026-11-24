@@ -1,11 +1,9 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
-import { selectBubblewrapCandidate } from "./bwrap-selection.mjs";
+import { statSync } from "node:fs";
 import { buildLaunchArgs, probeBubblewrap } from "./direct-launch.mjs";
 import type { EgressGrantRef } from "../../lifecycle";
 import type { DirectBackendDriver, DirectBackendProbe, DirectBackendUnavailable, NativeCompletionInput, NativeLaunchPlan } from "../direct";
-import { captureRuntimeIdentity } from "../../runtime-identity";
+
 import type { ResolvedRuntimeFiles } from "../../runtime-store";
 import type { ExecutionOperation, ExecutionRequest } from "../../types";
 
@@ -58,10 +56,10 @@ function runNativeProbe(executable: string, options: LinuxBackendOptions, bwrapP
     }
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill();
+      child.kill("SIGKILL");
     }, 3_000);
     timer.unref?.();
-    const abort = () => child.kill();
+    const abort = () => child.kill("SIGKILL");
     signal?.addEventListener("abort", abort, { once: true });
     const finish = (code: number | null) => {
       if (settled) return;
@@ -92,25 +90,23 @@ function operationCompletion(operation: ExecutionOperation, input: NativeComplet
 }
 
 export function createLinuxDirectBackend(options: LinuxBackendOptions): DirectBackendDriver {
-  const validateRuntime = captureRuntimeIdentity(options.runtime);
-  const unavailable = (reason: string): DirectBackendUnavailable => ({ ok: false, code: "unavailable", reason });
-  let probed: {
-    readonly bubblewrapPath: string;
-    readonly bubblewrapSha256: string;
-    readonly capabilities: DirectBackendProbe["capabilities"];
-  } | undefined;
 
-  const selectBwrap = (): { readonly path: string; readonly version: string } | undefined => {
+  const unavailable = (reason: string): DirectBackendUnavailable => ({ ok: false, code: "unavailable", reason });
+  let probed = options.runtime.linuxProbe;
+
+  const selectBwrap = async (signal?: AbortSignal): Promise<{ readonly path: string; readonly version: string } | undefined> => {
     const bundled = options.runtime.files.bubblewrap;
     const bundledVersion = options.runtime.manifest.components?.bubblewrapVersion;
-    return selectBubblewrapCandidate(
-      options.systemBubblewrapPath,
-      bundled === undefined || bundledVersion === undefined ? undefined : {
-        path: bundled,
-        version: bundledVersion,
-      },
-      probeBubblewrap,
-    );
+    const candidates = [
+      ...(options.systemBubblewrapPath === undefined ? [] : [{ path: options.systemBubblewrapPath, version: undefined }]),
+      ...(bundled === undefined || bundledVersion === undefined ? [] : [{ path: bundled, version: bundledVersion }]),
+    ];
+    for (const candidate of candidates) {
+      const version = await probeBubblewrap(candidate.path, candidate.version, signal);
+      if (signal?.aborted) return undefined;
+      if (version !== undefined) return { path: candidate.path, version };
+    }
+    return undefined;
   };
 
   return {
@@ -118,15 +114,16 @@ export function createLinuxDirectBackend(options: LinuxBackendOptions): DirectBa
     version: BACKEND_VERSION,
     async probe(signal?: AbortSignal): Promise<DirectBackendProbe | DirectBackendUnavailable> {
       if (signal?.aborted) return unavailable("runtime probe was cancelled");
-      const runtimeReason = validateRuntime();
-      if (runtimeReason) return unavailable(runtimeReason);
+      if (probed !== undefined) return { ok: true, capabilities: probed.capabilities, linuxBubblewrap: probed.bubblewrap };
+
       const nativePath = options.runtime.files.linuxLauncher;
       const bridgePath = options.runtime.files.egressBridge;
       if (!nativePath || !bridgePath) return unavailable("Linux runtime files are incomplete");
-      const selected = selectBwrap();
+      const selected = await selectBwrap(signal);
+      if (signal?.aborted) return unavailable("runtime probe was cancelled");
       if (!selected) return unavailable("no compatible system or bundled bubblewrap passed the required-option and user-namespace probes");
-      const bubblewrapSha256 = createHash("sha256").update(readFileSync(selected.path)).digest("hex");
       const native = await runNativeProbe(nativePath, options, selected.path, signal);
+      if (signal?.aborted) return unavailable("runtime probe was cancelled");
       if (native.timedOut || native.error || native.code !== 0) {
         return unavailable(native.stderr.trim() || native.error || "Linux native capability probe failed");
       }
@@ -143,8 +140,12 @@ export function createLinuxDirectBackend(options: LinuxBackendOptions): DirectBa
         const info = statSync(bridgePath);
         bridgeReady = info.isFile() && (info.mode & 0o111) !== 0;
       } catch {}
+      const bubblewrap = selected.path === options.runtime.files.bubblewrap
+        ? { kind: "bundled" as const }
+        : { kind: "system" as const, path: selected.path };
       const result: DirectBackendProbe = {
         ok: true,
+        linuxBubblewrap: bubblewrap,
         capabilities: {
           filesystem: {
             read: true,
@@ -161,27 +162,19 @@ export function createLinuxDirectBackend(options: LinuxBackendOptions): DirectBa
           processTree: true,
         },
       };
-      probed = { bubblewrapPath: selected.path, bubblewrapSha256, capabilities: result.capabilities };
+      probed = { bubblewrap, capabilities: result.capabilities };
       return result;
     },
-    async prepare(request: ExecutionRequest, egress?: EgressGrantRef): Promise<NativeLaunchPlan | DirectBackendUnavailable> {
-      const runtimeReason = validateRuntime();
-      if (runtimeReason) return { ok: false, code: "setup", reason: runtimeReason };
+    async prepare(request: ExecutionRequest, egress?: EgressGrantRef, signal?: AbortSignal): Promise<NativeLaunchPlan | DirectBackendUnavailable> {
+
+
       const nativePath = options.runtime.files.linuxLauncher;
-      const selected = probed ?? (() => {
-        const candidate = selectBwrap();
-        if (!candidate) return undefined;
-        return {
-          bubblewrapPath: candidate.path,
-          bubblewrapSha256: createHash("sha256").update(readFileSync(candidate.path)).digest("hex"),
-          capabilities: undefined,
-        };
-      })();
-      if (!nativePath || !selected) return { ok: false, code: "setup", reason: "Linux runtime files are incomplete" };
+      const selectedPath = probed === undefined ? (await selectBwrap(signal))?.path
+        : probed.bubblewrap.kind === "bundled" ? options.runtime.files.bubblewrap : probed.bubblewrap.path;
+      if (!nativePath || !selectedPath) return { ok: false, code: "setup", reason: "Linux runtime files are incomplete" };
       try {
-        if (createHash("sha256").update(readFileSync(selected.bubblewrapPath)).digest("hex") !== selected.bubblewrapSha256) {
-          return { ok: false, code: "setup", reason: "selected bubblewrap is unavailable or changed" };
-        }
+        const info = statSync(selectedPath);
+        if (!info.isFile() || (info.mode & 0o111) === 0) return { ok: false, code: "setup", reason: "selected bubblewrap is unavailable or not executable" };
         const launch = buildLaunchArgs(request.plan, request.start, request.toolCallId, egress,
           { installRoot: options.installRoot });
         const operation = request.start.operation;
@@ -196,7 +189,7 @@ export function createLinuxDirectBackend(options: LinuxBackendOptions): DirectBa
           cwd: options.hostCwd,
           environment: {
             ...options.hostEnvironment,
-            PI_SANDBOX_BWRAP_PATH: selected.bubblewrapPath,
+            PI_SANDBOX_BWRAP_PATH: selectedPath,
             ...(launch.egressEnv ?? {}),
           },
           ...(launch.operationInput === undefined ? {} : { input: launch.operationInput }),

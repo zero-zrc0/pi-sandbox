@@ -13,7 +13,9 @@
  * the fallback, the model resolver and C2 exist for.
  *
  * An explicit one-time elevation is an `escalate` ask, so later grants cannot
- * replace approval of its selected tier.
+ * replace approval of its selected tier. Default requests fail closed on
+ * unproven effects; Host requests stay reviewable because a human approves
+ * the exact command.
  */
 import type { PermissionMode } from "../../../contracts";
 import type { ApprovalContext, UnitAccessFact } from "../facts";
@@ -40,12 +42,18 @@ function baseOpinion(context: ApprovalContext, strictApproval: boolean): Handler
   if (call.hostExecutionRequest !== undefined) {
     const elevation = call.hostExecutionRequest.elevation;
     const facts = provenAccess(unit.access);
-    if (facts.some(fact => fact.kind === "unknown" || fact.kind === "network" || fact.kind === "review")) {
-      return { action: "deny", reason: "mode:elevation:effects-unproven-or-unsafe" };
+    if (elevation.tier === "default") {
+      // A Default request widens the sandbox, so its effects must be proven:
+      // unproven or unsafe facts fail closed, and external targets exceed it.
+      if (facts.some(fact => fact.kind === "unknown" || fact.kind === "network" || fact.kind === "review")) {
+        return { action: "deny", reason: "mode:elevation:effects-unproven-or-unsafe" };
+      }
+      if (facts.some(fact => fact.external === true || fact.externalDelete === true)) {
+        return { action: "deny", reason: "mode:elevation:scope-exceeds-default" };
+      }
     }
-    if (elevation.tier === "default" && facts.some(fact => fact.external === true || fact.externalDelete === true)) {
-      return { action: "deny", reason: "mode:elevation:scope-exceeds-default" };
-    }
+    // A Host request is always human-gated: even unproven or unsafe facts stay
+    // reviewable, because the reviewer approves the exact command text.
     return { action: "ask", askFor: "escalate", reason: `mode:${mode}:one-time-${elevation.tier}-execution` };
   }
   if (mode === "full-access") {

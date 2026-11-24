@@ -16,7 +16,7 @@ import type { PathExtractorLookup } from "../utils/access-intent/tool-input-path
 import type { ShellToolsConfig } from "../utils/access-intent/input-normalizer";
 import type { PathNormalizer, ResolvedPathValue } from "../utils/path/path-normalizer";
 import type { PermissionCheckResult } from "../contracts";
-import type { PermissionManager } from "./permission-manager";
+import type { PermissionManager, PolicyLoaderView } from "./permission-manager";
 
 export interface GateCheckRequest {
   readonly toolName: string;
@@ -61,8 +61,8 @@ export class PermissionResolver {
   }
 
   /** Resolve a raw tool call into the intent kind the policy manager consumes. */
-  buildIntent(toolName: string, input: unknown, agent?: string): AccessIntent {
-    const mcpConfigServers = this.mcpConfigServers?.();
+  buildIntent(toolName: string, input: unknown, agent?: string, policy?: PolicyLoaderView): AccessIntent {
+    const mcpConfigServers = policy?.mcpServerNames ?? this.mcpConfigServers?.();
     return buildAccessIntent(toolName, input, {
       normalizer: this.normalizer,
       ...(this.shellTools === undefined ? {} : { shellTools: this.shellTools }),
@@ -73,8 +73,9 @@ export class PermissionResolver {
   }
 
   check(request: GateCheckRequest): PermissionCheckResult {
-    const intent = this.buildIntent(request.toolName, request.input, request.agent);
-    return this.manager.check(intent, { toolName: request.toolName });
+    const policy = this.manager.loadPolicyView(request.agent);
+    const intent = this.buildIntent(request.toolName, request.input, request.agent, policy);
+    return this.manager.check(intent, { toolName: request.toolName }, policy);
   }
 
   /** Check one path literal on a surface, resolving it with the session cwd. */

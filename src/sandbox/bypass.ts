@@ -113,14 +113,14 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
       typeof input.toolName !== "string" || input.toolName.trim().length === 0 ||
       (input.tier !== "default" && input.tier !== "host")
     ) {
-      return { block: true, reason: "sandbox-bypass:invalid-request" };
+      return { block: true, reason: "sandbox-bypass:invalid-request: supply reason, toolName, the target's exact complete arguments, and tier (default or host)" };
     }
     if (input.toolName === SANDBOX_BYPASS_TOOL_NAME) {
       return { block: true, reason: "sandbox-bypass:self-target-forbidden" };
     }
     const sessionId = ctx.sessionManager.getSessionId();
     if (usedCalls.get(sessionId)?.has(toolCallId)) {
-      return { block: true, reason: "sandbox-bypass:duplicate-request" };
+      return { block: true, reason: "sandbox-bypass:duplicate-request: this call already used its one elevation request" };
     }
     const target = findUniqueTool(api, input.toolName);
     if (target === undefined) {
@@ -132,7 +132,7 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
     }
     try {
       if (!Value.Check(target.parameters, args)) {
-        return { block: true, reason: `sandbox-bypass:arguments-do-not-match:${input.toolName}` };
+        return { block: true, reason: `sandbox-bypass:arguments-do-not-match:${input.toolName}: pass the target tool's exact complete arguments unchanged` };
       }
     } catch {
       return { block: true, reason: `sandbox-bypass:invalid-tool-schema:${input.toolName}` };
@@ -144,7 +144,7 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
     }
     const preparedElevation = options.prepareElevation(input.toolName, args, input.tier, ctx);
     if (preparedElevation === undefined) {
-      return { block: true, reason: `sandbox-bypass:elevation-unavailable:${input.tier}:${input.toolName}` };
+      return { block: true, reason: `sandbox-bypass:elevation-unavailable:${input.tier}:${input.toolName}: the elevation could not be prepared for this tool and tier` };
     }
     if ("block" in preparedElevation) return preparedElevation;
     const request: PreparedRequest = {
@@ -229,7 +229,7 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
       options.policyRevision(ctx) !== request.policyRevision ||
       ctx.sessionManager.getSessionId() !== request.sessionId
     ) {
-      throw new Error(formatPiSandboxError("sandbox-bypass:approval-invalidated-by-policy-change"));
+      throw new Error(formatPiSandboxError("sandbox-bypass:approval-invalidated-by-policy-change: the permission configuration changed after approval; request elevation again"));
     }
     const currentTarget = findUniqueTool(api, request.targetToolName);
     const currentHostTool = options.resolveHostTool(request.targetToolName, request.schema);
@@ -242,7 +242,7 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
     }
     if (signal?.aborted || ctx.signal?.aborted) throw new Error(formatPiSandboxError("sandbox-bypass:cancelled-before-execution"));
     if (!options.validateElevation(request.targetToolName, request.arguments, request.elevation, ctx)) {
-      throw new Error(formatPiSandboxError("sandbox-bypass:target-scope-changed"));
+      throw new Error(formatPiSandboxError("sandbox-bypass:target-scope-changed: the approved target's access needs changed after approval; request elevation again"));
     }
 
     const actionDigest = jsonDigest({
@@ -289,10 +289,11 @@ export function createSandboxBypass(options: SandboxBypassOptions) {
       name: SANDBOX_BYPASS_TOOL_NAME,
       label: "Request one-time tool elevation",
       description:
-        "Request one-time elevation for a supported built-in file tool by supplying its exact complete arguments, a reason, and the tier you choose. " +
-        "Choose Default for a one-time sandboxed file access, or Host only when the action needs access outside the sandbox. " +
+        "Request one-time elevation for a supported built-in tool by supplying its exact complete arguments, a reason, and the tier you choose. " +
+        "File tools accept Default for a one-time sandboxed file access; shell tools (bash, powershell) accept Host only, which runs the exact command once outside the OS sandbox after approval. " +
+        "Choose Host only when the action needs access outside the sandbox. " +
         "Default never falls back to Host. Use the least access needed. " +
-        "Explicit policy denies, risk denies, and unknown or unverified effects cannot be overridden.",
+        "Explicit policy denies and risk denies remain final.",
       parameters,
       executionMode: "sequential" as const,
       execute,

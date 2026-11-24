@@ -194,6 +194,44 @@ describe("createStepFacts manifest path", () => {
     expect(recording.inputs).toHaveLength(0);
   });
 
+  it("falls back per-call for a host-certified sanctioned rewrite", () => {
+    const recording = recordingPort();
+    const resolver = createStepFacts({ capture: recording.port });
+    const rewritten = { command: "ls -la /resolved-temporary-path" };
+
+    const result = resolver.capture({
+      event: directEvent({ input: rewritten }),
+      manifest: buildManifest(),
+      registeredTools: ["bash", "read"],
+      sanctionedArgumentRewrite: (manifestCall) => manifestCall.argumentsDigest === LS_DIGEST,
+    });
+
+    expect(result).toMatchObject({ ok: true, source: "per-call" });
+    expect(recording.inputs).toHaveLength(1);
+    expect(recording.inputs[0]!.stepKey).toBe("call:call-ls");
+    expect(recording.inputs[0]!.directCalls[0]).toStrictEqual({
+      toolCallId: "call-ls",
+      toolName: "bash",
+      arguments: rewritten,
+      argumentsDigest: reviewDigest(rewritten),
+    });
+  });
+
+  it("still rejects a digest mismatch the host does not certify", () => {
+    const recording = recordingPort();
+    const resolver = createStepFacts({ capture: recording.port });
+
+    const result = resolver.capture({
+      event: directEvent({ input: { command: "rm -rf /" } }),
+      manifest: buildManifest(),
+      registeredTools: ["bash", "read"],
+      sanctionedArgumentRewrite: () => false,
+    });
+
+    expect(result).toEqual({ ok: false, reason: "invalid" });
+    expect(recording.inputs).toHaveLength(0);
+  });
+
   it("rejects a manifest whose direct tool is not registered", () => {
     const recording = recordingPort();
     const resolver = createStepFacts({ capture: recording.port });

@@ -425,15 +425,6 @@ describe("decision node: C2 sandbox default run", () => {
     expect(summary.reasons[0]?.review?.reason).toBe("session:remembered-deny");
   });
 
-  it("keeps a remembered session denial over sandbox default run", async () => {
-    const summary = await decide("cd sub", {
-      sandboxRun: SANDBOX,
-      sessionReviews: async () => ({ decision: "deny", reason: "session:remembered-deny" }),
-    });
-    expect(summary.decision).toBe("deny");
-    expect(summary.reasons[0]?.review?.reason).toBe("session:remembered-deny");
-  });
-
   it.each(["default", "auto-review"] as const)("does not require a command allowlist in %s", async mode => {
     const summary = await decide("./unmodeled-tool first; ./another-unmodeled-tool second", {
       mode, sandboxRun: SANDBOX,

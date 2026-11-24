@@ -7,7 +7,7 @@
  * worked examples written from the spec, never recomputed from the
  * implementation.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   BranchSummaryEntry,
   CompactionEntry,
@@ -1145,6 +1145,37 @@ describe("incremental suffix synchronization", () => {
 // §1 capacity limits
 // ---------------------------------------------------------------------------
 
+describe("snapshot validity", () => {
+  it("reuses an unchanged view without sorting tool events again", () => {
+    const state = new FakeHostState();
+    state.append(messageEntry("a1", assistantMessage([{ type: "text", text: "first" }])));
+    const memory = createMemory(state);
+    const first = captureView(memory);
+    const sort = vi.spyOn(Array.prototype, "sort");
+    try {
+      expect(captureView(memory).view).toBe(first.view);
+      expect(sort).not.toHaveBeenCalled();
+    } finally {
+      sort.mockRestore();
+    }
+  });
+
+  it("accepts appended messages but rejects a changed branch or authorization", () => {
+    const state = new FakeHostState();
+    state.append(messageEntry("a1", assistantMessage([{ type: "text", text: "first" }])));
+    const memory = createMemory(state);
+    const snapshot = captureView(memory);
+    state.append(messageEntry("a2", assistantMessage([{ type: "text", text: "queued" }])));
+    expect(memory.isCurrent("owner-1", snapshot.view, snapshot.revisions)).toBe(true);
+    state.insert(messageEntry("other", assistantMessage([{ type: "text", text: "other branch" }])));
+    state.setLeaf("other");
+    expect(memory.isCurrent("owner-1", snapshot.view, snapshot.revisions)).toBe(false);
+    state.setLeaf("a2");
+    memory.noteUserInput("new authorization");
+    expect(memory.isCurrent("owner-1", snapshot.view, snapshot.revisions)).toBe(false);
+  });
+});
+
 describe("capacity limits", () => {
   it("truncates the oldest transcript entries at the transcript limit", () => {
     const state = new FakeHostState();
@@ -1164,6 +1195,55 @@ describe("capacity limits", () => {
     state.append(messageEntry("a1", assistantMessage([{ type: "text", text: "answer" }])));
     const memory = createMemory(state, { limits: { maxTranscriptEntries: 2 } });
     expect(captureView(memory).view.transcript).toHaveLength(2);
+  });
+
+  it("truncates completed tool pairs as one unit when results settle out of order", () => {
+    const state = new FakeHostState();
+    state.append(messageEntry("a1", assistantMessage([
+      toolCall("call-a", "bash", { command: "first" }),
+      toolCall("call-b", "grep", { pattern: "needle" }),
+    ])));
+    state.append(messageEntry("r-b", toolResultMessage("call-b", "grep", "denied", { isError: true })));
+    state.append(messageEntry("r-a", toolResultMessage("call-a", "bash", "done")));
+    const memory = createMemory(state, { limits: { maxTranscriptEntries: 1 } });
+
+    const transcript = captureView(memory).view.transcript;
+    expect(transcript.map((entry) => entry.entryKey)).toEqual(["call:call-b", "result:call-b"]);
+    expect(transcript[1]?.tool).toMatchObject({ callId: "call-b", isError: true });
+  });
+
+  it("removes a complete tool pair when the byte budget cannot retain it", () => {
+    const state = new FakeHostState();
+    state.append(messageEntry("a1", assistantMessage([toolCall("call-1", "bash", { command: "run" })])));
+    state.append(messageEntry("r1", toolResultMessage("call-1", "bash", "done")));
+    const memory = createMemory(state, { limits: { maxViewBytes: 16 } });
+
+    const transcript = captureView(memory).view.transcript;
+    expect(transcript).toEqual([]);
+    expect(transcript.some((entry) => entry.tool?.callId === "call-1")).toBe(false);
+  });
+
+  it("limits a large UTF-8 transcript without repeatedly serializing the full view", () => {
+    const state = new FakeHostState();
+    for (let index = 0; index < 80; index += 1) {
+      state.append(messageEntry(`a${index}`, assistantMessage([{ type: "text", text: `内容-${index}-${"字".repeat(40)}` }])));
+    }
+    const memory = createMemory(state, { limits: { maxViewBytes: 2_500 } });
+    const original = JSON.stringify;
+    let wholeViews = 0;
+    const spy = vi.spyOn(JSON, "stringify").mockImplementation(((value: unknown, ...rest: unknown[]) => {
+      if (typeof value === "object" && value !== null && "captureSeq" in value && "transcript" in value) wholeViews += 1;
+      return Reflect.apply(original, JSON, [value, ...rest]);
+    }) as typeof JSON.stringify);
+    try {
+      const view = captureView(memory).view;
+      expect(view.transcript.length).toBeGreaterThan(0);
+      expect(view.transcript.at(-1)?.content).toContain("内容-79-");
+      expect(Buffer.byteLength(original(view), "utf8")).toBeLessThanOrEqual(2_500);
+      expect(wholeViews).toBeLessThanOrEqual(2);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("truncates the oldest authorization entries at the authorization limit", () => {
@@ -1368,7 +1448,7 @@ describe("tool event recording", () => {
     const first = captureView(memory);
     memory.recordToolEvent(callEvent());
     memory.recordToolEvent(resultEvent());
-    expect(memory.state().pendingEvents).toBe(2);
+    expect(memory.state().pendingEvents).toBe(1);
     const second = captureView(memory);
     expect(memory.state().pendingEvents).toBe(0);
     expect(second.view.captureSeq).toBe(2);
@@ -1610,6 +1690,54 @@ describe("nested tool call reconciliation", () => {
 });
 
 describe("tool result reconciliation", () => {
+  it("admits new nested events after the default 8192-ID budget is filled", () => {
+    const state = new FakeHostState();
+    state.append(messageEntry("a1", assistantMessage([toolCall("parent", "bash", { command: "run" })])));
+    const memory = createMemory(state);
+    captureView(memory);
+    for (let index = 0; index < 8_194; index += 1) {
+      const id = `nested-${index}`;
+      memory.recordToolEvent(callEvent({ toolCallId: id, parentToolCallId: "parent", input: { index } }));
+      memory.recordToolEvent(resultEvent({ toolCallId: id, text: `result-${index}` }));
+    }
+    const transcript = captureView(memory).view.transcript;
+    expect(transcript.some(entry => entry.tool?.callId === "nested-0")).toBe(false);
+    expect(transcript.filter(entry => entry.tool?.callId === "nested-8193").map(entry => entry.content)).toEqual([
+      { index: 8193 }, "result-8193",
+    ]);
+    expect(memory.state().failure).toBeUndefined();
+  }, 30_000);
+
+  it("preserves in-flight calls while completed event slots are reused", () => {
+    const state = new FakeHostState();
+    state.append(messageEntry("a1", assistantMessage([toolCall("parent", "bash", { command: "run" })])));
+    const memory = createMemory(state, { limits: { maxToolEvents: 2, maxTranscriptEntries: 10 } });
+    captureView(memory);
+    for (const id of ["a", "b"]) memory.recordToolEvent(callEvent({ toolCallId: id, parentToolCallId: "parent", input: { id } }));
+    memory.recordToolEvent(resultEvent({ toolCallId: "b", text: "finished-b" }));
+    memory.recordToolEvent(callEvent({ toolCallId: "c", parentToolCallId: "parent", input: { id: "c" } }));
+    memory.recordToolEvent(resultEvent({ toolCallId: "c", text: "finished-c" }));
+    memory.recordToolEvent(resultEvent({ toolCallId: "b", text: "finished-b" }));
+    const entries = captureView(memory).view.transcript.filter(entry => ["a", "b", "c"].includes(entry.tool?.callId ?? ""));
+    expect(entries.map(entry => entry.entryKey)).toEqual(["call:a", "call:b", "result:b", "call:c", "result:c"]);
+    expect(entries.find(entry => entry.tool?.callId === "a")?.content).toEqual({ id: "a" });
+  });
+
+  it("retains completed nested calls in the bounded view when live event slots are reused", () => {
+    const state = new FakeHostState();
+    state.append(messageEntry("a1", assistantMessage([toolCall("parent", "bash", { command: "run" })])));
+    const memory = createMemory(state, { limits: { maxToolEvents: 2, maxTranscriptEntries: 10 } });
+    captureView(memory);
+    for (const id of ["nested-a", "nested-b", "nested-c"]) {
+      memory.recordToolEvent(callEvent({ toolCallId: id, parentToolCallId: "parent", input: { id } }));
+      memory.recordToolEvent(resultEvent({ toolCallId: id, text: `result-${id}` }));
+    }
+    const view = captureView(memory).view;
+    expect(view.transcript.filter(entry => entry.tool?.callId?.startsWith("nested-")).map(entry => entry.entryKey)).toEqual([
+      "call:nested-a", "result:nested-a", "call:nested-b", "result:nested-b", "call:nested-c", "result:nested-c",
+    ]);
+  });
+
   it("appends a result placeholder for a known direct call", () => {
     const state = new FakeHostState();
     const memory = manifestMemory(state);

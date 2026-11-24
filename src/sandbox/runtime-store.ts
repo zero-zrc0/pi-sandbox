@@ -1,6 +1,6 @@
-import { createReadStream, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { createReadStream, lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { isPathWithin } from "./path";
 import type { RuntimeCatalog, RuntimeFileEntry, RuntimeFileRole, RuntimeResourceEntry } from "./runtime-catalog";
 import { parseRuntimeManifest, type RuntimeManifest } from "./runtime-manifest";
@@ -29,7 +29,13 @@ export interface ResolvedRuntimeFiles {
   readonly manifest: RuntimeManifest;
   readonly source: "manual" | "managed";
   readonly files: Readonly<Partial<Record<RuntimeFileRole, string>>>;
+  readonly linuxProbe?: {
+    readonly bubblewrap: LinuxBubblewrapSelection;
+    readonly capabilities: import("./types").BackendCapabilities;
+  };
 }
+
+export type LinuxBubblewrapSelection = { readonly kind: "system"; readonly path: string } | { readonly kind: "bundled" };
 
 export interface InstalledRuntimeScan {
   readonly candidates: readonly InstalledRuntimeCandidate[];
@@ -54,9 +60,11 @@ function candidateFor(
   const root = realpathSync(pluginRoot);
   const runtimeRoot = canonicalDirectory(root, join(root, "runtimes"), "runtime root");
   const runtimeDirectory = canonicalDirectory(runtimeRoot, directory, "runtime directory");
-  const expectedDirectory = resolve(runtimeRoot, `${platform}-${arch}`);
   const normalize = (path: string) => process.platform === "win32" ? resolve(path).toLowerCase() : resolve(path);
-  if (normalize(runtimeDirectory) !== normalize(expectedDirectory)) {
+  const directoryName = basename(runtimeDirectory);
+  const legacyName = `${platform}-${arch}`;
+  if (normalize(dirname(runtimeDirectory)) !== normalize(runtimeRoot) ||
+      (directoryName !== legacyName && !directoryName.startsWith(`${legacyName}-`))) {
     throw new Error("runtime directory does not match the fixed platform layout");
   }
   const manifestPath = join(runtimeDirectory, "runtime.json");
@@ -65,7 +73,8 @@ function candidateFor(
     throw new Error("runtime manifest must be a regular file inside the runtime directory");
   }
   const manifest = parseRuntimeManifest(JSON.parse(readFileSync(manifestPath, "utf8")) as unknown);
-  if (manifest.platform !== platform || manifest.arch !== arch) {
+  if (manifest.platform !== platform || manifest.arch !== arch ||
+      (directoryName !== legacyName && directoryName !== `${legacyName}-${manifest.version}`)) {
     throw new Error("runtime manifest does not match its fixed directory");
   }
   let catalogEntry: RuntimeResourceEntry | undefined;
@@ -149,19 +158,20 @@ export function scanInstalledRuntimes(input: {
   const runtimeRootPath = join(root, "runtimes");
   if (!pathExists(runtimeRootPath)) return { candidates: [], problems: [] };
   const runtimeRoot = canonicalDirectory(root, runtimeRootPath, "runtime root");
-  const directory = join(runtimeRoot, `${input.platform}-${input.arch}`);
-  if (!pathExists(directory)) return { candidates: [], problems: [] };
-  try {
-    return {
-      candidates: [candidateFor(root, directory, input.catalog, input.platform, input.arch)],
-      problems: [],
-    };
-  } catch (error) {
-    return {
-      candidates: [],
-      problems: [{ directory, reason: error instanceof Error ? error.message : String(error) }],
-    };
+  const legacyName = `${input.platform}-${input.arch}`;
+  const directoryNames = readdirSync(runtimeRoot)
+    .filter(name => name === legacyName || name.startsWith(`${legacyName}-`));
+  const candidates: InstalledRuntimeCandidate[] = [];
+  const problems: { directory: string; reason: string }[] = [];
+  for (const name of directoryNames) {
+    const directory = join(runtimeRoot, name);
+    try {
+      candidates.push(candidateFor(root, directory, input.catalog, input.platform, input.arch));
+    } catch (error) {
+      problems.push({ directory, reason: error instanceof Error ? error.message : String(error) });
+    }
   }
+  return { candidates, problems };
 }
 
 async function sha256File(path: string): Promise<string> {

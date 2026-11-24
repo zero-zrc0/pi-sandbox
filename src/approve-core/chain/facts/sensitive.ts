@@ -11,7 +11,10 @@
  * inventing a new policy:
  *
  * - control directories `.git`, `.agents`, `.codex`, `.aws`
- *   (`sandbox/path.ts` `PROTECTED_CONTROL_DIRECTORY_NAMES`);
+ *   (`sandbox/path.ts` `PROTECTED_CONTROL_DIRECTORY_NAMES`); reads of the
+ *   readable control directories `.agents` and `.codex`
+ *   (`READABLE_CONTROL_DIRECTORY_NAMES`) are exempt, mirroring the sandbox
+ *   layer where those directories stay write-restricted but readable;
  * - credential paths from `risk/danger.ts`'s `credential-upload` class:
  *   `SSH_KEY_PATHS` (`.ssh`, `id_rsa`/`id_ed25519`, ...), `AWS_CREDENTIAL_PATHS`
  *   (`.aws` directory), `DOTENV_PATHS` (`.env`, `.env.*`),
@@ -46,6 +49,13 @@ export interface ProjectSensitiveFactsInput {
 interface SensitiveFamily {
   readonly category: string;
   readonly patterns: readonly RegExp[];
+  /**
+   * Reads of this family's targets are exempt: only mutating surfaces
+   * (write, delete, upload) produce a reference. Mirrors
+   * `READABLE_CONTROL_DIRECTORY_NAMES` in `sandbox/path.ts`, where the same
+   * directories stay write-restricted but readable.
+   */
+  readonly readExempt?: boolean;
 }
 
 const GIT_DIRECTORY = /(?:^|[\\/])\.git(?:[\\/]|$)/u;
@@ -66,7 +76,7 @@ const CLOUD_CREDENTIAL_DIRECTORIES =
  */
 const SENSITIVE_PATH_FAMILIES: readonly SensitiveFamily[] = Object.freeze([
   { category: "git", patterns: [GIT_DIRECTORY] },
-  { category: "agent-control", patterns: [AGENT_CONTROL_DIRECTORIES] },
+  { category: "agent-control", patterns: [AGENT_CONTROL_DIRECTORIES], readExempt: true },
   { category: "ssh", patterns: [SSH_DIRECTORY, SSH_KEY_FILES] },
   { category: "aws", patterns: [AWS_DIRECTORY] },
   { category: "dotenv", patterns: [DOTENV_PATHS] },
@@ -77,11 +87,15 @@ const SENSITIVE_PATH_FAMILIES: readonly SensitiveFamily[] = Object.freeze([
   },
 ]);
 
-function categoryOf(foldedPath: string): string | undefined {
+function familyOf(foldedPath: string): SensitiveFamily | undefined {
   for (const family of SENSITIVE_PATH_FAMILIES) {
-    if (family.patterns.some((pattern) => pattern.test(foldedPath))) return family.category;
+    if (family.patterns.some((pattern) => pattern.test(foldedPath))) return family;
   }
   return undefined;
+}
+
+function categoryOf(foldedPath: string): string | undefined {
+  return familyOf(foldedPath)?.category;
 }
 
 /**
@@ -148,8 +162,10 @@ export function projectSensitiveFacts(
     const resolved = resolvePath(path, flavor, cwd);
     if (resolved === undefined) continue;
     const folded = flavor.fold(resolved);
-    const category = categoryOf(folded);
-    if (category === undefined) continue;
+    const family = familyOf(folded);
+    if (family === undefined) continue;
+    if (family.readExempt === true && surface === "read") continue;
+    const category = family.category;
     const key = `${surface}\u0000${folded}`;
     if (seen.has(key)) continue;
     seen.add(key);

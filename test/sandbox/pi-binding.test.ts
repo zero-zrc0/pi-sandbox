@@ -75,6 +75,27 @@ describe("operation binding to the approved action", () => {
     }
   });
 
+  it("allows a protected read under .agents while keeping its write protected", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-sandbox-agents-read-"));
+    const skill = join(root, ".agents", "skills", "deploy", "SKILL.md");
+    mkdirSync(dirname(skill), { recursive: true });
+    writeFileSync(skill, "skill");
+    const baseline = { filesystem: [
+      { path: root, access: "read" as const, granularity: "directory" as const },
+      { path: root, access: "write" as const, granularity: "directory" as const },
+    ], network: { kind: "none" as const } };
+    try {
+      const read = validateOperationPermissions({ operation: { kind: "read-file", path: skill },
+        baseline, approved: { filesystem: [] }, runtime: [], resolvePath: resolveHostPathIdentity });
+      expect(read).toEqual({ ok: true, additionalProtectedPaths: [] });
+      const write = validateOperationPermissions({ operation: { kind: "write-file", path: skill, content: "changed" },
+        baseline, approved: { filesystem: [] }, runtime: [], resolvePath: resolveHostPathIdentity });
+      expect(write).toMatchObject({ ok: false, code: "protected-path" });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("limits a parent-directory check to its exact writable file", () => {
     const parent = process.platform === "win32" ? "D:\\data" : "/data";
     const file = join(parent, "report.txt");

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ExecutionController, type EgressProvider } from "#sandbox/lifecycle";
 import type { ExecutionRequest, NetworkScope } from "#sandbox/types";
@@ -181,6 +181,68 @@ describe("direct backend lifecycle", () => {
     expect(outcome.started).toBe(false);
   });
 
+  it("reuses one process capability probe across sessions and tool calls", async () => {
+    const base = createTestDirectBackend();
+    const probe = vi.fn(base.probe);
+    const directBackend = {
+      ...base,
+      probeCacheKey: `fixture:${process.pid}:${Date.now()}:${Math.random()}`,
+      probe,
+    } as DirectBackendDriver & { readonly probeCacheKey: string };
+    const first = controllerFor(layout(), { directBackend });
+    const second = controllerFor(layout(), { directBackend });
+
+    expect((await first.probe()).status).toBe("available");
+    expect((await second.probe()).status).toBe("available");
+    expect((await first.execute({ request: shellRequest(layout().workspace) })).state).toBe("completed");
+    expect((await second.execute({ request: shellRequest(layout().workspace) })).state).toBe("completed");
+    expect(probe).toHaveBeenCalledOnce();
+  });
+
+  it("retries a failed capability probe and reuses the succeeding result", async () => {
+    const base = createTestDirectBackend();
+    const probe = vi.fn()
+      .mockResolvedValueOnce({ ok: false, code: "unavailable", reason: "temporary failure" })
+      .mockImplementation(base.probe);
+    const directBackend: DirectBackendDriver = {
+      ...base, probeCacheKey: `retry:${process.pid}:${Math.random()}`, probe,
+    };
+    const controller = controllerFor(layout(), { directBackend });
+    expect((await controller.probe()).status).toBe("unavailable");
+    expect((await controller.probe()).status).toBe("available");
+    expect((await controller.probe()).status).toBe("available");
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels one session's probe without cancelling a concurrent session", async () => {
+    const base = createTestDirectBackend();
+    const success = await base.probe();
+    const signals: AbortSignal[] = [];
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const probe = vi.fn(async (signal?: AbortSignal) => {
+      if (signal === undefined) throw new Error("missing probe signal");
+      signals.push(signal);
+      await Promise.race([hold, new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }))]);
+      return signal.aborted ? { ok: false as const, code: "unavailable", reason: "cancelled" } : success;
+    });
+    const directBackend: DirectBackendDriver = {
+      ...base, probeCacheKey: `concurrent:${process.pid}:${Math.random()}`, probe,
+    };
+    const first = controllerFor(layout(), { directBackend });
+    const second = controllerFor(layout(), { directBackend });
+    const firstProbe = first.probe();
+    const secondProbe = second.probe();
+    await vi.waitFor(() => expect(signals).toHaveLength(2));
+    await first.dispose();
+    expect((await firstProbe).status).toBe("setup-failed");
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals[1]?.aborted).toBe(false);
+    release();
+    expect((await secondProbe).status).toBe("available");
+    expect((await second.probe()).status).toBe("available");
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
   it("streams process output and records exactly one result", async () => {
     const testLayout = layout();
     const records: unknown[] = [];

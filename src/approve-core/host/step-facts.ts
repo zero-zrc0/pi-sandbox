@@ -7,7 +7,10 @@ import type { ExecutionRequest } from "../../elevation";
  * incomplete manifest, an empty manifest and an event outside the manifest all
  * fall back to a per-call capture bounded by that call alone. A manifest that
  * exists but disagrees with the event is invalid — evidence is never borrowed
- * from another step and never silently re-derived.
+ * from another step and never silently re-derived. The one exception is a
+ * rewrite the host itself certifies (the sanctioned temporary-path mapping):
+ * it degrades to a per-call capture of the event's actual arguments instead
+ * of failing.
  */
 import type {
   CaptureStepResult,
@@ -48,6 +51,13 @@ export interface StepFactsResolver {
     readonly event: StepFactsEvent;
     readonly manifest?: ReviewStepManifest;
     readonly registeredTools?: readonly string[];
+    /**
+     * Per-call port: true when the manifest call's frozen arguments differ
+     * from the event only by a rewrite the host itself performed (the
+     * temporary-path mapping). Certified disagreements fall back to a
+     * per-call capture; everything else still fails closed.
+     */
+    readonly sanctionedArgumentRewrite?: (manifestCall: ReviewManifestCall) => boolean;
   }): StepFactsResult;
 }
 
@@ -178,14 +188,21 @@ function runCapture(
 
 export function createStepFacts(options: StepFactsOptions): StepFactsResolver {
   return {
-    capture({ event, manifest, registeredTools }): StepFactsResult {
+    capture({ event, manifest, registeredTools, sanctionedArgumentRewrite }): StepFactsResult {
       if (!validEvent(event, registeredTools)) return { ok: false, reason: "invalid" };
       const input = event.input as Record<string, unknown>;
 
       const manifestCall = directManifestCall(event, manifest);
       if (manifestCall !== undefined && manifest !== undefined) {
         const captureInput = manifestCaptureInput(event, manifest, manifestCall, registeredTools);
-        if (captureInput === undefined) return { ok: false, reason: "invalid" };
+        if (captureInput === undefined) {
+          // A host-certified rewrite (e.g. the temporary-path mapping) is not
+          // tampering: review the event's actual arguments, bounded by this
+          // call alone. Anything else fails closed.
+          return sanctionedArgumentRewrite?.(manifestCall) === true
+            ? runCapture(options.capture, perCallCaptureInput(event, input), "per-call")
+            : { ok: false, reason: "invalid" };
+        }
         return runCapture(options.capture, captureInput, "manifest");
       }
 

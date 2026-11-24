@@ -9,6 +9,9 @@ export const PROTECTED_CONTROL_DIRECTORY_NAMES = Object.freeze([
   ".aws",
 ] as const);
 
+/** Control directories that stay writable-restricted but readable (agent state and skills live here). */
+export const READABLE_CONTROL_DIRECTORY_NAMES = Object.freeze([".agents", ".codex"] as const);
+
 function stripTrailingSeparators(value: string): string {
   if (value.length <= 1) return value;
   let end = value.length;
@@ -102,6 +105,18 @@ export function findProtectedControlRoot(
     if (wanted.has(pathKey(part))) return current;
   }
   return null;
+}
+
+/**
+ * Return the protected control root that blocks a read. Directories listed as
+ * readable (`READABLE_CONTROL_DIRECTORY_NAMES`) only enforce write restrictions.
+ */
+export function findProtectedControlReadRoot(
+  target: string,
+  names: readonly string[] = PROTECTED_CONTROL_DIRECTORY_NAMES,
+): string | null {
+  const readable = new Set(READABLE_CONTROL_DIRECTORY_NAMES.map((name) => pathKey(name)));
+  return findProtectedControlRoot(target, names.filter((name) => !readable.has(pathKey(name))));
 }
 
 export function protectedPathsForGrant(

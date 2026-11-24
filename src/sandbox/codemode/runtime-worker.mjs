@@ -1,4 +1,5 @@
 const { Worker } = require("node:worker_threads");
+const { readFileSync } = require("node:fs");
 import {
   CODEMODE_MAX_QUEUED_BYTES,
   FrameDecoder,
@@ -67,11 +68,11 @@ function finishStop() {
 async function start(frame) {
   if (ready || !Number.isInteger(frame.version) || frame.version !== 1 ||
       typeof frame.generation !== "string" || typeof frame.workerSource !== "string" ||
-      typeof frame.wasmBase64 !== "string" || !frame.data || typeof frame.data !== "object") {
+      typeof frame.wasmPath !== "string" || frame.wasmPath.length === 0 || !frame.data || typeof frame.data !== "object") {
     throw new Error("Codemode Runtime start frame is invalid");
   }
   generation = frame.generation;
-  const wasm = await WebAssembly.compile(Buffer.from(frame.wasmBase64, "base64"));
+  const wasm = await WebAssembly.compile(readFileSync(frame.wasmPath));
   interrupt = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   worker = new Worker(frame.workerSource, {
     eval: true,

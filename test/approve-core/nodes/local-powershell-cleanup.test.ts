@@ -1,4 +1,3 @@
-import { appendFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { captureStep, prepareStep, applyNodeResult, readyCallResults } from "#approve-core/contracts";
 import { analyzeStep, createPowerShellProgramProvider } from "#approve-core/nodes/analysis";
@@ -41,8 +40,6 @@ describe.skipIf(resolveTrustedPowerShellEngine() === undefined)("local PowerShel
       const facts = await projectShellFacts({ call: prepared.state.calls[0]!, powershellView: powershellPrograms?.call,
         options: { cwd, workspaceRoot: cwd, platform: "win32" } });
       const summary = readyCallResults(applied.state)[0]!;
-      appendFileSync("temp-review.txt", JSON.stringify({ event: "local-cleanup-reproduction", mode: "auto-review",
-        enabledNodes: [node.id], transport: "not-requested", command, unitFacts: facts && [...facts.access], summary }) + "\n");
       if (allowed) expect(summary.decision).toBe("allow");
       else expect(summary.decision).not.toBe("allow");
       if (command.startsWith("function ")) {

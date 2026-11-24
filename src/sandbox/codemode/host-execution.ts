@@ -15,6 +15,7 @@ import { renderToolSample, toCodemodeIdentifier } from "@earendil-works/pi-codem
 import { CODEMODE_RUNTIME_LIMITS } from "./limits";
 import { createCodemodeModelGlobals, type CodemodeModelCallOptions } from "./model-bridge";
 import { runWithApprovedCodemode } from "./approval-scope";
+import { Bm25Ranker, createToolSearchDocument } from "./tool-search";
 import type { SensitivePath } from "../sensitive-paths";
 import {
   type CodemodeRuntimeRequest,
@@ -59,64 +60,10 @@ interface ActiveCodemodeExecution {
   finish(): void;
 }
 
-interface SearchDocument {
-  readonly name: string;
-  readonly text: string;
-}
-
-const SEARCH_STOP_WORDS = new Set([
-  "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it", "of", "on", "or", "that", "the", "this", "to", "with",
-]);
-
-function searchTerms(text: string): string[] {
-  return text
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(term => term.length > 0 && !SEARCH_STOP_WORDS.has(term))
-    .map(term => term.length > 4 && term.endsWith("ies")
-      ? `${term.slice(0, -3)}y`
-      : term.length > 4 && /(ches|shes|sses|xes|zes)$/.test(term)
-        ? term.slice(0, -2)
-        : term.length > 3 && term.endsWith("s") && !term.endsWith("ss")
-          ? term.slice(0, -1)
-          : term);
-}
-
 function isNamespaceMatch(namespace: ToolNamespace, query: string): boolean {
   const queryId = toCodemodeIdentifier(query);
   return [namespace.name, ...(namespace.aliases ?? [])]
     .some(name => name === query || toCodemodeIdentifier(name) === queryId);
-}
-
-function searchMatches(query: string, documents: readonly SearchDocument[], limit: number): string[] {
-  const queryTerms = [...new Set(searchTerms(query))];
-  if (queryTerms.length === 0 || documents.length === 0) return [];
-  const counts = documents.map(document => {
-    const frequencies = new Map<string, number>();
-    for (const term of searchTerms(document.text)) frequencies.set(term, (frequencies.get(term) ?? 0) + 1);
-    return frequencies;
-  });
-  const lengths = counts.map(frequencies => [...frequencies.values()].reduce((sum, count) => sum + count, 0));
-  const averageLength = lengths.reduce((sum, length) => sum + length, 0) / documents.length || 1;
-  const scores = documents.map((document, index) => {
-    let score = 0;
-    for (const term of queryTerms) {
-      const frequency = counts[index]?.get(term);
-      if (!frequency) continue;
-      const documentFrequency = counts.filter(item => item.has(term)).length;
-      const inverseFrequency = Math.log(1 + (documents.length - documentFrequency + 0.5) / (documentFrequency + 0.5));
-      const norm = 1.2 * (1 - 0.75 + 0.75 * (lengths[index] ?? 0) / averageLength);
-      score += inverseFrequency * frequency * 2.2 / (frequency + norm);
-    }
-    return { name: document.name, score, index };
-  });
-  return scores
-    .filter(match => match.score > 0)
-    .sort((left, right) => right.score - left.score || left.index - right.index)
-    .slice(0, limit)
-    .map(match => match.name);
 }
 
 function createDiscoveryGlobals(
@@ -146,13 +93,9 @@ function createDiscoveryGlobals(
         const documents = tools.flatMap(tool => {
           const toolNamespace = namespaces.get(tool.name);
           if (namespace && (!toolNamespace || !isNamespaceMatch(toolNamespace, namespace))) return [];
-          return [{
-            name: tool.name,
-            text: [tool.name, tool.name.replaceAll("_", " "), tool.description ?? "", JSON.stringify(tool.inputSchema ?? {}) ?? "",
-              toolNamespace?.name ?? "", toolNamespace?.description ?? "", toolNamespace?.instructions ?? ""].join(" "),
-          }];
+          return [createToolSearchDocument(tool, toolNamespace)];
         });
-        return searchMatches(query, documents, limit).map(entry);
+        return new Bm25Ranker().rank(query, documents, limit).map(match => entry(match.name));
       },
     },
     {

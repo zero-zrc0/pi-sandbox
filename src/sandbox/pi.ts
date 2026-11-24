@@ -62,7 +62,7 @@ import {
   type OperationOutputChunk,
   type OperationRunOptions,
 } from "#sandbox/operations";
-import { findProtectedControlRoot, isPathWithin, isSamePath, normalizeHostPath, PROTECTED_CONTROL_DIRECTORY_NAMES } from "#sandbox/path";
+import { findProtectedControlReadRoot, findProtectedControlRoot, isPathWithin, isSamePath, normalizeHostPath, PROTECTED_CONTROL_DIRECTORY_NAMES } from "#sandbox/path";
 import type { PlanApprovedScope, PlanBaselineScope } from "#sandbox/plan";
 import { intersectNetworkScopes } from "#sandbox/network-scope";
 import { sensitivePathIdentityMatches, type SensitivePath } from "#sandbox/sensitive-paths";
@@ -375,8 +375,12 @@ export function operationMatchesApprovedAction(
   operation: ExecutionOperation,
 ): string | null {
   if (operation.kind === "builtin-tool") {
+    const selectedPath = selectedFilePath(invocation);
+    const expectedArguments = selectedPath === undefined
+      ? invocation.action.effectiveArguments
+      : { ...invocation.action.effectiveArguments, path: selectedPath };
     return operation.name === invocation.action.tool.name &&
-      jsonDigest(operation.arguments) === jsonDigest(invocation.action.effectiveArguments)
+      jsonDigest(operation.arguments) === jsonDigest(expectedArguments)
       ? null : "builtin tool or arguments differ from the approved invocation";
   }
   const args = invocation.action.effectiveArguments as Record<string, unknown>;
@@ -455,6 +459,11 @@ export function operationMatchesApprovedAction(
   }
 }
 
+function selectedFilePath(invocation: ToolInvocationFacts): string | undefined {
+  return invocation.executionBinding.status === "bound"
+    ? invocation.executionBinding.selectedFilePath
+    : undefined;
+}
 function resolveExecutionPath(
   path: string,
   cwd: string,
@@ -483,15 +492,22 @@ export function prepareExecutionOperation(
   if (typeof operation !== "object" || operation === null) return { ok: false, reason: "operation must be an object" };
   switch (operation.kind) {
     case "builtin-tool": {
+      const selectedPath = selectedFilePath(invocation);
+      const expectedArguments = selectedPath === undefined
+        ? invocation.action.effectiveArguments
+        : { ...invocation.action.effectiveArguments, path: selectedPath };
       if (!BUILTIN_TOOL_NAMES.includes(operation.name) || operation.name !== invocation.action.tool.name ||
           typeof operation.arguments !== "object" || operation.arguments === null || Array.isArray(operation.arguments) ||
-          jsonDigest(operation.arguments) !== jsonDigest(invocation.action.effectiveArguments)) {
+          jsonDigest(operation.arguments) !== jsonDigest(expectedArguments)) {
         return { ok: false, reason: "builtin invocation differs from the approved tool or arguments" };
       }
       if (operation.name === "bash" || operation.name === "powershell") return { ok: true, operation };
       const requested = operation.arguments.path ?? ".";
       if (typeof requested !== "string" || requested.includes("\0")) return { ok: false, reason: "invalid builtin path" };
-      const resolved = resolveExecutionPath(builtinToolPath(operation.name, requested, invocation.action.cwd), invocation.action.cwd, resolver);
+
+      const resolved = selectedPath === undefined
+        ? resolveExecutionPath(builtinToolPath(operation.name, requested, invocation.action.cwd), invocation.action.cwd, resolver)
+        : normalizeHostPath(selectedPath);
       if (!resolved) return { ok: false, reason: "builtin path cannot be resolved" };
       return { ok: true, operation: { ...operation, arguments: { ...operation.arguments, path: resolved } } };
     }
@@ -611,7 +627,9 @@ export function validateOperationPermissions(input: {
       if (!grants.some(grant => grant.access === access && grantCoversTarget(grant, canonicalTarget))) {
         return { ok: false, code: "scope-expansion", reason: `${access} target is outside the approved scope: ${canonicalTarget}` };
       }
-      const protectedRoot = findProtectedControlRoot(canonicalTarget, protectedNames);
+      const protectedRoot = access === "read"
+        ? findProtectedControlReadRoot(canonicalTarget, protectedNames)
+        : findProtectedControlRoot(canonicalTarget, protectedNames);
       if (!protectedRoot) continue;
       const exactApprovedFile = approved.some(grant => grant.access === access && grant.granularity === "file" &&
         isSamePath(grant.path, canonicalTarget));
@@ -1296,7 +1314,7 @@ export function createPiExecutionAdapter(
         const context = freezeJson({
           sessionId: ctx.sessionManager.getSessionId(),
           ...(options.plan.backendId === "windows-mxc" && (name === "write" || name === "edit")
-            ? { mutationQueuePath: builtinToolPath(name, (args as { path: string }).path, ctx.cwd) } : {}),
+            ? { mutationQueuePath: selectedFilePath(call.invocation) ?? builtinToolPath(name, (args as { path: string }).path, ctx.cwd) } : {}),
           ...(ctx.sessionManager.getSessionFile() === undefined ? {} : { sessionFile: ctx.sessionManager.getSessionFile() }),
           ...(ctx.model === undefined ? {} : { model: { id: ctx.model.id, provider: ctx.model.provider, input: ctx.model.input,
             ...(ctx.model.inputLimits === undefined ? {} : { inputLimits: ctx.model.inputLimits }) } }),
@@ -1319,7 +1337,9 @@ export function createPiExecutionAdapter(
         return result;
       };
       if (name === "write" || name === "edit") {
-        const path = resolveHostPathIdentity(builtinToolPath(name, (args as { path: string }).path, ctx.cwd));
+        const invocation = callStorage.getStore()?.invocation;
+        const path = (invocation === undefined ? undefined : selectedFilePath(invocation)) ??
+          resolveHostPathIdentity(builtinToolPath(name, (args as { path: string }).path, ctx.cwd));
         if (!path) throw new ControlledOperationError("invalid-plan", "mutation target cannot be resolved");
         return withFileMutationQueue(process.platform === "win32" ? path.toLowerCase() : path, run);
       }

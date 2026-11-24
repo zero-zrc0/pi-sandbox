@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,21 +25,50 @@ const REQUIRED_BWRAP_FLAGS = [
   "--tmpfs", "--remount-ro", "--ro-bind-data", "--perms", "--dir", "--file", "--clearenv", "--setenv", "--chdir",
 ];
 
-function probeBubblewrap(path, expectedVersion) {
+function runBubblewrapProbe(path, args, signal) {
+  return new Promise(resolve => {
+    if (signal?.aborted) { resolve(undefined); return; }
+    let child;
+    try { child = spawn(path, args, { stdio: ["ignore", "pipe", "pipe"] }); }
+    catch { resolve(undefined); return; }
+    let stdout = "";
+    let stderr = "";
+    let failed = false;
+    const stop = () => { failed = true; child.kill("SIGKILL"); };
+    const timer = setTimeout(stop, 3_000);
+    timer.unref?.();
+    signal?.addEventListener("abort", stop, { once: true });
+    if (signal?.aborted) stop();
+    const collect = (part, chunk) => {
+      if (part === "stdout") stdout += chunk.toString("utf8");
+      else stderr += chunk.toString("utf8");
+      if (stdout.length + stderr.length > 1_048_576) stop();
+    };
+    child.stdout.on("data", chunk => collect("stdout", chunk));
+    child.stderr.on("data", chunk => collect("stderr", chunk));
+    child.once("error", () => { failed = true; });
+    child.once("close", code => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", stop);
+      resolve(failed || code !== 0 ? undefined : { stdout, stderr });
+    });
+  });
+}
+
+async function probeBubblewrap(path, expectedVersion, signal) {
   try {
-    const help = spawnSync(path, ["--help"], { encoding: "utf8", timeout: 3_000, stdio: ["ignore", "pipe", "pipe"] });
-    const helpText = `${help.stdout ?? ""}\n${help.stderr ?? ""}`;
-    if (help.status !== 0 || REQUIRED_BWRAP_FLAGS.some(flag => !helpText.includes(flag))) return undefined;
-    const versionResult = spawnSync(path, ["--version"], { encoding: "utf8", timeout: 3_000, stdio: ["ignore", "pipe", "ignore"] });
-    const match = /^bubblewrap (\d+\.\d+\.\d+)/u.exec(versionResult.stdout ?? "");
-    if (versionResult.status !== 0 || !match || (expectedVersion !== undefined && match[1] !== expectedVersion) ||
+    const help = await runBubblewrapProbe(path, ["--help"], signal);
+    if (!help || REQUIRED_BWRAP_FLAGS.some(flag => !`${help.stdout}\n${help.stderr}`.includes(flag))) return undefined;
+    const versionResult = await runBubblewrapProbe(path, ["--version"], signal);
+    const match = /^bubblewrap (\d+\.\d+\.\d+)/u.exec(versionResult?.stdout ?? "");
+    if (!versionResult || !match || (expectedVersion !== undefined && match[1] !== expectedVersion) ||
         !versionAtLeast(match[1], "0.9.0")) return undefined;
-    const smoke = spawnSync(path, [
+    const smoke = await runBubblewrapProbe(path, [
       "--die-with-parent", "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-net",
       "--disable-userns", "--assert-userns-disabled", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
       "--clearenv", "--setenv", "PATH", "/usr/bin:/bin", "--chdir", "/", "--", "/bin/true",
-    ], { stdio: "ignore", timeout: 3_000 });
-    return smoke.status === 0 ? match[1] : undefined;
+    ], signal);
+    return smoke ? match[1] : undefined;
   } catch { return undefined; }
 }
 

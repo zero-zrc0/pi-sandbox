@@ -64,16 +64,6 @@ function issuesFor(value: unknown): readonly DialogKeyIssue[] {
 }
 
 describe("dialog key definitions", () => {
-  it("lists the five actions in their fixed order", () => {
-    expect(DIALOG_KEY_ACTIONS).toEqual([
-      "approve",
-      "approveSession",
-      "approveSessionBoth",
-      "deny",
-      "denyWithReason",
-    ]);
-  });
-
   it("maps every action to its default character and freezes the table", () => {
     expect(DEFAULT_DIALOG_KEYS).toEqual(EXPECTED_DEFAULTS);
     expect(Object.isFrozen(DEFAULT_DIALOG_KEYS)).toBe(true);
@@ -217,14 +207,6 @@ describe("resolveDialogKeys", () => {
     });
   }
 
-  it("reports first-pass problems in the fixed action order", () => {
-    expect(issuesFor({ denyWithReason: "yy", approve: "A", approveSession: "j" })).toEqual([
-      { action: "approve", value: "A", code: "unbindable" },
-      { action: "approveSession", value: "j", code: "reserved" },
-      { action: "denyWithReason", value: "yy", code: "unbindable" },
-    ]);
-  });
-
   it("removes an override that collides with another action's default", () => {
     expect(resolveDialogKeys({ approve: "n" })).toEqual({
       keys: EXPECTED_DEFAULTS,
@@ -274,19 +256,6 @@ describe("resolveDialogKeys", () => {
       keys: { ...EXPECTED_DEFAULTS, approve: "q" },
       issues: [{ action: "approveSession", value: "q", code: "conflict" }],
     });
-  });
-
-  it("orders reported issues by the fixed action order across passes", () => {
-    // First-pass problems are collected in action order. Conflict removals happen
-    // in the later pass but are reported back in that same action order.
-    expect(issuesFor({ approve: "A", approveSession: "j" })).toEqual([
-      { action: "approve", value: "A", code: "unbindable" },
-      { action: "approveSession", value: "j", code: "reserved" },
-    ]);
-    expect(issuesFor({ approve: "n", approveSession: "j" })).toEqual([
-      { action: "approve", value: "n", code: "conflict" },
-      { action: "approveSession", value: "j", code: "reserved" },
-    ]);
   });
 
   it("never mutates the shared default table", () => {

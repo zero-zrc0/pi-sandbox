@@ -10,9 +10,8 @@ import type { ResolvedRuntimeFiles } from "#sandbox/runtime-store";
 const temporaryDirectories: string[] = [];
 const sdkRevision = "b21120168d70befe12356411423266bfef168446";
 
-function runtime(pluginRoot: string, version: string): void {
-  // runtimes use the fixed `<platform>-<arch>` layout; the version lives in runtime.json.
-  const directory = join(pluginRoot, "runtimes", "win32-x64");
+function runtime(pluginRoot: string, version: string, directoryName = "win32-x64"): void {
+  const directory = join(pluginRoot, "runtimes", directoryName);
   mkdirSync(directory, { recursive: true });
   const executable = Buffer.from(`mxc-${version}`);
   const executableHash = createHash("sha256").update(executable).digest("hex");
@@ -60,6 +59,43 @@ afterEach(() => {
 });
 
 describe("SandboxRuntimeManager", () => {
+  it("pins one runtime version across sessions and selects a newer version after manager reload", async () => {
+    const pluginRoot = join(root(), "plugin");
+    mkdirSync(pluginRoot);
+    runtime(pluginRoot, "9.1.0", "win32-x64-9.1.0");
+    const probe = vi.fn(async () => ({ available: true }));
+    const options: SandboxRuntimeManagerOptions = {
+      pluginRoot,
+      catalog: { schemaVersion: 1, runtimes: [] },
+      platform: "win32",
+      arch: "x64",
+      pluginVersion: "1.2.0",
+      protocolVersion: 3,
+      probe,
+    };
+    const manager = new SandboxRuntimeManager(options);
+    const first = await manager.prepare({ workspaceRoot: workspace() });
+    expect(first.status).toBe("ready");
+    if (first.status !== "ready") throw new Error("runtime should be ready");
+    expect(first.runtime.manifest.version).toBe("9.1.0");
+    const selectedExecutable = first.runtime.files.windowsExecutable;
+    if (!selectedExecutable) throw new Error("selected runtime executable is missing");
+    writeFileSync(selectedExecutable, Buffer.from("changed after selection"));
+
+    runtime(pluginRoot, "9.2.0", "win32-x64-9.2.0");
+    const secondSession = await manager.prepare({ workspaceRoot: workspace() });
+    expect(secondSession.status).toBe("ready");
+    if (secondSession.status !== "ready") throw new Error("runtime should remain ready");
+    expect(secondSession.runtime.manifest.version).toBe("9.1.0");
+    expect(probe).toHaveBeenCalledOnce();
+
+    const reloadedManager = new SandboxRuntimeManager(options);
+    const reloaded = await reloadedManager.prepare({ workspaceRoot: workspace() });
+    expect(reloaded.status).toBe("ready");
+    if (reloaded.status !== "ready") throw new Error("reloaded runtime should be ready");
+    expect(reloaded.runtime.manifest.version).toBe("9.2.0");
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
   it("starts disabled and prepares a user-trusted manual runtime without a release catalog", async () => {
     const pluginRoot = join(root(), "plugin");
     mkdirSync(pluginRoot);
@@ -112,6 +148,31 @@ describe("SandboxRuntimeManager", () => {
 
     expect(state.status).toBe("ready");
     expect(probe).toHaveBeenCalledOnce();
+  });
+
+  it("passes cancellation into preparation and probes again on the next request", async () => {
+    const pluginRoot = join(root(), "plugin");
+    mkdirSync(pluginRoot);
+    runtime(pluginRoot, "9.1.0");
+    const signals: AbortSignal[] = [];
+    const manager = new SandboxRuntimeManager({
+      pluginRoot, catalog: { schemaVersion: 1, runtimes: [] }, platform: "win32", arch: "x64",
+      pluginVersion: "1.2.0", protocolVersion: 3,
+      probe: async (_runtime, input) => {
+        signals.push(input.signal);
+        if (signals.length > 1) return { available: true };
+        await new Promise<void>(resolve => input.signal.addEventListener("abort", () => resolve(), { once: true }));
+        return { available: false, reason: "cancelled" };
+      },
+    });
+    const controller = new AbortController();
+    const first = manager.prepare({ workspaceRoot: workspace(), signal: controller.signal });
+    await vi.waitFor(() => expect(signals).toHaveLength(1));
+    controller.abort();
+    await first;
+    expect(signals[0]?.aborted).toBe(true);
+    expect((await manager.prepare({ workspaceRoot: workspace() })).status).toBe("ready");
+    expect(signals).toHaveLength(2);
   });
 
   it("treats a manually placed runtime as user-trusted even when its version is cataloged", async () => {

@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ExtensionToolContext } from "@earendil-works/pi-coding-agent";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { resolveConfigPaths } from "#config/config-paths";
 import { createApprovalChainConfigOwner } from "#config/owner";
@@ -17,7 +17,7 @@ import type { AnyToolDefinition } from "#sandbox/pi";
 
 const operationWorkerPath = fileURLToPath(new URL("../../../../src/sandbox/backend/macos/operation-worker.mjs", import.meta.url));
 const extensionSource = fileURLToPath(new URL("../../../../src/index.ts", import.meta.url));
-const seatbelt = process.platform === "darwin" ? probeMacOSSeatbelt() : undefined;
+const seatbelt = process.platform === "darwin" ? await probeMacOSSeatbelt() : undefined;
 const nativeReady = process.platform === "darwin" && existsSync(operationWorkerPath) && seatbelt?.status === "candidate-present";
 
 /**
@@ -30,6 +30,9 @@ describe.skipIf(!nativeReady)("native macOS runtime end to end", () => {
   let root: string;
   let workspace: string;
   let agentDir: string;
+  let homeDir: string;
+  let configPath: string;
+  let owner: ReturnType<typeof createApprovalChainConfigOwner>;
   let manager: SandboxRuntimeManager;
   let execution: ReturnType<typeof createControlledExecution>;
   const definitions = new Map<string, AnyToolDefinition>();
@@ -40,12 +43,15 @@ describe.skipIf(!nativeReady)("native macOS runtime end to end", () => {
     root = realpathSync(mkdtempSync(join(realpathSync(tmpdir()), "pi-sandbox-macos-e2e-")));
     workspace = join(root, "workspace");
     agentDir = join(root, "agent");
-    for (const directory of [workspace, agentDir, join(agentDir, "extensions", "pi-sandbox")]) {
+    homeDir = join(root, "home");
+    for (const directory of [workspace, agentDir, homeDir, join(agentDir, "extensions", "pi-sandbox")]) {
       mkdirSync(directory, { recursive: true });
     }
+    vi.stubEnv("HOME", homeDir);
     const paths = resolveConfigPaths({ agentDir, cwd: workspace, extensionRoot: dirname(dirname(extensionSource)) });
+    configPath = paths.globalConfigFile;
     writeFileSync(paths.globalConfigFile, JSON.stringify({ mode: "default", experimental: { sandboxEnabled: true } }));
-    const owner = createApprovalChainConfigOwner({ paths, cwd: workspace, projectTrusted: true });
+    owner = createApprovalChainConfigOwner({ paths, cwd: workspace, projectTrusted: true });
     const packageVersion = (JSON.parse(readFileSync(fileURLToPath(new URL("../../../../package.json", import.meta.url)), "utf8")) as { version: string }).version;
     manager = new SandboxRuntimeManager({
       pluginRoot: join(agentDir, "extensions", "pi-sandbox"),
@@ -93,6 +99,7 @@ describe.skipIf(!nativeReady)("native macOS runtime end to end", () => {
       await handler({ type: "session_shutdown", reason: "quit" }, ctx);
     }
     await manager?.disable();
+    vi.unstubAllEnvs();
     if (root) rmSync(root, { recursive: true, force: true });
   });
 
@@ -111,5 +118,42 @@ describe.skipIf(!nativeReady)("native macOS runtime end to end", () => {
     const workspaceTemporary = join(execution.sessionWorkspace(ctx), "tmp", "notes.txt");
     expect(readFileSync(workspaceTemporary, "utf8")).toBe("sandboxed temporary");
     expect(existsSync(join(workspace, "$TMPDIR"))).toBe(false);
+  }, 60_000);
+
+  it("reads skills, blocks control writes, and applies denyPaths in native execution", async () => {
+    const files = [
+      { root: ".agents", relative: join("skills", "demo", "SKILL.md"), content: "skill content" },
+      { root: ".codex", relative: "config.toml", content: "model = 'test'" },
+    ];
+    for (const file of files) {
+      const path = join(homeDir, file.root, file.relative);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, file.content);
+    }
+
+    for (const [index, file] of files.entries()) {
+      const path = join(homeDir, file.root, file.relative);
+      const read = { type: "tool_call" as const, toolName: "read", toolCallId: `macos-control-read-${index}`, input: { path } };
+      expect(await execution.guard(read, ctx, async () => undefined)).toBeUndefined();
+      const result = await definitions.get("read")!.execute(read.toolCallId, read.input, undefined, undefined, ctx as never);
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      expect(JSON.stringify(result)).toContain(file.content);
+
+      const write = { type: "tool_call" as const, toolName: "write", toolCallId: `macos-control-write-${index}`,
+        input: { path, content: "must not replace control data" } };
+      expect(await execution.guard(write, ctx, async () => undefined)).toMatchObject({ block: true,
+        reason: expect.stringContaining("protected-control-path") });
+      expect(readFileSync(path, "utf8")).toBe(file.content);
+    }
+
+    const deniedPath = join(homeDir, ".agents", "skills", "demo", "SKILL.md");
+    writeFileSync(configPath, JSON.stringify({ mode: "default", experimental: { sandboxEnabled: true },
+      execution: { denyPaths: [deniedPath] } }));
+    owner.reload();
+    const deniedRead = { type: "tool_call" as const, toolName: "read", toolCallId: "macos-control-deny-path", input: { path: deniedPath } };
+    expect(await execution.guard(deniedRead, ctx, async () => undefined)).toBeUndefined();
+    const deniedResult = await definitions.get("read")!.execute(deniedRead.toolCallId, deniedRead.input, undefined, undefined, ctx as never);
+    expect(deniedResult.isError, JSON.stringify(deniedResult)).toBe(true);
+    expect(JSON.stringify(deniedResult)).not.toContain("skill content");
   }, 60_000);
 });

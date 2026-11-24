@@ -19,6 +19,7 @@ export type ToolExecutionBinding =
       readonly toolName: string;
       readonly bindingId: string;
       readonly revision: string;
+      readonly selectedFilePath?: string;
     }
   | { readonly status: "unavailable"; readonly reason: string }
   | { readonly status: "unbound"; readonly reason: string };

@@ -57,6 +57,39 @@ const PACKAGE_DECLARATION = {
   entry: "dist/index.js",
 };
 
+const invalidDeclarations: readonly Case[] = [
+  { label: "an origin and package together", value: { ...ORIGIN_DECLARATION, package: "@acme/file-tools" } },
+  { label: "an origin with an entry", value: { ...ORIGIN_DECLARATION, entry: "dist/index.js" } },
+  { label: "neither identity", value: { tool: "read", profile: "file-reader", locations: [{ pointer: "/path", access: "read" }] } },
+  { label: "an empty tool name", value: { ...ORIGIN_DECLARATION, tool: "" } },
+  { label: "a whitespace-only tool name", value: { ...ORIGIN_DECLARATION, tool: "  " } },
+  { label: "a non-string tool name", value: { ...ORIGIN_DECLARATION, tool: 1 } },
+  { label: "an empty origin", value: { ...ORIGIN_DECLARATION, origin: "" } },
+  { label: "a non-string origin", value: { ...ORIGIN_DECLARATION, origin: null } },
+  { label: "an empty profile", value: { ...ORIGIN_DECLARATION, profile: "" } },
+  { label: "an unknown profile", value: { ...ORIGIN_DECLARATION, profile: "file-namer" } },
+  { label: "a missing profile", value: { tool: "read", locations: [{ pointer: "/path", access: "read" }], origin: "sdk" } },
+  { label: "an empty location list", value: { ...ORIGIN_DECLARATION, locations: [] } },
+  { label: "a non-array location list", value: { ...ORIGIN_DECLARATION, locations: { pointer: "/path", access: "read" } } },
+  { label: "an invalid location", value: { ...ORIGIN_DECLARATION, locations: [{ pointer: "/path", access: "execute" }] } },
+  { label: "an unknown top-level field on an origin", value: { ...ORIGIN_DECLARATION, revision: 1 } },
+  { label: "an array", value: [ORIGIN_DECLARATION] },
+  { label: "an uppercase package name", value: { ...PACKAGE_DECLARATION, package: "Read-Tool" } },
+  { label: "an uppercase scoped package name", value: { ...PACKAGE_DECLARATION, package: "@Acme/file-tools" } },
+  { label: "an uppercase scoped name segment", value: { ...PACKAGE_DECLARATION, package: "@acme/File-Tools" } },
+  { label: "a scope without a name", value: { ...PACKAGE_DECLARATION, package: "@acme" } },
+  { label: "a scope with an empty name", value: { ...PACKAGE_DECLARATION, package: "@acme/" } },
+  { label: "a package name with a slash", value: { ...PACKAGE_DECLARATION, package: "tool/name" } },
+  { label: "a package name starting with an underscore", value: { ...PACKAGE_DECLARATION, package: "_private" } },
+  { label: "an empty package name", value: { ...PACKAGE_DECLARATION, package: "" } },
+  { label: "an empty entry", value: { ...PACKAGE_DECLARATION, entry: "" } },
+  { label: "a whitespace-only entry", value: { ...PACKAGE_DECLARATION, entry: "   " } },
+  { label: "a non-string entry", value: { ...PACKAGE_DECLARATION, entry: 7 } },
+  { label: "an origin field alongside the package form", value: { ...PACKAGE_DECLARATION, origin: "sdk" } },
+  { label: "a package declaration without locations", value: { tool: "read", profile: "file-reader", package: "@acme/tools" } },
+  { label: "an unknown top-level field on a package", value: { ...PACKAGE_DECLARATION, version: "1.0.0" } },
+];
+
 describe("tool binding constants", () => {
   it("publishes the four supported profiles", () => {
     expect(TOOL_BINDING_PROFILES).toEqual(["file-reader", "file-search", "file-writer", "file-editor"]);
@@ -187,29 +220,6 @@ describe("origin tool binding declarations", () => {
     expect(accept(toolBindingDeclarationSchema, value)).toBe(true);
   });
 
-  const invalid: readonly Case[] = [
-    { label: "an origin and package together", value: { ...ORIGIN_DECLARATION, package: "@acme/file-tools" } },
-    { label: "an origin with an entry", value: { ...ORIGIN_DECLARATION, entry: "dist/index.js" } },
-    { label: "neither identity", value: { tool: "read", profile: "file-reader", locations: [{ pointer: "/path", access: "read" }] } },
-    { label: "an empty tool name", value: { ...ORIGIN_DECLARATION, tool: "" } },
-    { label: "a whitespace-only tool name", value: { ...ORIGIN_DECLARATION, tool: "  " } },
-    { label: "a non-string tool name", value: { ...ORIGIN_DECLARATION, tool: 1 } },
-    { label: "an empty origin", value: { ...ORIGIN_DECLARATION, origin: "" } },
-    { label: "a non-string origin", value: { ...ORIGIN_DECLARATION, origin: null } },
-    { label: "an empty profile", value: { ...ORIGIN_DECLARATION, profile: "" } },
-    { label: "an unknown profile", value: { ...ORIGIN_DECLARATION, profile: "file-namer" } },
-    { label: "a missing profile", value: { tool: "read", locations: [{ pointer: "/path", access: "read" }], origin: "sdk" } },
-    { label: "an empty location list", value: { ...ORIGIN_DECLARATION, locations: [] } },
-    { label: "a non-array location list", value: { ...ORIGIN_DECLARATION, locations: { pointer: "/path", access: "read" } } },
-    { label: "an invalid location", value: { ...ORIGIN_DECLARATION, locations: [{ pointer: "/path", access: "execute" }] } },
-    { label: "an unknown top-level field", value: { ...ORIGIN_DECLARATION, revision: 1 } },
-    { label: "an array", value: [ORIGIN_DECLARATION] },
-  ];
-
-  it.each(invalid)("rejects $label", ({ value }) => {
-    expect(accept(toolBindingDeclarationSchema, value)).toBe(false);
-  });
-
   it("reports unknown top-level fields as unknown keys", () => {
     const codes = issueCodes(toolBindingDeclarationSchema, { ...ORIGIN_DECLARATION, extra: true });
     expect(codes).toContain("unknown-key");
@@ -238,26 +248,10 @@ describe("package tool binding declarations", () => {
     }
   });
 
-  const invalid: readonly Case[] = [
-    { label: "an uppercase package name", value: { ...PACKAGE_DECLARATION, package: "Read-Tool" } },
-    { label: "an uppercase scoped package name", value: { ...PACKAGE_DECLARATION, package: "@Acme/file-tools" } },
-    { label: "an uppercase scoped name segment", value: { ...PACKAGE_DECLARATION, package: "@acme/File-Tools" } },
-    { label: "a scope without a name", value: { ...PACKAGE_DECLARATION, package: "@acme" } },
-    { label: "a scope with an empty name", value: { ...PACKAGE_DECLARATION, package: "@acme/" } },
-    { label: "a package name with a slash", value: { ...PACKAGE_DECLARATION, package: "tool/name" } },
-    { label: "a package name starting with an underscore", value: { ...PACKAGE_DECLARATION, package: "_private" } },
-    { label: "an empty package name", value: { ...PACKAGE_DECLARATION, package: "" } },
-    { label: "an empty entry", value: { ...PACKAGE_DECLARATION, entry: "" } },
-    { label: "a whitespace-only entry", value: { ...PACKAGE_DECLARATION, entry: "   " } },
-    { label: "a non-string entry", value: { ...PACKAGE_DECLARATION, entry: 7 } },
-    { label: "an origin field alongside the package form", value: { ...PACKAGE_DECLARATION, origin: "sdk" } },
-    { label: "a package declaration without locations", value: { tool: "read", profile: "file-reader", package: "@acme/tools" } },
-    { label: "an unknown top-level field", value: { ...PACKAGE_DECLARATION, version: "1.0.0" } },
-  ];
+});
 
-  it.each(invalid)("rejects $label", ({ value }) => {
-    expect(accept(toolBindingDeclarationSchema, value)).toBe(false);
-  });
+it.each(invalidDeclarations)("rejects $label", ({ value }) => {
+  expect(accept(toolBindingDeclarationSchema, value)).toBe(false);
 });
 
 describe("tool binding lists", () => {

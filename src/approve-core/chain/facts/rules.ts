@@ -132,9 +132,11 @@ async function factsForCall(
   options: RuleFactsOptions,
   nodeOptions: RulesNodeOptions,
 ): Promise<readonly RuleUnitFacts[]> {
+  const selectedPath = context.selectedFilePaths?.[call.toolCallId];
+  const ruleCall = selectedPath === undefined ? call : { ...call, arguments: { ...call.arguments, path: selectedPath } };
   return options.resolveFacts !== undefined
     ? options.resolveFacts(call, context)
-    : defaultFacts(call, nodeOptions);
+    : defaultFacts(ruleCall, nodeOptions);
 }
 
 /**

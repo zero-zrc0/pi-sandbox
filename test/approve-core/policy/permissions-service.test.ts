@@ -101,6 +101,28 @@ describe("path and tool queries", () => {
     expect(service.isToolFullyDenied("tool")).toBe(true);
   });
 
+  it("uses the requested agent rules when agent policy stamps match", () => {
+    const session = new SessionRuleStore({ flavor: POSIX });
+    const normalizer = new PathNormalizer(POSIX, "/work", {
+      realpathSync: path => path,
+      existsSync: () => false,
+    });
+    const policies = {
+      writer: { stamp: "same-mtime", scopes: { global: { permission: { tool: "allow" } }, agent: { permission: { tool: "allow" } } } },
+      planner: { stamp: "same-mtime", scopes: { global: { permission: { tool: "allow" } }, agent: { permission: { tool: "deny" } } } },
+    } as const;
+    const manager = new PermissionManager({
+      flavor: POSIX,
+      session,
+      loadPolicy: (agent?: string) => policies[agent === "planner" ? "planner" : "writer"],
+    });
+    const resolver = new PermissionResolver({ manager, normalizer });
+    const service = new PermissionService({ manager, resolver, normalizer, session });
+
+    expect(service.toolState("tool", "writer")).toBe("allow");
+    expect(service.toolState("tool", "planner")).toBe("deny");
+  });
+
   it("forwards ordinary tool checks", () => {
     const { service } = harness({ tool: "allow" });
     expect(service.checkTool("tool", {}).state).toBe("allow");

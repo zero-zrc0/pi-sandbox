@@ -121,6 +121,7 @@ export interface StepBeginInput {
   readonly sessionFacts: ReviewerSessionFacts;
   readonly bashPrograms?: Readonly<Record<string, BashProgramFactsView>>;
   readonly powershellPrograms?: Readonly<Record<string, PowerShellProgramFactsView>>;
+  readonly selectedFilePaths?: Readonly<Record<string, string>>;
   readonly signal?: AbortSignal;
   readonly deadlineAt?: number | null;
   readonly human?: HumanApprover;
@@ -794,6 +795,7 @@ export function createStepRunner(options: StepRunnerOptions): StepRunner {
       ...(input.sessionReviews === undefined ? {} : { sessionReviews: input.sessionReviews }),
       bashPrograms: input.bashPrograms,
       powershellPrograms: input.powershellPrograms,
+      selectedFilePaths: input.selectedFilePaths,
       host,
       onReady: (result, state) => deliverReady(step, result, state),
     };

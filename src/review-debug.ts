@@ -76,7 +76,7 @@ export function createReviewDebugAuditObserver(
 /** Append one JSONL line. Hosts pass `paths.debugLogFile`; the argument defaults to the legacy location. */
 export function writeReviewDebug(
   event: Record<string, unknown>,
-  file = join(homedir(), ".pi", "agents", "pi-sandbox", "debug.txt"),
+  file = join(homedir(), ".pi", "agent", "pi-sandbox", "debug.txt"),
 ): void {
   let line = `${JSON.stringify({ time: new Date().toISOString(), ...event })}\n`;
   if (Buffer.byteLength(line) > MAX_LOG_BYTES) {

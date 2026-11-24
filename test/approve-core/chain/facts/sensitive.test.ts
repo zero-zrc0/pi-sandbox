@@ -220,3 +220,62 @@ describe("projectSensitiveFacts — path language and call fallback", () => {
     expect(sensitivePathCategory(`${CWD}/src/app.ts`, "linux")).toBeUndefined();
   });
 });
+
+describe("projectSensitiveFacts — readable control directories", () => {
+  it("produces no reference for reading a project .agents skill", () => {
+    const refs = projectSensitiveFacts(input(
+      [{ kind: "read", path: `${CWD}/.agents/skills/demo/SKILL.md` }],
+      { platform: "linux" },
+    ));
+    expect(refs).toEqual([]);
+  });
+
+  it("produces no reference for reading the global .agents directory", () => {
+    const refs = projectSensitiveFacts(input(
+      [{ kind: "read", path: "/home/me/.agents/skills/demo/SKILL.md" }],
+      { platform: "linux" },
+    ));
+    expect(refs).toEqual([]);
+  });
+
+  it("produces no reference for reading a .codex config", () => {
+    const refs = projectSensitiveFacts(input(
+      [{ kind: "read", path: "C:\\Users\\me\\.codex\\config.toml" }],
+      { platform: "win32", cwd: "C:\\work" },
+    ));
+    expect(refs).toEqual([]);
+  });
+
+  it("still maps a write into .agents", () => {
+    const refs = projectSensitiveFacts(input(
+      [{ kind: "write", path: `${CWD}/.agents/skills/demo/SKILL.md` }],
+      { platform: "linux" },
+    ));
+    expect(refs).toEqual([{
+      path: `${CWD}/.agents/skills/demo/SKILL.md`,
+      category: "agent-control",
+      surface: "write",
+    }]);
+  });
+
+  it("still maps an external delete of .codex", () => {
+    const refs = projectSensitiveFacts(input(
+      [{ kind: "write", path: "C:\\Users\\me\\.codex\\config.toml", external: true, externalDelete: true }],
+      { platform: "win32", cwd: "C:\\work" },
+    ));
+    expect(refs).toEqual([{
+      path: "C:\\Users\\me\\.codex\\config.toml",
+      category: "agent-control",
+      surface: "delete",
+    }]);
+  });
+
+  it("keeps only the mutating reference when one unit reads and writes .agents", () => {
+    const path = `${CWD}/.agents/skills/demo/SKILL.md`;
+    const refs = projectSensitiveFacts(input(
+      [{ kind: "read", path }, { kind: "write", path }],
+      { platform: "linux" },
+    ));
+    expect(refs).toEqual([{ path, category: "agent-control", surface: "write" }]);
+  });
+});

@@ -281,6 +281,10 @@ export function bindOwnedToolExecution<
       if (!Value.Check(parameters, approvedArguments)) {
         return executionError("approved-action-invalid", failureDetails);
       }
+      const selectedFilePath = binding.status === "bound" ? binding.selectedFilePath : undefined;
+      const executionArguments = selectedFilePath === undefined
+        ? approvedArguments
+        : { ...approvedArguments, path: selectedFilePath };
       if (signal?.aborted) {
         return executionError("execution-cancelled-before-start", failureDetails);
       }
@@ -316,7 +320,7 @@ export function bindOwnedToolExecution<
       const executeApproved = () => execute.call(
         definition,
         toolCallId,
-        approvedArguments,
+        executionArguments,
         signal,
         onUpdate,
         ctx,

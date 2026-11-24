@@ -5,6 +5,7 @@ import {
   type McpExtensionOptions,
   type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { existsSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -20,7 +21,7 @@ import { ExecutionController } from "./lifecycle";
 import { EgressService } from "./egress/index";
 import { createPiExecutionAdapter, type AnyToolDefinition, type PiExecutionAdapter } from "./pi";
 import { selectExecutionEnvironment } from "./plan";
-import { findSystemBubblewrap } from "./backend/linux/bwrap-selection.mjs";
+import { findSystemBubblewrap, resolveSystemBubblewrap } from "./backend/linux/bwrap-selection.mjs";
 import { createLinuxDirectBackend } from "./backend/linux/direct";
 import { createMacOSDirectBackend } from "./backend/macos/direct";
 import { createWindowsDirectBackend } from "./backend/windows/direct";
@@ -31,14 +32,13 @@ import type { SandboxRuntimeState } from "./runtime-manager";
 import type { ResolvedRuntimeFiles } from "./runtime-store";
 import { acquireRuntimeUseLease } from "./runtime-installation";
 import { ManagedMcpTransports } from "./mcp";
-import { resolveHostPathIdentity, findProtectedControlRoot, isPathWithin } from "./path";
+import { resolveHostPathIdentity, findProtectedControlReadRoot, findProtectedControlRoot, isPathWithin, READABLE_CONTROL_DIRECTORY_NAMES } from "./path";
 import { ensureSessionWorkspace } from "./session-workspace";
 import { builtinToolPath, resolveTemporaryToolPath } from "./builtin-path";
 import { collectSensitivePaths } from "./sensitive-paths";
 import { linuxRuntimeFilesystem, macOSRuntimeFilesystem, windowsRuntimeFilesystem } from "./runtime-filesystem";
-import { captureRuntimeIdentity } from "./runtime-identity";
 import type { ToolElevation } from "../elevation";
-import type { SandboxBypassReviewInput } from "../approve-core/host";
+import type { SandboxBypassReviewInput, SandboxReviewInput } from "../approve-core/host";
 import { hasApprovedCodemodeScope } from "./codemode/approval-scope";
 import {
   collectToolRuleLocations,
@@ -57,11 +57,13 @@ const BINDING = "builtin-and-mcp:v1";
 type Block = { block: true; reason: string; permissionDenied?: boolean };
 type HostExecutionApproval = { kind: "host-execution"; reason: string };
 type ReviewOutcome = Block | HostExecutionApproval | undefined;
-type Review = (input?: { readonly ask?: boolean }) => Promise<ReviewOutcome>;
+type Review = (input?: SandboxReviewInput) => Promise<ReviewOutcome>;
 const factories = [createBashToolDefinition, createPowerShellToolDefinition, createReadToolDefinition,
   createWriteToolDefinition, createEditToolDefinition, createGrepToolDefinition,
   createFindToolDefinition, createLsToolDefinition];
 const FILE_TOOL_NAMES = new Set(["read", "write", "edit", "grep", "find", "ls"]);
+/** Shell tools whose elevation is Host-only: the approved command runs once on the host. */
+const SHELL_ELEVATION_TOOL_NAMES = new Set(["bash", "powershell"]);
 
 export interface ControlledExecutionOptions {
   readonly registrationPath?: string;
@@ -89,6 +91,13 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
   const bindings = new ToolInvocationBindingStore();
   const egress = new EgressService();
   const sessions = new Map<string, SessionExecution>();
+  const selectedFileTargets = new Map<string, Map<string, {
+    readonly toolName: string;
+    readonly argumentsDigest: string;
+    readonly revision: string;
+    readonly cwd: string;
+    readonly target: ReturnType<typeof fileTarget>;
+  }>>();
   const pendingSessions = new Map<string, Promise<SessionExecution>>();
   const epochs = new Map<string, number>();
   const closedSessions = new Set<string>();
@@ -128,8 +137,12 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
   const baselineFilesystem = (ctx: ExtensionContext, mode: ApprovalChainConfigSnapshot["config"]["mode"]): FilesystemGrantInput[] => {
     const workspace = sessionWorkspace(ctx);
     const readOnly = mode === "read-only";
+    // Skills and agent state live in the readable control directories under
+    // the user home; every mode can read them so skills stay usable.
+    const readableControlRoots = READABLE_CONTROL_DIRECTORY_NAMES.map((name) => join(homedir(), name));
     return [{ path: ctx.cwd, access: "read", granularity: "directory" },
       { path: workspace, access: "read", granularity: "directory" },
+      ...readableControlRoots.map((path) => ({ path, access: "read" as const, granularity: "directory" as const })),
       ...(readOnly ? [] : [{ path: workspace, access: "write" as const, granularity: "directory" as const }]),
       ...(readOnly ? [] : [{ path: ctx.cwd, access: "write" as const, granularity: "directory" as const }])];
   };
@@ -149,26 +162,19 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
   const snapshot = (ctx: ExtensionContext) => options.snapshot(ctx);
 
   /**
-   * A sandboxed session keeps its temporary files in the session workspace,
-   * but file-tool arguments are not shell-expanded: a literal `$TMPDIR`
-   * would name a project entry while the sandboxed shell resolves it to the
-   * workspace. Rewrite that spelling once, before rules, approval, capture
-   * and the tool itself read it, so the read or write targets the temporary
-   * directory the sandbox actually grants.
+   * Preserve the model input while mapping temporary-variable paths for policy and execution.
    */
-  function mapTemporaryFilePath(event: ToolCallEvent, ctx: ExtensionContext): void {
-    if (!FILE_TOOL_NAMES.has(event.toolName)) return;
+  function mapTemporaryFilePath(event: ToolCallEvent, ctx: ExtensionContext, current: ApprovalChainConfigSnapshot): Record<string, unknown> {
     const input = event.input as Record<string, unknown>;
+    if (!FILE_TOOL_NAMES.has(event.toolName) || current.config.mode === "full-access") return input;
     const path = input.path;
-    if (typeof path !== "string") return;
-    const current = snapshot(ctx);
-    if (current.config.mode === "full-access") return;
+    if (typeof path !== "string") return input;
     const host = environment();
     const temporaryRoot = current.config.experimental.sandboxEnabled
       ? executionEnvironment(ctx).TMPDIR
       : host.TMPDIR;
     const mapped = resolveTemporaryToolPath(path, host, temporaryRoot);
-    if (mapped !== undefined) input.path = mapped;
+    return mapped === undefined ? input : { ...input, path: mapped };
   }
   const host = {
     getAllTools: () => api.getAllTools(),
@@ -244,9 +250,12 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     const backendId = runtime?.manifest.backendId ?? "unsupported-platform";
     const currentEnvironment = environment();
     const hostCwd = resolve(process.env.TEMP ?? process.env.TMPDIR ?? "/tmp");
-    const systemBubblewrapPath = process.platform === "linux" && runtime !== undefined
-      ? findSystemBubblewrap(currentEnvironment.PATH, ctx.cwd)
-      : undefined;
+    const selectedBubblewrap = runtime?.linuxProbe?.bubblewrap;
+    const selectedSystemPath = selectedBubblewrap?.kind === "system" ? selectedBubblewrap.path : undefined;
+    const systemBubblewrapPath = process.platform !== "linux" || runtime === undefined ? undefined
+      : selectedSystemPath !== undefined ? resolveSystemBubblewrap(selectedSystemPath, ctx.cwd)
+        : selectedBubblewrap?.kind === "bundled" ? undefined : findSystemBubblewrap(currentEnvironment.PATH, ctx.cwd);
+    const invalidSelectedSystem = selectedSystemPath !== undefined && systemBubblewrapPath !== selectedSystemPath;
     const hostEnvironment = {
       ...currentEnvironment,
       PI_MXC_AGENT_DIR: agentDirectory,
@@ -265,7 +274,7 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
         hostCwd,
         hostEnvironment,
       })
-        : process.platform === "linux" ? createLinuxDirectBackend({
+        : process.platform === "linux" && !invalidSelectedSystem ? createLinuxDirectBackend({
           runtime,
           installRoot: EXECUTION_INSTALL_ROOT,
           hostCwd,
@@ -287,6 +296,7 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
           storageRoot: runtime.storageRoot,
           platform: runtime.manifest.platform,
           arch: runtime.manifest.arch,
+          version: runtime.manifest.version,
         }),
       }),
       onRecord: record,
@@ -322,7 +332,6 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
           ...(current.projectConfig === undefined ? [] : [current.paths.projectConfigFile])],
         readSensitivePaths: () => collectSensitivePaths({ agentDirectory, cwd: ctx.cwd,
           denyPaths: current.config.execution.denyPaths }),
-        ...(runtime === undefined || options.controller !== undefined ? {} : { validateRuntime: captureRuntimeIdentity(runtime) }),
         ...(process.platform === "win32" ? { runtimeFilesystem: (operation: import("./types").ExecutionOperation) =>
           windowsRuntimeFilesystem({ cwd: ctx.cwd, installRoot: EXECUTION_INSTALL_ROOT,
             operation, environment: executionEnvironment(ctx), agentDirectory: resolve(getAgentDir()) }) } : process.platform === "linux" ? {
@@ -549,6 +558,7 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     void cancelManagedSession(id).catch(() => undefined);
     egress.closeSession(id);
     bindings.clearSession(id);
+    selectedFileTargets.delete(id);
     clearElevations(id);
     epochs.set(id, (epochs.get(id) ?? 0) + 1);
     const previous = sessions.get(id);
@@ -578,6 +588,42 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       : name === "edit" ? ["read", "write"] as const
         : ["read"] as const;
     return { path: target, accesses };
+  }
+
+  function selectFileTarget(event: ToolCallEvent, ctx: ExtensionContext, current: SessionExecution): ReturnType<typeof fileTarget> {
+    if (!FILE_TOOL_NAMES.has(event.toolName) || !owns(event.toolName)) return undefined;
+    const sessionId = ctx.sessionManager.getSessionId();
+    let selected = selectedFileTargets.get(sessionId);
+    if (selected === undefined) {
+      selected = new Map();
+      selectedFileTargets.set(sessionId, selected);
+    }
+    const argumentsDigest = jsonDigest(event.input as JsonObject);
+    const existing = selected.get(event.toolCallId);
+    if (existing !== undefined) {
+      if (existing.toolName !== event.toolName || existing.argumentsDigest !== argumentsDigest ||
+          existing.revision !== current.revision || existing.cwd !== ctx.cwd) {
+        throw new Error("selected file target no longer matches the call");
+      }
+      return existing.target;
+    }
+    if (selected.size >= 8192) throw new Error("selected file target capacity exceeded");
+    const target = fileTarget(event.toolName, mapTemporaryFilePath(event, ctx, current.snapshot), ctx);
+    selected.set(event.toolCallId, { toolName: event.toolName, argumentsDigest, revision: current.revision, cwd: ctx.cwd, target });
+    return target;
+  }
+
+  /**
+   * The protected root an elevation may not touch. A mutating target keeps the
+   * write-protection list; a read-only target uses the readable exemption, the
+   * same split `ordinaryFileScopeBlock` applies to ordinary calls.
+   */
+  function protectedElevationRoot(
+    target: NonNullable<ReturnType<typeof fileTarget>>,
+  ): string | null {
+    return target.accesses.includes("write")
+      ? findProtectedControlRoot(target.path)
+      : findProtectedControlReadRoot(target.path);
   }
 
   function missingFileAccesses(
@@ -631,32 +677,39 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
     ctx: ExtensionContext,
   ): ToolElevation | undefined {
     const target = fileTarget(name, args, ctx);
-    if (target === undefined || target === null || findProtectedControlRoot(target.path) !== null) return undefined;
+    if (target === undefined || target === null || protectedElevationRoot(target) !== null) return undefined;
     const accesses = missingFileAccesses(target, ctx);
     if (accesses === null || accesses.length === 0) return undefined;
     const scope = elevationScope(target, accesses, tier, ctx);
     return scope.ok ? scope.elevation : undefined;
   }
-  function ordinaryFileScopeBlock(name: string, args: Record<string, unknown>, ctx: ExtensionContext): Block | undefined {
+  function ordinaryFileScopeBlock(name: string, args: Record<string, unknown>, ctx: ExtensionContext, selectedTarget: ReturnType<typeof fileTarget>): Block | undefined {
     const current = snapshot(ctx);
     if (current.config.mode === "full-access" || !current.config.experimental.sandboxEnabled) return undefined;
-    const target = fileTarget(name, args, ctx);
+    const target = selectedTarget;
     if (target === undefined) return undefined;
-    if (target === null) return { block: true, reason: `permission:path-unverifiable:${String(args.path ?? ".")}` };
-    if (findProtectedControlRoot(target.path) !== null) {
-      return { block: true, reason: `permission:protected-control-path:${target.path}` };
+    if (target === null) return { block: true, reason: `permission:path-unverifiable:${String(args.path ?? ".")}: the target path could not be resolved to a real location` };
+    const protectedRoot = protectedElevationRoot(target);
+    if (protectedRoot !== null) {
+      return { block: true, reason: `permission:protected-control-path:${target.path}: this path is inside a protected control directory (.git, .agents, .codex, .aws) and cannot be accessed this way` };
     }
     if (readOnlySessionWorkspaceWrite(target, ctx)) {
       return { block: true, reason: `permission:mode:read-only:session-workspace-write-forbidden:${target.path}` };
     }
     const accesses = missingFileAccesses(target, ctx);
-    if (accesses === null) return { block: true, reason: "permission:baseline-path-unverifiable" };
+    if (accesses === null) return { block: true, reason: "permission:baseline-path-unverifiable: the session's baseline access scopes could not be resolved; retry the call" };
     if (accesses.length === 0) return undefined;
     const workspace = resolveHostPathIdentity(ctx.cwd);
-    if (workspace === null) return { block: true, reason: "permission:workspace-path-unverifiable" };
+    if (workspace === null) return { block: true, reason: "permission:workspace-path-unverifiable: the project root could not be resolved; retry the call" };
     const tier = isPathWithin(workspace, target.path) ? "default" : "host";
     const scope = elevationScope(target, accesses, tier, ctx);
-    if (!scope.ok) return { block: true, reason: `permission:${scope.reason}:${target.path}` };
+    if (!scope.ok) return {
+      block: true,
+      reason: `permission:${scope.reason}:${target.path}` +
+        (scope.reason === "default-scope-unverifiable"
+          ? ": the project and session-workspace roots could not be verified for a default-tier elevation"
+          : `: default-tier elevation only covers paths inside the project and session workspace; request tier "host" for this target`),
+    };
     return {
       block: true,
       reason: `permission:elevation-required:${accesses.join("+")} ${target.path}; call request_tool_elevation with toolName "${name}", unchanged complete arguments, a reason, and tier "${tier}"`,
@@ -673,11 +726,23 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       if (!owns(name) || hostExecutors.get(name) === undefined) {
         return { block: true, reason: `sandbox-bypass:target-executor-unavailable:${name}` };
       }
+      const ruleMatch = evaluateToolRules(current.toolRules, { tool: name, args });
+      if (ruleMatch.kind === "deny") {
+        return { block: true, reason: `sandbox-denied-tool:${ruleMatch.ruleId}` };
+      }
+      if (SHELL_ELEVATION_TOOL_NAMES.has(name)) {
+        // A shell command's reach is the command text itself: the reviewer
+        // approves that exact text, so the elevation carries no derived scope.
+        if (tier !== "host") {
+          return { block: true, reason: `sandbox-bypass:default-tier-unavailable:${name}; shell tools support tier "host" only` };
+        }
+        return { tier: "host", scope: [] };
+      }
       const target = fileTarget(name, args, ctx);
-      if (target === undefined) return { block: true, reason: `sandbox-bypass:unsupported-target-tool:${name}` };
+      if (target === undefined) return { block: true, reason: `sandbox-bypass:unsupported-target-tool:${name}: request_tool_elevation supports the built-in file tools and the bash/powershell shell tools (host tier)` };
       if (target === null) return { block: true, reason: `sandbox-bypass:target-path-unverifiable:${String(args.path ?? ".")}` };
-      if (findProtectedControlRoot(target.path) !== null) {
-        return { block: true, reason: `sandbox-bypass:protected-target:${target.path}` };
+      if (protectedElevationRoot(target) !== null) {
+        return { block: true, reason: `sandbox-bypass:protected-target:${target.path}: this path is inside a protected control directory; choose a different target` };
       }
       const accesses = missingFileAccesses(target, ctx);
       if (accesses === null) return { block: true, reason: "sandbox-bypass:baseline-path-unverifiable" };
@@ -692,10 +757,34 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       return scope.elevation;
     },
     validateElevation(name: string, args: JsonObject, elevation: ToolElevation, ctx: ExtensionToolContext): boolean {
-      const current = fileElevation(name, args, elevation.tier, ctx);
+      const current = SHELL_ELEVATION_TOOL_NAMES.has(name)
+        ? elevation.tier === "host" ? { tier: "host" as const, scope: [] as ToolElevation["scope"] } : undefined
+        : fileElevation(name, args, elevation.tier, ctx);
       return !closedSessions.has(ctx.sessionManager.getSessionId()) && owns(name) &&
         snapshot(ctx).config.mode !== "full-access" && snapshot(ctx).config.experimental.sandboxEnabled &&
         current !== undefined && jsonDigest(current) === jsonDigest(elevation);
+    },
+    /** True when `currentInput` differs from the model's recorded `originalInput` only by the sanctioned temporary-path rewrite. */
+    sanctionedArgumentRewrite(name: string, originalInput: unknown, currentInput: unknown, ctx: ExtensionContext): boolean {
+      if (!FILE_TOOL_NAMES.has(name)) return false;
+      if (typeof originalInput !== "object" || originalInput === null || Array.isArray(originalInput)) return false;
+      if (typeof currentInput !== "object" || currentInput === null || Array.isArray(currentInput)) return false;
+      const before = (originalInput as Record<string, unknown>).path;
+      const after = (currentInput as Record<string, unknown>).path;
+      if (typeof before !== "string" || typeof after !== "string" || before === after) return false;
+      const withoutPath = (value: Record<string, unknown>): JsonObject => {
+        const rest: Record<string, unknown> = {};
+        for (const [key, entry] of Object.entries(value)) if (key !== "path") rest[key] = entry;
+        return rest as JsonObject;
+      };
+      if (jsonDigest(withoutPath(originalInput as Record<string, unknown>)) !==
+        jsonDigest(withoutPath(currentInput as Record<string, unknown>))) return false;
+      const current = snapshot(ctx);
+      if (current.config.mode === "full-access") return false;
+      const root = current.config.experimental.sandboxEnabled
+        ? executionEnvironment(ctx).TMPDIR
+        : environment().TMPDIR;
+      return resolveTemporaryToolPath(before, environment(), root) === after;
     },
     async executeDefault(input: SandboxBypassReviewInput, signal: AbortSignal | undefined,
       onUpdate: Parameters<AnyToolDefinition["execute"]>[3], ctx: ExtensionToolContext) {
@@ -784,18 +873,36 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       return { status: "verified", source: "builtin", complete: true, unknownEffects: [],
         accesses: accesses.map(access => ({ path, access, operation: access })) };
     },
+    selectFileTargets(calls: import("#approve-core/contracts").StepCapture["directCalls"], ctx: ExtensionContext) {
+      const current = sessions.get(ctx.sessionManager.getSessionId());
+      if (current === undefined || current.revision !== revision(snapshot(ctx))) throw new Error("sandbox session changed");
+      const targets: Record<string, { requestedPath: string; resolvedPath: string }> = Object.create(null);
+      for (const call of calls) {
+        const event = { type: "tool_call", toolName: call.toolName, toolCallId: call.toolCallId, input: call.arguments } as ToolCallEvent;
+        const target = selectFileTarget(event, ctx, current);
+        if (target !== undefined && target !== null) {
+          const requested = call.arguments.path;
+          targets[call.toolCallId] = { requestedPath: typeof requested === "string" ? requested : ".", resolvedPath: target.path };
+        }
+      }
+      return Object.freeze(targets);
+    },
     registerManagedTool(definition: AnyToolDefinition, lifecycle?: ManagedToolLifecycle): void {
       hostExecutors.set(definition.name, definition);
       register(definition, false, lifecycle ?? {});
     },
     configurationChanged,
+    invalidate(sessionId: string) {
+      selectedFileTargets.delete(sessionId);
+    },
     async guard(event: ToolCallEvent, ctx: ExtensionContext, review: Review): Promise<ReviewOutcome> {
       if (event.toolName === disabledShell) return { block: true, reason: disabledShellReason };
       const current = await session(ctx);
-      mapTemporaryFilePath(event, ctx);
+      const selectedArguments = mapTemporaryFilePath(event, ctx, current.snapshot);
+      const selectedTarget = selectFileTarget(event, ctx, current);
       const ruleMatch = evaluateToolRules(current.snapshot.toolRules, {
         tool: event.toolName,
-        args: event.input,
+        args: selectedArguments,
       });
       if (ruleMatch.kind === "deny") {
         auditToolRule(ctx.sessionManager.getSessionId(), event, ruleMatch);
@@ -818,7 +925,7 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       let declaredAccesses: readonly { readonly path: string; readonly access: "read" | "write" }[] = [];
       if (allowedByRule) {
         // §5.1: an allow rule validates its declared arguments before execution.
-        const locations = collectToolRuleLocations(ruleMatch.rule, event.input, ctx.cwd);
+        const locations = collectToolRuleLocations(ruleMatch.rule, selectedArguments, ctx.cwd);
         if (!locations.ok) {
           auditToolRule(ctx.sessionManager.getSessionId(), event, ruleMatch, locations.reason);
           return { block: true, reason: `sandbox-tool-rule:${ruleMatch.ruleId}:${locations.reason}` };
@@ -835,17 +942,24 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
         return current.snapshot.config.mode === "full-access"
           ? review() : { block: true, reason: `sandbox-unmanaged-tool: ${event.toolName}` };
       }
-      const scopeBlock = ordinaryFileScopeBlock(event.toolName, event.input as Record<string, unknown>, ctx);
+      const scopeBlock = ordinaryFileScopeBlock(event.toolName, selectedArguments, ctx, selectedTarget);
       if (scopeBlock !== undefined) return scopeBlock;
       const seed = captureToolInvocationSeed({ event, registeredTools: api.getAllTools(), cwd: ctx.cwd,
         requester: host.readRequester(ctx as ExtensionToolContext), environment: executionEnvironment(ctx) });
       if (!seed.ok) return { block: true, reason: `sandbox-binding: ${seed.reason}` };
+      const requestedPath = (event.input as Record<string, unknown>).path;
+      const reviewInput = {
+        ask: true,
+        ...(typeof requestedPath === "string" && selectedTarget !== undefined && selectedTarget !== null
+          ? { requestedPath, resolvedPath: selectedTarget.path }
+          : {}),
+      };
       const answer = allowedByRule || hasApprovedCodemodeScope(ctx.sessionManager.getSessionId())
         ? undefined
-        : await review({ ask: true });
+        : await review(reviewInput);
       if (answer !== undefined) {
         return "kind" in answer && answer.kind === "host-execution"
-          ? { block: true, reason: "permission:ordinary-host-execution-forbidden; use request_tool_elevation for a supported file tool" }
+          ? { block: true, reason: "permission:ordinary-host-execution-forbidden; use request_tool_elevation for a supported tool" }
           : answer;
       }
       if (sessions.get(ctx.sessionManager.getSessionId()) !== current || current.revision !== revision(snapshot(ctx)) || !owns(event.toolName)) return { block: true, reason: "plan-invalidated: execution policy or tool changed during approval" };
@@ -872,16 +986,17 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
         }
       }
       if (BUILTIN_TOOL_NAMES.includes(name as typeof BUILTIN_TOOL_NAMES[number]) && name !== "bash" && name !== "powershell") {
-        const raw = seed.seed.effectiveArguments.path ?? ".";
+        const raw = selectedArguments.path ?? ".";
         if (typeof raw !== "string") return { block: true, reason: "sandbox-binding: invalid path" };
-        const path = resolveHostPathIdentity(builtinToolPath(name as typeof BUILTIN_TOOL_NAMES[number], raw, ctx.cwd));
-        if (!path) return { block: true, reason: "sandbox-binding: path identity is unavailable" };
-        for (const access of name === "write" ? ["write" as const] : name === "edit" ? ["read" as const, "write" as const] : ["read" as const]) {
-          scopes.push({ id: `builtin:${access}`, surface: `path_${access}`, target: path, access, state: "allow", source: "approval-chain" });
+        if (selectedTarget === undefined || selectedTarget === null) {
+          return { block: true, reason: "sandbox-binding: path identity is unavailable" };
+        }
+        for (const access of selectedTarget.accesses) {
+          scopes.push({ id: `builtin:${access}`, surface: `path_${access}`, target: selectedTarget.path, access, state: "allow", source: "approval-chain" });
         }
       }
       const captured = finalizeToolInvocation(seed.seed, { requestId: `${ctx.sessionManager.getSessionId()}:${event.toolCallId}`,
-        scopes, executionBinding: { status: "bound", toolName: name, owner: OWNER, bindingId: BINDING, revision: seed.seed.tool.revision } });
+        scopes, executionBinding: { status: "bound", toolName: name, owner: OWNER, bindingId: BINDING, revision: seed.seed.tool.revision, ...(selectedTarget === undefined || selectedTarget === null ? {} : { selectedFilePath: selectedTarget.path }) } });
       if (!captured.ok) return { block: true, reason: "sandbox-binding: authorization could not be bound" };
       if (!bindings.authorize(captured.invocation, current.revision)) return { block: true, reason: "sandbox-binding: authorization could not be bound" };
       return undefined;
@@ -893,6 +1008,9 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
       pi.on("tool_execution_end", (event, ctx) => {
         const sessionId = ctx.sessionManager.getSessionId();
         bindings.take(sessionId, event.toolCallId);
+        const selected = selectedFileTargets.get(sessionId);
+        selected?.delete(event.toolCallId);
+        if (selected?.size === 0) selectedFileTargets.delete(sessionId);
       });
       pi.on("session_shutdown", async (_event, ctx) => {
         const id = ctx.sessionManager.getSessionId();
@@ -901,6 +1019,7 @@ export function createControlledExecution(options: ControlledExecutionOptions) {
         closedSessions.add(id);
         epochs.set(id, (epochs.get(id) ?? 0) + 1);
         bindings.clearSession(id);
+        selectedFileTargets.delete(id);
         const previous = sessions.get(id); sessions.delete(id);
         await Promise.all([cancelling, previous?.adapter.dispose(), retiring.get(id), pendingSessions.get(id)?.catch(() => undefined), mcp.close()]);
         egress.closeSession(id);

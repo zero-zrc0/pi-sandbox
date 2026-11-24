@@ -74,7 +74,12 @@ export async function probeSandboxRuntime(input: {
       ...(!capabilities.processTree ? ["process tree control"] : []),
     ];
     if (missing.length > 0) return { available: false, reason: `runtime lacks required capabilities: ${missing.join(", ")}` };
-    return { available: true };
+    return {
+      available: true,
+      ...(result.linuxBubblewrap === undefined ? {} : {
+        linuxProbe: { bubblewrap: result.linuxBubblewrap, capabilities },
+      }),
+    };
   } finally {
     input.signal.removeEventListener("abort", stop);
     await controller.dispose();

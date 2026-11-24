@@ -226,6 +226,7 @@ async function prepareSandboxRuntime(manager: SandboxRuntimeManager, ctx: Extens
   let progressDialog: RuntimeDownloadProgressDialog | undefined;
   const state = await manager.prepare({
     workspaceRoot: ctx.cwd,
+    ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
     confirmDownload: async release => {
       if (!ctx.hasUI || ctx.mode !== "tui") return false;
       const answer = await selectPermissionOption(
@@ -823,7 +824,7 @@ export default function registerPermissionExtension(
     const manager = new PermissionManager({
       flavor,
       session: sessionRules,
-      loadPolicy: () => policyLoader.load(getActiveAgentName(runtime.ctx)),
+      loadPolicy: agent => policyLoader.load(agent),
       shellTools: snapshot.config.shellTools,
     });
     const normalizer = new PathNormalizer(flavor, ctx.cwd, {
@@ -834,7 +835,6 @@ export default function registerPermissionExtension(
       manager,
       normalizer,
       shellTools: snapshot.config.shellTools,
-      mcpConfigServers: () => policyLoader.load(getActiveAgentName(runtime.ctx)).mcpServerNames,
     });
     const permissionService = new PermissionService({
       manager, resolver, normalizer, session: sessionRules,
@@ -849,7 +849,7 @@ export default function registerPermissionExtension(
         if (toolName.startsWith("mcp__")) return permissionService.checkMcp(toolName, agent);
         return permissionService.checkTool(toolName, input ?? {}, agent);
       },
-      getToolPermission: (toolName: string) => manager.toolState(toolName),
+      getToolPermission: (toolName: string) => permissionService.toolState(toolName, getActiveAgentName(runtime.ctx)),
     });
     const nodeHost = createApprovalNodeHost({
       onWarning: (warning) => notify(runtime.ctx, warning.message),
@@ -1160,7 +1160,7 @@ export default function registerPermissionExtension(
     publications,
     analysis,
     captureStep,
-    sessionPathApproval: ({ sessionId, toolName, arguments: args, cwd }) => {
+    sessionPathApproval: ({ sessionId, toolName, arguments: args, selectedFilePath, cwd }) => {
       const runtime = runtimes.get(sessionId);
       if (runtime === undefined) return undefined;
       const normalizer = cwd === runtime.normalizer.cwd
@@ -1175,9 +1175,9 @@ export default function registerPermissionExtension(
           ? "path_read"
           : undefined;
       if (surface === undefined) return undefined;
-      const path = typeof args.path === "string" && args.path.length > 0
+      const path = selectedFilePath ?? (typeof args.path === "string" && args.path.length > 0
         ? args.path
-        : toolName === "read" || toolName === "grep" ? "." : "";
+        : toolName === "read" || toolName === "grep" ? "." : "");
       if (path === "" || /[*?]/u.test(path)) return undefined;
       try {
         const target = normalizer.nativeToolPath(toolName, path);

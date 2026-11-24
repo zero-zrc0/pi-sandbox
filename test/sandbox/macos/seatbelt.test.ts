@@ -181,8 +181,8 @@ describe.skipIf(process.platform !== "darwin")("macOS Seatbelt profiles", () => 
     expect(result).toMatchObject({ ok: false, code: "sandbox-capability-unsupported" });
   });
 
-  it("probes the fixed sandbox-exec and reports the backend as a candidate", () => {
-    const probe = probeMacOSSeatbelt();
+  it("probes the fixed sandbox-exec and reports the backend as a candidate", async () => {
+    const probe = await probeMacOSSeatbelt();
 
     expect(MACOS_SANDBOX_EXEC_PATH).toBe("/usr/bin/sandbox-exec");
     expect(probe).toMatchObject({
@@ -190,5 +190,13 @@ describe.skipIf(process.platform !== "darwin")("macOS Seatbelt profiles", () => 
       executable: MACOS_SANDBOX_EXEC_PATH,
       defaultDenyProbePassed: true,
     });
+  });
+
+  it("cancels the active Seatbelt probe and permits a later probe", async () => {
+    const controller = new AbortController();
+    const pending = probeMacOSSeatbelt(controller.signal);
+    controller.abort();
+    expect(await pending).toMatchObject({ status: "unavailable", reason: expect.stringContaining("cancelled") });
+    expect(await probeMacOSSeatbelt()).toMatchObject({ status: "candidate-present" });
   });
 });

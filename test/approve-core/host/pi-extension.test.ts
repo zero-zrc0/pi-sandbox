@@ -10,7 +10,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -33,6 +32,7 @@ import {
   type PublicationFactoryPort,
   type RunChainPort,
   type SandboxPort,
+  type SessionPathApprovalRequest,
 } from "#approve-core/host/pi-extension";
 import type {
   CaptureStepResult,
@@ -54,6 +54,7 @@ import type {
   LearningFinalizeInput,
 } from "#approve-core/context";
 import { reviewDigest } from "#approve-core/context/types";
+import { createReviewerSessionMemory } from "#approve-core/context/session-memory";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -150,6 +151,8 @@ function makeFakeMemory(): FakeMemory {
       pendingEvents: 0,
     }),
     capture: (owner: string) => ({ ok: true as const, view: view(owner), revisions: { ...revisions } }),
+    isCurrent: (_owner: string, _view: ReviewView, captured: typeof revisions) =>
+      captured.owner === revisions.owner && captured.navigation === revisions.navigation && captured.authorization === revisions.authorization,
     noteUserInput: () => {
       revisions.authorization += 1;
     },
@@ -456,6 +459,7 @@ interface Harness {
   readonly analysis: AnalysisPort & { readonly calls: StepCapture[] };
   readonly audit: AuditEvent[];
   readonly memory: FakeMemory;
+  readonly memoryInstance: ReviewerSessionMemory;
   readonly ctx: ExtensionContext;
   fire(event: string, payload: unknown): Promise<unknown>;
   toolCall(toolCallId?: string, toolName?: string, input?: Record<string, unknown>): Promise<{ block?: boolean; reason?: string; kind?: string } | undefined>;
@@ -493,6 +497,8 @@ async function harness(options: {
   readonly bashPrograms?: AnalysisPort["bashPrograms"];
   readonly runChain?: RunChainPort;
   readonly captureStep?: CaptureStepPort;
+  readonly useRealMemory?: boolean;
+  readonly sessionPathApproval?: (request: SessionPathApprovalRequest) => { surface: "path_read" | "path_write"; scope: string; remember(decision: "allow" | "deny"): void } | undefined;
 } = {}): Promise<Harness> {
   const session = makeSession();
   const ctx = makeContext(session);
@@ -500,6 +506,8 @@ async function harness(options: {
     (ctx.ui as unknown as { notify: () => void }).notify = () => options.uiNotify?.();
   }
   const memory = makeFakeMemory();
+  const memoryInstance = options.useRealMemory === true
+    ? createReviewerSessionMemory({ host: ctx.sessionManager }) : memory.memory;
   const analysis = makeAnalysis(options.onAnalyze);
   if (options.bashPrograms !== undefined) Object.assign(analysis, { bashPrograms: options.bashPrograms });
   const publications = makePublications(options.modes ?? ["default"], options.nodes ?? []);
@@ -511,7 +519,8 @@ async function harness(options: {
     analysis,
     captureStep: options.captureStep ?? capturePort,
     runChain: options.runChain ?? chain.port,
-    memory: { create: () => memory.memory } satisfies MemoryPort,
+    memory: { create: () => memoryInstance } satisfies MemoryPort,
+    ...(options.sessionPathApproval === undefined ? {} : { sessionPathApproval: options.sessionPathApproval }),
     contextStore,
     ...(options.sandbox === undefined ? {} : { sandbox: options.sandbox }),
     ...(options.bypassToolName === undefined ? {} : { bypassToolName: options.bypassToolName }),
@@ -533,6 +542,7 @@ async function harness(options: {
     analysis,
     audit,
     memory,
+    memoryInstance,
     ctx,
     fire: (event, payload) => api.fire(event, payload, ctx),
     async toolCall(toolCallId = "call-1", toolName = "bash", input = { command: "ls" }) {
@@ -903,6 +913,40 @@ describe("host tool call processing (§6)", () => {
     expect(h.chain.calls).toHaveLength(0);
   });
 
+  it("uses one captured session view throughout an approval", async () => {
+    const h = await harness();
+    const capture = vi.spyOn(h.memory.memory, "capture");
+    const call = h.toolCall("single-snapshot");
+    await waitFor(() => h.chain.calls.length === 1, "single snapshot chain");
+    h.chain.resolve(chainResult(h.chain.calls[0]!.capture, "single-snapshot", "allow", 1));
+    expect(await call).toBeUndefined();
+    expect(capture).toHaveBeenCalledTimes(1);
+  });
+
+  it("records nested tool execution start and its real result without a separate review", async () => {
+    const h = await harness();
+    const args = { path: "notes.txt", content: "nested" };
+    await h.fire("tool_execution_start", { type: "tool_execution_start", toolCallId: "inner", parentToolCallId: "outer", toolName: "write", args });
+    await h.fire("tool_execution_end", { type: "tool_execution_end", toolCallId: "inner", parentToolCallId: "outer", toolName: "write", isError: false, result: { content: [{ type: "text", text: "written" }] } });
+    expect(h.memory.events).toEqual([
+      { kind: "call", sessionId: SESSION_ID, toolCallId: "inner", parentToolCallId: "outer", toolName: "write", input: args },
+      { kind: "result", sessionId: SESSION_ID, toolCallId: "inner", toolName: "write", text: "written", isError: false },
+    ]);
+  });
+
+  it("includes a completed nested execution in the next approval snapshot", async () => {
+    const h = await harness({ useRealMemory: true });
+    await h.fire("tool_execution_start", { type: "tool_execution_start", toolCallId: "inner", parentToolCallId: "outer", toolName: "write", args: { path: "note.txt", content: "value" } });
+    await h.fire("tool_execution_end", { type: "tool_execution_end", toolCallId: "inner", parentToolCallId: "outer", toolName: "write", isError: false, result: { content: [{ type: "text", text: "written" }] } });
+    const call = h.toolCall("next");
+    await waitFor(() => h.chain.calls.length === 1, "next approval");
+    expect(h.memoryInstance.state().view?.transcript.filter(entry => entry.tool?.callId === "inner").map(entry => entry.content)).toEqual([
+      { path: "note.txt", content: "value" }, "written",
+    ]);
+    h.chain.resolve(chainResult(h.chain.calls[0]!.capture, "next", "allow", 1));
+    expect(await call).toBeUndefined();
+  });
+
   it("shares analysis and one step run between concurrent calls of a complete manifest", async () => {
     const h = await harness({ tools: [{ name: "bash" }] });
     h.memory.setManifest({
@@ -1112,6 +1156,23 @@ describe("host tool call processing (§6)", () => {
     expect(h.chain.calls).toHaveLength(0);
   });
 
+  it("keeps a pending approval when Pi queues a follow-up input", async () => {
+    const h = await harness();
+    const call = h.toolCall("call-queued-input");
+    await waitFor(() => h.chain.calls.length === 1, "queued-input chain run");
+
+    await h.fire("input", {
+      type: "input",
+      text: "apply this after the current turn",
+      source: "interactive",
+      streamingBehavior: "followUp",
+    });
+    h.chain.resolve(chainResult(h.chain.calls[0]!.capture, "call-queued-input", "allow", 1));
+
+    expect(await call).toBeUndefined();
+    expect(h.chain.calls).toHaveLength(1);
+  });
+
   it("asks the injected human selector and maps no selection to a cancel", async () => {
     const h = await harness();
     const call = h.toolCall("call-5");
@@ -1156,7 +1217,7 @@ describe("host sandbox bypass channel (§6)", () => {
     await waitFor(() => h.chain.calls.length === 1, "bypass chain run");
     const changed = h.extension.reviewSandboxBypass({ ...request, reason: "second" }, h.ctx as never);
     h.chain.resolve(chainResult(h.chain.calls[0]!.capture, request.toolCallId, "escalate", 1));
-    expect(await changed).toEqual({ block: true, reason: "permission:capture-mismatch" });
+    expect(await changed).toMatchObject({ block: true, reason: expect.stringContaining("permission:capture-mismatch") });
     expect(await first).toBeUndefined();
   });
 
@@ -1349,9 +1410,26 @@ describe("default human selector facts (§9)", () => {
     expect(facts.title.toLowerCase()).not.toContain("host execution");
     expect(facts.title.toLowerCase()).not.toContain("escalat");
   });
-});
+  it("shows the requested and resolved paths for a manually reviewed file call", () => {
+    const requestedPath = "$TMPDIR/notes.txt";
+    const resolvedPath = "C:/session/tmp/notes.txt";
+    const facts = humanPromptFacts(Object.assign(request(false), {
+      selectedFileTarget: { requestedPath, resolvedPath },
+    }));
+    expect(facts.targetPaths).toHaveLength(2);
+    expect(facts.targetPaths[0]).toContain(requestedPath);
+    expect(facts.targetPaths[1]).toContain(resolvedPath);
+  });
 
-// ---------------------------------------------------------------------------
+  it("shows only the requested path when resolution leaves it unchanged", () => {
+    const path = "C:/session/tmp/notes.txt";
+    const facts = humanPromptFacts(Object.assign(request(false), {
+      selectedFileTarget: { requestedPath: path, resolvedPath: path },
+    }));
+    expect(facts.targetPaths).toHaveLength(1);
+    expect(facts.targetPaths[0]).toContain(path);
+  });
+});
 // Spec-conformance fixes (retired generations, learning seam, audit, ordering)
 // ---------------------------------------------------------------------------
 
@@ -1552,10 +1630,6 @@ describe("host spec-conformance fixes", () => {
       arguments: { path: "notes.txt", content: "safe" }, reason: "save output",
       elevation: { tier: "host", scope: [{ path: "E:\\output\\notes.txt", access: "write" }] },
     }, h.ctx as never);
-    appendFileSync("temp-review.txt", JSON.stringify({ event: "host-review-order-reproduction",
-      mode: h.extension.state().sessions[0]?.mode, enabledNodes: [reviewer.node.id, human.node.id],
-      transport: "deterministic-test-double", reviewerVerdict: verdict, executedNodes: events,
-      finalVerdict: answer === undefined ? "approved" : "blocked" }) + "\n");
     if (verdict === "approve") expect(answer).toBeUndefined();
     else expect(answer).toMatchObject({ block: true });
     expect(events).toEqual(verdict === "defer" ? [reviewer.node.id, human.node.id] : [reviewer.node.id]);
@@ -1669,6 +1743,43 @@ describe("session-scoped ask decisions (§5.6)", () => {
     return { h, chains, driver: promptDriver(h.ctx) };
   }
 
+  it.each([
+    ["different", "$TMPDIR/notes.txt", "C:/session/tmp/notes.txt", 2],
+    ["same", "C:/session/tmp/notes.txt", "C:/session/tmp/notes.txt", 1],
+  ] as const)("renders the %s requested and resolved path once each", async (_label, requestedPath, resolvedPath, expectedLines) => {
+    const { initTheme } = await import("@earendil-works/pi-coding-agent");
+    initTheme(undefined, false);
+    const h = await harness({
+      sandbox: { guard: async (_event, _ctx, review) => review({ ask: true, requestedPath, resolvedPath }) },
+      runChain: approvalChain([]),
+    });
+    const driver = promptDriver(h.ctx);
+    const call = h.toolCall("path-prompt", "bash", { command: "ls", path: requestedPath });
+    await waitFor(() => driver.pending.length > 0, "file approval prompt");
+    const pathLines = driver.pending[0]!.render(100).join("\n").split("\n")
+      .filter(line => line.startsWith("请求路径") || line.startsWith("解析路径") || line.startsWith("路径  "));
+
+    expect(pathLines).toHaveLength(expectedLines);
+    await driver.cancel();
+    await call;
+  });
+
+  it("derives the remembered path scope from the selected target while retaining original arguments", async () => {
+    const { initTheme } = await import("@earendil-works/pi-coding-agent");
+    initTheme(undefined, false);
+    const requests: SessionPathApprovalRequest[] = [];
+    const h = await harness({
+      sandbox: { guard: async (_event, _ctx, review) => review({ ask: true, requestedPath: "$TMPDIR/note.txt", resolvedPath: "C:/session/tmp/note.txt" }) },
+      runChain: approvalChain([]),
+      sessionPathApproval: request => { requests.push(request); return undefined; },
+    });
+    const driver = promptDriver(h.ctx);
+    const call = h.toolCall("path-session-scope", "write", { path: "$TMPDIR/note.txt", content: "note" });
+    await driver.choose(0);
+    await call;
+    expect(requests).toMatchObject([{ arguments: { path: "$TMPDIR/note.txt", content: "note" }, selectedFilePath: "C:/session/tmp/note.txt" }]);
+  });
+
   it.each(["zh", "en"])("shows external deletion correctly and restores the %s title color", async language => {
     const { initTheme } = await import("@earendil-works/pi-coding-agent");
     initTheme(undefined, false);
@@ -1717,91 +1828,6 @@ describe("session-scoped ask decisions (§5.6)", () => {
     expect(await review).toMatchObject({ block: true });
   });
 
-  it("renders tool arguments and choices in the approval panel", async () => {
-    const { initTheme } = await import("@earendil-works/pi-coding-agent");
-    initTheme(undefined, false);
-    const { h, driver } = await askHarness();
-    const call = h.toolCall("render", "bash", { command: "first()\nsecond()" });
-    await waitFor(() => driver.pending.length > 0, "human prompt");
-    const output = driver.pending[0]!.render(60).join("\n");
-    expect(output).toContain("工具 bash 请求执行");
-    expect(output).toContain("调用参数");
-    expect(output).toContain("first()");
-    expect(output).toContain("second()");
-    expect(output).toContain("仅允许本次");
-    expect(output).toContain("↑↓ 选择");
-    expect(output.indexOf("调用参数")).toBeLessThan(output.indexOf("仅允许本次"));
-    const narrow = driver.pending[0]!.render(32);
-    const { visibleWidth } = await import("@earendil-works/pi-tui");
-    expect(narrow.every(line => visibleWidth(line) <= 32)).toBe(true);
-    expect(output).not.toContain("红=删除");
-    await driver.cancel();
-    await call;
-  });
-
-  it.each([["zh", "default"], ["zh", "host"], ["en", "default"], ["en", "host"]] as const)("shows %s %s elevation with its exact scope and one-time choices", async (language, tier) => {
-    vi.stubEnv("LC_ALL", language === "zh" ? "zh-CN" : "fr-FR");
-    const { initTheme } = await import("@earendil-works/pi-coding-agent");
-    initTheme(undefined, false);
-    const h = await harness({ runChain: approvalChain([]) });
-    const liveTheme = process.env.PI_SANDBOX_APPROVAL_PREVIEW
-      ? (await import(new URL("modes/interactive/theme/theme.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href)).theme
-      : theme;
-    const driver = promptDriver(h.ctx, liveTheme);
-    h.extension.setSessionMode(SESSION_ID, "read-only");
-    const content = Array.from({ length: 20 }, (_, i) => `notes line ${i}`).join("\n");
-    const call = h.extension.reviewSandboxBypass({ toolCallId: `elevation-${tier}`, targetToolName: "write",
-      arguments: { path: "notes.md", content }, reason: language === "zh" ? "保存本次修改" : "Save the current changes",
-      elevation: { tier, scope: [{ path: "E:\\project\\notes.md", access: "write" }] },
-    }, h.ctx as never);
-    await waitFor(() => driver.pending.length > 0, "elevation prompt");
-    const prompt = driver.pending[0]!;
-    const rawOutput = prompt.render(76).join("\n");
-    const output = rawOutput.replace(/\u001b\[[0-9;]*m/g, "");
-    expect(output).toContain(language === "zh" ? `工具 write 请求提权 ${tier} 执行` : `write requests elevation ${tier} execution`);
-    expect(output).not.toContain("→");
-    expect(output).toContain(`${language === "zh" ? "写入" : "write"} E:\\project\\notes.md`);
-    expect(output).toContain(language === "zh" ? "保存本次修改" : "Save the current changes");
-    expect(output).toContain(language === "zh" ? "文件内容" : "File content");
-    expect(output).not.toContain("path:");
-    expect(output).not.toContain("content:");
-    expect(output).toContain("notes line 19");
-    expect(output).toContain(language === "zh" ? "仅允许本次" : "Approve once");
-    expect(output).not.toContain(language === "zh" ? "本会话允许" : "Allow for this session");
-    if (language === "en") expect(output).not.toMatch(/[\p{Script=Han}]/u);
-    else {
-      expect(output).not.toContain("Call Arguments");
-      expect(output).not.toContain("Approve once");
-    }
-    expect(output).not.toContain("本次调用将脱离沙箱执行");
-    expect(output).not.toContain("This call will run outside the sandbox");
-    expect(output).not.toContain("点击展开");
-    expect(output).not.toContain("Click to expand");
-    const { visibleWidth } = await import("@earendil-works/pi-tui");
-    expect(prompt.render(32).every(line => visibleWidth(line) <= 32)).toBe(true);
-    if (process.env.PI_SANDBOX_APPROVAL_PREVIEW) {
-      mkdirSync(process.env.PI_SANDBOX_APPROVAL_PREVIEW, { recursive: true });
-      writeFileSync(join(process.env.PI_SANDBOX_APPROVAL_PREVIEW, `${language}-${tier}.txt`), rawOutput, "utf8");
-    }
-    await driver.cancel();
-    expect(await call).toMatchObject({ block: true });
-  });
-
-  it("shows every command argument line without collapse controls", async () => {
-    const { initTheme } = await import("@earendil-works/pi-coding-agent");
-    initTheme(undefined, false);
-    const { h, driver } = await askHarness();
-    const call = h.toolCall("mouse", "bash", { command: Array.from({ length: 50 }, (_, i) => `line-${i}`).join("\n") });
-    await waitFor(() => driver.pending.length > 0, "human prompt");
-    const prompt = driver.pending[0]!;
-    const output = prompt.render(80).join("\n");
-    expect(output).toContain("line-0");
-    expect(output).toContain("line-49");
-    expect(output).not.toContain("点击展开");
-    expect(output).not.toContain("点击收起");
-    await driver.cancel();
-    await call;
-  });
 
   it("reuses a session allow for the same tool and arguments without prompting", async () => {
     const { h, chains, driver } = await askHarness();

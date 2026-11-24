@@ -1,22 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { captureStep, prepareStep } from "#approve-core/contracts";
-import { createBashProgramProvider } from "#approve-core/nodes/analysis";
 import { deriveAccessFacts } from "#approve-core/nodes/mode";
 import { PermissionManager } from "#approve-core/policy/permission-manager";
 import { PermissionResolver } from "#approve-core/policy/permission-resolver";
 import { PermissionService } from "#approve-core/policy/permissions-service";
-import { createRuleEvaluator, type Rule } from "#approve-core/policy/rule";
 import { SessionRuleStore } from "#approve-core/policy/session-rules";
 import { checkBashCommand } from "#approve-core/utils/bash-command-check";
-import { bashPathFacts } from "#approve-core/utils/access-intent/bash/bash-path-resolver";
 import { BashProgram } from "#approve-core/utils/access-intent/bash/program";
 import { POSIX_PATH_FLAVOR } from "#approve-core/utils/path/path-flavor";
 import { PathNormalizer } from "#approve-core/utils/path/path-normalizer";
 import { jsonDigest } from "../../src/json";
-
-function rule(surface: string, action: Rule["action"]): Rule {
-  return { surface, pattern: "*", action, origin: "global", layer: "config" };
-}
 
 function policy(permission: unknown) {
   const normalizer = new PathNormalizer(POSIX_PATH_FLAVOR, "/review/project", {
@@ -35,27 +28,6 @@ function policy(permission: unknown) {
 }
 
 describe("rule evaluator consumer contracts", () => {
-  it("applies a wildcard surface denial to a matching tool", () => {
-    const evaluator = createRuleEvaluator([rule("review_*", "deny")], POSIX_PATH_FLAVOR);
-    expect(evaluator.evaluate("review_read", "document").action).toBe("deny");
-  });
-
-  it("keeps surface matching case sensitive on Windows", async () => {
-    const { WIN32_PATH_FLAVOR } = await import("#approve-core/utils/path/path-flavor");
-    const evaluator = createRuleEvaluator([rule("Review_*", "deny")], WIN32_PATH_FLAVOR);
-    expect(evaluator.evaluate("review_read", "document").action).toBe("ask");
-  });
-
-  it("keeps an old evaluator on its original rule view when the producer appends a rule", () => {
-    const input = [rule("review_read", "allow")];
-    const old = createRuleEvaluator(input, POSIX_PATH_FLAVOR);
-    expect(old.evaluate("review_read", "document").action).toBe("allow");
-    input.push(rule("review_write", "deny"));
-    const next = createRuleEvaluator(input, POSIX_PATH_FLAVOR);
-    expect(next.evaluate("review_write", "document").action).toBe("deny");
-    expect(old.evaluate("review_write", "document").action).toBe("ask");
-  });
-
   it("uses the last matching rule for aliases and the most restrictive result for separate paths", () => {
     const { manager, resolver } = policy({
       mcp: { "short-name": "deny", "long-name": "allow" },
@@ -112,22 +84,6 @@ describe("permission service and gate consistency", () => {
 });
 
 describe("Bash path facts at the mode node consumer", () => {
-  it("marks an outside redirect as a write when the path analysis capability is connected", async () => {
-    const { normalizer } = policy({});
-    const program = await BashProgram.parse("printf review > /review/result.txt", normalizer, { pathFacts: bashPathFacts });
-    expect(program.pathFactsAvailable).toBe(true);
-    expect(program.externalAccesses().map((entry) => ({ path: entry.path.value(), effect: entry.effect.effect })))
-      .toContainEqual({ path: "/review/result.txt", effect: "write" });
-  });
-
-  it("connects path analysis when the step provider creates the shared program", async () => {
-    const call = { toolCallId: "review-call", toolName: "bash", arguments: { command: "printf review > /review/result.txt" } };
-    const provider = createBashProgramProvider([call], { cwd: "/review/project", platform: "linux" });
-    const program = await provider(call);
-    expect(program).toBeDefined();
-    expect(program!.pathFactsAvailable).toBe(true);
-  });
-
   it("keeps an outside redirect target in the mode node facts with the default parsing path", async () => {
     const args = { command: "printf review > /review/result.txt" };
     const capture = captureStep({

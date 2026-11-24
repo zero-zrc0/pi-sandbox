@@ -120,6 +120,12 @@ export type ReviewAnswer =
   | { readonly kind: "host-execution"; readonly reason: string }
   | undefined;
 
+export interface SandboxReviewInput {
+  readonly ask?: boolean;
+  readonly requestedPath?: string;
+  readonly resolvedPath?: string;
+}
+
 /** One installed publication generation of the approval chain. */
 export interface PermissionPublication {
   readonly generation: number;
@@ -184,10 +190,22 @@ export interface SandboxPort {
   guard(
     event: ToolCallEvent,
     ctx: ExtensionContext,
-    review: (input?: { readonly ask?: boolean }) => Promise<ReviewAnswer>,
+    review: (input?: SandboxReviewInput) => Promise<ReviewAnswer>,
   ): Promise<ReviewAnswer>;
+  selectFileTargets?(calls: StepCapture["directCalls"], ctx: ExtensionContext): Readonly<Record<string, HumanPromptTarget>>;
   invalidate?(sessionId: string): void;
   configurationChanged?(sessionId: string): void;
+  /**
+   * True when `currentInput` differs from the model's recorded
+   * `originalInput` only by a rewrite the host itself performed (the
+   * temporary-path mapping); such a disagreement is not tampering.
+   */
+  sanctionedArgumentRewrite?(
+    toolName: string,
+    originalInput: unknown,
+    currentInput: unknown,
+    ctx: ExtensionContext,
+  ): boolean;
 }
 
 export interface MemoryPort {
@@ -318,6 +336,7 @@ export interface SessionPathApprovalRequest {
   readonly sessionId: string;
   readonly toolName: string;
   readonly arguments: Readonly<Record<string, unknown>>;
+  readonly selectedFilePath?: string;
   readonly cwd: string;
 }
 
@@ -474,6 +493,12 @@ function defaultContextStorePort(): ContextStorePort {
 // Human request facts (§9)
 // ---------------------------------------------------------------------------
 
+interface HumanPromptTarget {
+  readonly requestedPath: string;
+  readonly resolvedPath: string;
+}
+
+type HumanPromptRequest = HumanRequest & { readonly selectedFileTarget?: HumanPromptTarget };
 export interface HumanPromptFacts {
   readonly escalation: boolean;
   readonly askFor: "allow" | "escalate";
@@ -481,6 +506,7 @@ export interface HumanPromptFacts {
   readonly toolCallId: string;
   readonly reason: string;
   readonly arguments: Readonly<Record<string, unknown>>;
+  readonly targetPaths: readonly string[];
   readonly title: string;
   readonly options: readonly string[];
   readonly approveOption: string;
@@ -493,7 +519,7 @@ export interface HumanPromptFacts {
  * reason, the tool and the final arguments in its title; a normal request never
  * claims to be an escalation.
  */
-export function humanPromptFacts(request: HumanRequest): HumanPromptFacts {
+export function humanPromptFacts(request: HumanPromptRequest): HumanPromptFacts {
   const toolName = nonEmpty(request.call.toolName) ?? "tool";
   const askFor = request.summary.askFor === "escalate" ? "escalate" : "allow";
   const escalation = askFor === "escalate";
@@ -502,6 +528,9 @@ export function humanPromptFacts(request: HumanRequest): HumanPromptFacts {
     ? tier === undefined ? "ordinary approvals cannot grant Host execution" : `one-time ${tier} elevation was requested`
     : "no reason was recorded");
   const args = serializeArguments(request.call.arguments);
+  const targetPaths = request.selectedFileTarget === undefined
+    ? []
+    : formatHumanTargetPaths(request.selectedFileTarget, approvalText[resolveApprovalLanguage()]);
   const title = tier === "host"
     ? `Host execution request for ${toolName} (outside the OS sandbox). Reason: ${reason}. Final arguments: ${args}`
     : tier === "default"
@@ -516,6 +545,7 @@ export function humanPromptFacts(request: HumanRequest): HumanPromptFacts {
     toolCallId: request.call.toolCallId,
     reason,
     arguments: request.call.arguments,
+    targetPaths,
     title,
     options: [CANCEL_OPTION, APPROVE_OPTION, DENY_OPTION],
     approveOption: APPROVE_OPTION,
@@ -524,6 +554,13 @@ export function humanPromptFacts(request: HumanRequest): HumanPromptFacts {
   };
 }
 
+function formatHumanTargetPaths(target: HumanPromptTarget, text: ApprovalText): readonly string[] {
+  if (target.requestedPath === target.resolvedPath) return [`${text.path}  ${target.requestedPath}`];
+  return [
+    `${text.requestedPath}  ${target.requestedPath}`,
+    `${text.resolvedPath}  ${target.resolvedPath}`,
+  ];
+}
 function formatHumanArguments(value: unknown): string {
   try {
     return JSON.stringify(value, null, 2) ?? "[unserializable arguments]";
@@ -616,7 +653,7 @@ function humanEscalationReason(request: HumanRequest, text: ApprovalText): strin
   return reasons.find((reason) => reason.trim().length > 0)?.trim() ?? "";
 }
 
-function renderHumanTitle(request: HumanRequest, cwd: string, highlight: (value: string) => string, text: ApprovalText): string {
+function renderHumanTitle(request: HumanPromptRequest, cwd: string, highlight: (value: string) => string, text: ApprovalText): string {
   const escalation = request.call.hostExecutionRequest !== undefined ||
     (request.summary.askFor === "escalate" && request.summary.reasons.some(entry =>
       /external-(?:write|delete)-needs-approval|one-time-host-execution/.test(entry.reason)));
@@ -624,7 +661,10 @@ function renderHumanTitle(request: HumanRequest, cwd: string, highlight: (value:
   const args = request.call.arguments as Record<string, unknown> | undefined;
   const path = args !== undefined && typeof args.path === "string" ? args.path : "";
   const fileTool = request.call.toolName === "write" || request.call.toolName === "edit";
-  const absolutePath = path === "" ? "" : isAbsolute(path) ? path : resolve(cwd, path);
+  const absolutePath = request.selectedFileTarget?.resolvedPath ?? (path === "" ? "" : isAbsolute(path) ? path : resolve(cwd, path));
+  const targetPaths = request.selectedFileTarget === undefined
+    ? []
+    : formatHumanTargetPaths(request.selectedFileTarget, text);
   const elevation = request.call.hostExecutionRequest?.elevation;
   const tier = elevation?.tier;
   const scope = elevation?.scope.map(entry => `${text === approvalText.zh ? entry.access === "write" ? "写入" : "读取" : entry.access} ${entry.path}`).join(`\n${text.scope}  `);
@@ -642,7 +682,12 @@ function renderHumanTitle(request: HumanRequest, cwd: string, highlight: (value:
     hostBoundary,
     ordinaryHostNotice,
     fileTool ? `${text.operation}  ${operation} · ${path === "" ? "" : basename(path)}` : "",
-    scope !== undefined ? `${text.scope}  ${scope}` : path !== "" ? `${text.path}  ${absolutePath}` : "",
+    ...targetPaths,
+    scope !== undefined
+      ? `${text.scope}  ${scope}`
+      : targetPaths.length === 0 && path !== ""
+        ? `${text.path}  ${absolutePath}`
+        : "",
     reason.length > 0 ? `${text.reason}  ${reason}` : "",
   ].filter((part) => part.length > 0).join("\n");
 }
@@ -802,6 +847,7 @@ interface PreparingStep {
   readonly mode: PermissionMode;
   readonly publication: PermissionPublication;
   readonly captured: Extract<ReviewCaptureResult, { readonly ok: true }>;
+  readonly selectedFileTargets?: Readonly<Record<string, HumanPromptTarget>>;
   /** The session memory link, present only on the approval path. */
   readonly sessionReviews?: SessionReviewPort;
   readonly controller: AbortController;
@@ -814,6 +860,7 @@ interface PinnedPublication {
   readonly generation: number;
   readonly owner: string;
   readonly mode: PermissionMode;
+  readonly sessionFacts: ReviewerSessionFacts;
 }
 
 interface HostSession {
@@ -841,6 +888,7 @@ interface HostSession {
   readonly prepared: Map<string, PreparedStep>;
   readonly preparing: Map<string, PreparingStep>;
   readonly preparedByCall: Map<string, PreparedStep>;
+  readonly reviewPaths: Map<string, HumanPromptTarget>;
   readonly handledToolCallIds: Set<string>;
   readonly pinned: Map<string, PinnedPublication>;
   ctx: ExtensionContext | undefined;
@@ -1015,6 +1063,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
       prepared: new Map(),
       preparing: new Map(),
       preparedByCall: new Map(),
+      reviewPaths: new Map(),
       handledToolCallIds: new Set(),
       pinned: new Map(),
       ctx,
@@ -1207,17 +1256,8 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
     if (pin === undefined) return undefined;
     const owner = resolveOwner(session);
     if (owner !== pin.owner) return undefined;
-    const captured = session.memory.capture(owner);
-    if (!captured.ok) return undefined;
-    return {
-      view: captured.view,
-      revisions: {
-        ...captured.revisions,
-        projectRules: pin.publication.rulesRevision,
-        intent: pin.publication.intentRevision,
-      },
-      mode: pin.mode,
-    };
+    return session.memory.isCurrent(owner, pin.sessionFacts.view, pin.sessionFacts.revisions)
+      ? pin.sessionFacts : undefined;
   }
 
   function verifyFactsFor(
@@ -1230,15 +1270,11 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
     const pins = [...session.pinned.values()].filter((pin) =>
       pin.mode === input.mode &&
       pin.publication.rulesRevision === input.revisions.projectRules &&
-      pin.publication.intentRevision === input.revisions.intent);
+      pin.publication.intentRevision === input.revisions.intent &&
+      pin.sessionFacts.view.captureSeq === input.view.captureSeq &&
+      pin.sessionFacts.view.historyVersion === input.view.historyVersion &&
+      session.memory.isCurrent(owner, pin.sessionFacts.view, input.revisions));
     if (pins.length === 0) return false;
-    const captured = session.memory.capture(owner);
-    if (!captured.ok) return false;
-    if (captured.view.captureSeq !== input.view.captureSeq) return false;
-    if (captured.view.historyVersion !== input.view.historyVersion) return false;
-    if (captured.revisions.owner !== input.revisions.owner) return false;
-    if (captured.revisions.navigation !== input.revisions.navigation) return false;
-    if (captured.revisions.authorization !== input.revisions.authorization) return false;
     for (const call of input.calls) {
       if (call.call.digest !== call.actionDigest) return false;
       if (call.call.toolCallId !== call.toolCallId) return false;
@@ -1250,11 +1286,15 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
   // Human fallback (§9)
   // -------------------------------------------------------------------------
 
-  function makeHuman(ctx: ExtensionContext, session: HostSession): HumanApprover {
+  function makeHuman(ctx: ExtensionContext, session: HostSession, selectedFileTargets?: Readonly<Record<string, HumanPromptTarget>>): HumanApprover {
     if (options.human !== undefined) return options.human;
     return async (request: HumanRequest): Promise<HumanResponse> => {
       const unavailable: HumanResponse = { decision: "cancel", reason: "permission:human-unavailable" };
-      const facts = humanPromptFacts(request);
+      const selectedFileTarget = selectedFileTargets?.[request.call.toolCallId] ?? session.reviewPaths.get(request.call.toolCallId);
+      const promptRequest: HumanPromptRequest = selectedFileTarget === undefined
+        ? request
+        : { ...request, selectedFileTarget };
+      const facts = humanPromptFacts(promptRequest);
       const emit = (decision: HumanResponse["decision"]): void => {
         audit({
           kind: "human",
@@ -1268,7 +1308,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
       if (options.selectHuman !== undefined) {
         let response: HumanResponse | undefined;
         try {
-          response = await options.selectHuman(request, ctx);
+          response = await options.selectHuman(promptRequest, ctx);
         } catch {
           response = undefined;
         }
@@ -1301,6 +1341,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
             sessionId: session.id,
             toolName,
             arguments: args,
+            ...(selectedFileTarget === undefined ? {} : { selectedFilePath: selectedFileTarget.resolvedPath }),
             cwd: ctx.cwd,
           });
         } catch {
@@ -1361,7 +1402,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
           request.signal.addEventListener("abort", cancelPrompt, { once: true });
           timeout = setTimeout(() => finish(undefined), promptTimeoutMs);
           if (request.signal.aborted) finish(undefined);
-          const title = renderHumanTitle(request, ctx.cwd, (value) =>
+          const title = renderHumanTitle(promptRequest, ctx.cwd, (value) =>
             theme.fg("warning", theme.bold(value)) + (theme.getFgAnsi?.("accent") ?? ""), text);
           const preview = buildApprovalPreview(request, ctx.cwd, text);
           return new HumanApprovalSelectorComponent(
@@ -1436,7 +1477,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
     if (sandboxReview) return undefined;
     return allowHostExecution
       ? { kind: "host-execution", reason: `permission:host-execution: ${detail}` }
-      : { block: true, reason: "permission:ordinary-host-execution-forbidden; request_tool_elevation is available for supported built-in file tools" };
+      : { block: true, reason: "permission:ordinary-host-execution-forbidden; request_tool_elevation is available for supported built-in tools" };
   }
 
   // -------------------------------------------------------------------------
@@ -1566,6 +1607,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
   function preparationIsCurrent(session: HostSession, preparing: PreparingStep): boolean {
     return !session.disposed && !preparing.controller.signal.aborted &&
       session.invalidationRevision === preparing.invalidationRevision &&
+      resolveOwner(session) === preparing.owner &&
       session.preparing.get(preparing.stepKey) === preparing;
   }
 
@@ -1578,6 +1620,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
       readonly owner: string;
       readonly mode: PermissionMode;
       readonly publication: PermissionPublication;
+      readonly selectedFileTargets?: Readonly<Record<string, HumanPromptTarget>>;
       /** The session memory link; absent on non-approval paths. */
       readonly sessionReviews?: SessionReviewPort;
     },
@@ -1599,6 +1642,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
       mode: input.mode,
       publication: input.publication,
       captured: input.captured,
+      ...(input.selectedFileTargets === undefined ? {} : { selectedFileTargets: input.selectedFileTargets }),
       ...(input.sessionReviews === undefined ? {} : { sessionReviews: input.sessionReviews }),
       controller,
       promise: Promise.race([work, cancelled]),
@@ -1653,19 +1697,13 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
       if (!preparationIsCurrent(session, preparing)) return fail("evidence-changed");
       if (units.length === 0) return fail("analysis-failed");
 
-      const again = session.memory.capture(preparing.owner);
-      if (!again.ok) return fail(`evidence-changed:memory-${again.reason}`);
-      if (
-        again.revisions.owner !== preparing.captured.revisions.owner ||
-        again.revisions.navigation !== preparing.captured.revisions.navigation ||
-        again.revisions.authorization !== preparing.captured.revisions.authorization
-      ) {
+      if (!session.memory.isCurrent(preparing.owner, preparing.captured.view, preparing.captured.revisions)) {
         return fail("evidence-changed");
       }
       const sessionFacts: ReviewerSessionFacts = {
-        view: again.view,
+        view: preparing.captured.view,
         revisions: {
-          ...again.revisions,
+          ...preparing.captured.revisions,
           projectRules: preparing.publication.rulesRevision,
           intent: preparing.publication.intentRevision,
         },
@@ -1716,12 +1754,8 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
         }
       }
 
-      const finalCapture = session.memory.capture(preparing.owner);
-      if (!finalCapture.ok) return fail(`evidence-changed:memory-${finalCapture.reason}`);
       if (!preparationIsCurrent(session, preparing) ||
-          finalCapture.revisions.owner !== preparing.captured.revisions.owner ||
-          finalCapture.revisions.navigation !== preparing.captured.revisions.navigation ||
-          finalCapture.revisions.authorization !== preparing.captured.revisions.authorization) {
+          !session.memory.isCurrent(preparing.owner, preparing.captured.view, preparing.captured.revisions)) {
         return fail("evidence-changed");
       }
 
@@ -1730,6 +1764,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
         generation: preparing.generation,
         owner: preparing.owner,
         mode: preparing.mode,
+        sessionFacts,
       };
       session.pinned.set(preparing.stepKey, pin);
       let begun;
@@ -1743,8 +1778,11 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
           sessionFacts,
           ...(bashPrograms === undefined ? {} : { bashPrograms }),
           ...(powershellPrograms === undefined ? {} : { powershellPrograms }),
+          ...(preparing.selectedFileTargets === undefined ? {} : { selectedFilePaths: Object.fromEntries(
+            Object.entries(preparing.selectedFileTargets).map(([id, target]) => [id, target.resolvedPath]),
+          ) }),
           signal,
-          human: makeHuman(ctx, session),
+          human: makeHuman(ctx, session, preparing.selectedFileTargets),
           ...(preparing.sessionReviews === undefined
             ? {}
             : { sessionReviews: preparing.sessionReviews }),
@@ -1829,7 +1867,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
         });
       }
       if (!capturedCallMatches(fixed.capture, event, parentToolCallId, input.hostExecutionRequest)) {
-        return { block: true, reason: "permission:capture-mismatch" };
+        return { block: true, reason: "permission:capture-mismatch: the call changed after its approval was captured; the approval no longer covers it" };
       }
       const outcome = await fixed.handle.join(event.toolCallId);
       auditStep(session, requestId, fixed, event, outcome);
@@ -1843,12 +1881,6 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
       : undefined;
 
     const owner = resolveOwner(session);
-    if (!session.memory.initialized) {
-      const initialized = session.memory.capture(owner);
-      if (!initialized.ok) {
-        return { block: true, reason: "permission:session-unavailable:memory-" + initialized.reason };
-      }
-    }
     if (input.recordCallInMemory !== false) {
       recordToolEvent(session, {
         kind: "call",
@@ -1875,11 +1907,22 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
       },
       ...(captured.view.manifest === undefined ? {} : { manifest: captured.view.manifest }),
       ...(registeredTools === undefined ? {} : { registeredTools }),
+      ...(options.sandbox?.sanctionedArgumentRewrite === undefined ? {} : {
+        sanctionedArgumentRewrite: (manifestCall) => options.sandbox!.sanctionedArgumentRewrite!(
+          manifestCall.toolName, manifestCall.arguments, event.input, ctx),
+      }),
     });
-    if (!facts.ok) return { block: true, reason: "permission:step-facts:" + facts.reason };
+    if (!facts.ok) {
+      const detail = facts.reason === "incomplete"
+        ? "the approval capture for this call is incomplete; retry the call"
+        : facts.reason === "capture-failed"
+          ? "the approval chain could not freeze this call for review; retry the call"
+          : "this call no longer matches the arguments the model recorded (or the tool is not registered); the approval chain refuses to review a changed call";
+      return { block: true, reason: `permission:step-facts:${facts.reason}: ${detail}` };
+    }
     const capture = facts.capture;
     if (!capturedCallMatches(capture, event, parentToolCallId, input.hostExecutionRequest)) {
-      return { block: true, reason: "permission:capture-mismatch" };
+      return { block: true, reason: "permission:capture-mismatch: the call changed after its approval was captured; the approval no longer covers it" };
     }
 
     const deliver = async (result: PreparationResult): Promise<ReviewAnswer> => {
@@ -1910,7 +1953,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
     const prepared = session.prepared.get(capture.stepKey);
     if (prepared !== undefined) {
       if (prepared.captureDigest !== capture.digest) {
-        return { block: true, reason: "permission:capture-mismatch" };
+        return { block: true, reason: "permission:capture-mismatch: the call changed after its approval was captured; the approval no longer covers it" };
       }
       if (prepared.generation !== publication.generation) {
         return { block: true, reason: "permission:generation-stale" };
@@ -1921,7 +1964,7 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
     const existing = session.preparing.get(capture.stepKey);
     if (existing !== undefined) {
       if (existing.captureDigest !== capture.digest) {
-        return { block: true, reason: "permission:capture-mismatch" };
+        return { block: true, reason: "permission:capture-mismatch: the call changed after its approval was captured; the approval no longer covers it" };
       }
       if (existing.generation !== publication.generation) {
         return { block: true, reason: "permission:generation-stale" };
@@ -1935,6 +1978,9 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
       owner,
       mode,
       publication,
+      ...(input.hostExecutionRequest !== undefined || options.sandbox?.selectFileTargets === undefined ? {} : {
+        selectedFileTargets: options.sandbox.selectFileTargets(capture.directCalls, ctx),
+      }),
       ...(sessionReviews === undefined ? {} : { sessionReviews }),
     });
     return deliver(await preparing.promise);
@@ -2012,9 +2058,17 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
       return { block: true, reason: "permission:duplicate-call" };
     }
     session.handledToolCallIds.add(event.toolCallId);
-    const review = (_input?: { readonly ask?: boolean }) => resolveApproval(session, ctx, event, {
-      allowHostExecution: false,
-    });
+    const review = (input?: SandboxReviewInput) => {
+      const selectedFileTarget = typeof input?.requestedPath === "string" && typeof input.resolvedPath === "string"
+        ? { requestedPath: input.requestedPath, resolvedPath: input.resolvedPath }
+        : undefined;
+      if (selectedFileTarget !== undefined) session.reviewPaths.set(event.toolCallId, selectedFileTarget);
+      return resolveApproval(session, ctx, event, { allowHostExecution: false }).finally(() => {
+        if (selectedFileTarget !== undefined && session.reviewPaths.get(event.toolCallId) === selectedFileTarget) {
+          session.reviewPaths.delete(event.toolCallId);
+        }
+      });
+    };
     try {
       if (options.sandbox !== undefined) {
         const answer = await options.sandbox.guard(event, ctx, review);
@@ -2076,6 +2130,14 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
     api.on("tool_execution_start", (event, ctx) => {
       const session = sessions.get(ctx.sessionManager.getSessionId());
       if (session === undefined) return;
+      recordToolEvent(session, {
+        kind: "call",
+        sessionId: session.id,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        input: event.args,
+        ...(event.parentToolCallId === undefined ? {} : { parentToolCallId: event.parentToolCallId }),
+      });
       audit({
         kind: "execution",
         sessionId: session.id,
@@ -2116,12 +2178,14 @@ export function createPermissionExtension(options: PermissionExtensionOptions): 
       const session = ensureSession(ctx);
       if (session === undefined) return;
       if (event.source !== "extension") {
-        try {
-          session.memory.noteUserInput(event.text);
-        } catch {
-          // The memory failure only makes later captures fail closed.
+        if (event.streamingBehavior === undefined) {
+          try {
+            session.memory.noteUserInput(event.text);
+          } catch {
+            // The memory failure only makes later captures fail closed.
+          }
+          invalidateHost(session, "user-input");
         }
-        invalidateHost(session, "user-input");
         const mode = effectiveMode(session) ?? "default";
         const state = session.reminder.handleInput({
           mode,

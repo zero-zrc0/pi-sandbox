@@ -1,21 +1,26 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, parse } from "node:path";
+import { dirname, join, parse } from "node:path";
 import { fileURLToPath } from "node:url";
+import { rm } from "node:fs/promises";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createWindowsDirectBackend } from "#sandbox/backend/windows/direct";
+import { probeDirectBackendOnce } from "#sandbox/backend/direct";
+import { ExecutionController } from "#sandbox/lifecycle";
 import type { NativeLaunchPlan } from "#sandbox/backend/direct";
 import type { ExecutionOperation } from "#sandbox/types";
+import { collectSensitivePaths } from "#sandbox/sensitive-paths";
 import { windowsRuntimeFilesystem } from "#sandbox/runtime-filesystem";
 import type { ResolvedRuntimeFiles } from "#sandbox/runtime-store";
-import { compileTestRequest, makeInvocation, runtimeEnvironment } from "../../fixtures/harness";
+import { compileTestRequest, makeInvocation, runtimeEnvironment, waitFor, waitForProcessGone } from "../../fixtures/harness";
 import { installWindowsTestRuntime } from "../../fixtures/runtime";
 
-const sourceExecutable = fileURLToPath(new URL("../../../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url));
+const sourceExecutable = process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE ??
+  fileURLToPath(new URL("../../../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url));
 const packageRoot = realpathSync(fileURLToPath(new URL("../../../../", import.meta.url)));
-const nativeEnabled = process.platform === "win32" && Boolean(process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE) && existsSync(sourceExecutable);
+const nativeEnabled = process.platform === "win32" && existsSync(sourceExecutable);
 let runtime: ResolvedRuntimeFiles | undefined;
 const layouts: string[] = [];
 
@@ -23,9 +28,9 @@ beforeAll(() => {
   if (nativeEnabled) runtime = installWindowsTestRuntime();
 });
 
-afterAll(() => {
-  if (runtime) rmSync(runtime.directory, { recursive: true, force: true });
-  for (const root of layouts.splice(0)) rmSync(root, { recursive: true, force: true });
+afterAll(async () => {
+  if (runtime) await rm(runtime.directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  for (const root of layouts.splice(0)) await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 });
 
 function toolEnvironment(): Record<string, string> {
@@ -68,6 +73,7 @@ function makeRequest(
   layout: ReturnType<typeof createLayout>,
   operation: Extract<ExecutionOperation, { readonly kind: "shell" }> |
     Extract<ExecutionOperation, { readonly kind: "builtin-tool" }>,
+  sensitivePaths?: ReturnType<typeof collectSensitivePaths>,
 ) {
   const environment = toolEnvironment();
   const toolName = operation.kind === "shell" ? "powershell" : operation.name;
@@ -87,6 +93,7 @@ function makeRequest(
     backendId: "windows-mxc",
     runtimeFilesystem: filesystem.grants,
     protectedPaths: filesystem.protectedPaths,
+    ...(sensitivePaths === undefined ? {} : { sensitivePaths }),
     environment,
   });
 }
@@ -130,6 +137,33 @@ describe.skipIf(!nativeEnabled)("Windows host-native backend", () => {
     });
   });
 
+  it("terminates the actual probe process when its caller cancels", async () => {
+    const layout = createLayout();
+    if (!runtime) throw new Error("Windows native runtime is unavailable");
+    const directory = join(layout.root, "probe-runtime");
+    mkdirSync(directory);
+    const executable = join(directory, "pi-sandbox-windows-mxc.exe");
+    const mxcManifest = join(directory, "mxc-runtime.json");
+    copyFileSync(process.execPath, executable);
+    writeFileSync(mxcManifest, "{}");
+    const testRuntime: ResolvedRuntimeFiles = {
+      ...runtime, directory, storageRoot: layout.root, files: { windowsExecutable: executable, mxcManifest },
+    };
+    const pidFile = join(layout.root, "probe.pid");
+    writeFileSync(join(layout.hostCwd, "probe"),
+      `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`);
+    const backend = createWindowsDirectBackend({
+      runtime: testRuntime, installRoot: packageRoot, hostCwd: layout.hostCwd, hostEnvironment: runtimeEnvironment(),
+    });
+    const controller = new AbortController();
+    const pending = probeDirectBackendOnce(backend, controller.signal);
+    await waitFor(() => existsSync(pidFile));
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    controller.abort();
+    expect(await pending).toMatchObject({ ok: false });
+    await waitForProcessGone(pid);
+  });
+
   it("passes a shell request straight to MXC", async () => {
     const layout = createLayout();
     const shell = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
@@ -164,7 +198,61 @@ describe.skipIf(!nativeEnabled)("Windows host-native backend", () => {
     expect(nativeRequest.plan?.filesystem?.some(rule => rule.access === "write")).toBe(false);
   });
 
-  it("fails closed when the runtime manifest changes after selection", async () => {
+  it("reads control directories, denies their writes, and enforces denyPaths natively", async () => {
+    const layout = createLayout();
+    const agentsFile = join(layout.workspace, ".agents", "skills", "demo", "SKILL.md");
+    const codexFile = join(layout.workspace, ".codex", "config.toml");
+    mkdirSync(dirname(agentsFile), { recursive: true });
+    mkdirSync(dirname(codexFile), { recursive: true });
+    writeFileSync(agentsFile, "skill content");
+    writeFileSync(codexFile, "model = 'test'");
+    const shell = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const command = [
+      "$ErrorActionPreference = 'Stop'",
+      `$agents = Get-Content -Raw -LiteralPath '${agentsFile}'`,
+      `$codex = Get-Content -Raw -LiteralPath '${codexFile}'`,
+      "$agentsWriteDenied = $false",
+      `try { Set-Content -NoNewline -LiteralPath '${agentsFile}' -Value 'changed' -ErrorAction Stop } catch { $agentsWriteDenied = $true }`,
+      "$codexWriteDenied = $false",
+      `try { Set-Content -NoNewline -LiteralPath '${codexFile}' -Value 'changed' -ErrorAction Stop } catch { $codexWriteDenied = $true }`,
+      "if ($agents -ne 'skill content' -or $codex -ne \"model = 'test'\" -or -not $agentsWriteDenied -or -not $codexWriteDenied) { exit 21 }",
+      "Write-Output 'control-policy-ok'",
+    ].join("; ");
+    const operation = { kind: "shell" as const, shell, command };
+    const controller = new ExecutionController({ directBackend: createBackend(layout) });
+
+    try {
+      const probe = await controller.probe();
+      expect(probe.status).toBe("available");
+      const result = await controller.execute({ request: makeRequest(layout, operation) });
+      expect(result.state, JSON.stringify(result)).toBe("completed");
+      expect(result.state === "completed" ? result.exitCode : undefined).toBe(0);
+      expect(result.stdout).toContain("control-policy-ok");
+      expect(readFileSync(agentsFile, "utf8")).toBe("skill content");
+      expect(readFileSync(codexFile, "utf8")).toBe("model = 'test'");
+
+      const denyCommand = `try { [void](Get-Content -Raw -LiteralPath '${agentsFile}' -ErrorAction Stop); exit 22 } catch { Write-Output 'deny-path-blocked'; exit 0 }`;
+      const sensitivePaths = collectSensitivePaths({
+        agentDirectory: layout.agentDirectory,
+        cwd: layout.workspace,
+        home: layout.workspace,
+        environment: {},
+        platform: "win32",
+        denyPaths: [agentsFile],
+      });
+      const denied = await controller.execute({ request: makeRequest(layout, {
+        kind: "shell", shell, command: denyCommand,
+      }, sensitivePaths) });
+      expect(denied.state, JSON.stringify(denied)).toBe("completed");
+      expect(denied.state === "completed" ? denied.exitCode : undefined).toBe(0);
+      expect(denied.stdout).toContain("deny-path-blocked");
+      expect(denied.stdout).not.toContain("skill content");
+    } finally {
+      await controller.dispose();
+    }
+  }, 60_000);
+
+  it("continues using the selected runtime after a manifest file change", async () => {
     if (!runtime?.files.runtimeManifest) throw new Error("runtime manifest is unavailable");
     const layout = createLayout();
     const backend = createBackend(layout);
@@ -180,7 +268,7 @@ describe.skipIf(!nativeEnabled)("Windows host-native backend", () => {
         command: "echo must-not-start",
       });
 
-      await expect(backend.prepare(request)).resolves.toMatchObject({ ok: false });
+      await expect(backend.prepare(request)).resolves.toMatchObject({ executable: runtime.files.windowsExecutable });
     } finally {
       writeFileSync(runtime.files.runtimeManifest, before);
     }

@@ -93,7 +93,7 @@ export function prepareDecisionMaterial(input: {
   );
   sections.push(
     askFor === "escalate" && tier === undefined
-      ? "## REVIEW TARGET: INVALID ORDINARY HOST REQUEST\nThis call has no explicit hostExecutionRequest tier. Reject it. Ordinary approvals cannot issue Host execution; a supported file tool must use request_tool_elevation."
+      ? "## REVIEW TARGET: INVALID ORDINARY HOST REQUEST\nThis call has no explicit hostExecutionRequest tier. Reject it. Ordinary approvals cannot issue Host execution; a supported tool must use request_tool_elevation."
       : askFor === "escalate"
         ? `## REVIEW TARGET: ELEVATION (${tier})\nApprove only the exact requested tier and full call. Default stays inside the sandbox; Host runs outside it. Never change the requested tier.`
       : "## REVIEW TARGET: ALLOW\nThis call is asking for managed execution under the configured sandbox. Approve means approve this fixed request; it does not change the target.",

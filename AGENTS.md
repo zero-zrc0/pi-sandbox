@@ -20,3 +20,17 @@
 - 示例：`feat/runtime-catalog-20261117`、`debug/windows-launch-20261117`、`docs/git-branch-rules-20261117`。
 
 提交或推送 `docs/`、`specs/` 下的文件时，只纳入用户在当前任务明确指定的路径；未指定的文件不纳入提交或推送。
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as Markdown under `.scratch/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five canonical triage labels as named. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use the single-context root `GLOSSARY.md` and `docs/adr/` layout. See `docs/agents/domain.md`.

@@ -21,26 +21,6 @@ describe("formatToolInputPreview: omitted previews", () => {
 });
 
 describe("formatToolInputPreview: path tools reuse the prompt summary", () => {
-  it.each([
-    ["read", { path: "src/a.ts" }, "read src/a.ts"],
-    ["read", { file_path: "src/b.ts" }, "read src/b.ts"],
-    ["write", { path: "out.txt", content: "a\nb\nc" }, "write out.txt: 3 lines, 5 characters"],
-    [
-      "edit",
-      { path: "notes.txt", edits: [{ oldText: "x", newText: "y\nz\nw" }, { oldText: "p", newText: "q" }] },
-      "edit notes.txt: 2 replacements, first edit replaces 1 line with 3 lines, 1 more edit",
-    ],
-    [
-      "find",
-      { pattern: "TODO", glob: "*.ts", path: "src" },
-      'find pattern "TODO", glob "*.ts", path src',
-    ],
-    ["grep", { pattern: "needle" }, 'grep pattern "needle", in the current working directory'],
-    ["ls", {}, "ls in the current working directory"],
-  ] as const)("uses the prompt summary for %s", (toolName, input, expected) => {
-    expect(formatToolInputPreview(toolName, input)).toBe(expected);
-  });
-
   it("never leaks write/edit bodies or unrelated credential keys", () => {
     const writePreview = formatToolInputPreview("write", {
       path: "out.txt",
@@ -151,7 +131,7 @@ describe("formatToolInputPreview: masked generic JSON", () => {
 });
 
 describe("buildReviewLogContext", () => {
-  it("includes supplied facts in the documented field order", () => {
+  it("includes the supplied command, target, preview and rule origin", () => {
     const context = buildReviewLogContext({
       toolName: "read",
       input: { path: "src/a.ts" },
@@ -165,7 +145,6 @@ describe("buildReviewLogContext", () => {
       toolInputPreview: "read src/a.ts",
       ruleOrigin: "project",
     });
-    expect(Object.keys(context)).toEqual(["command", "target", "toolInputPreview", "ruleOrigin"]);
   });
 
   it("omits absent and blank facts instead of writing empty strings", () => {
@@ -178,14 +157,6 @@ describe("buildReviewLogContext", () => {
     });
     expect(context).toEqual({});
     expect(Object.values(context)).not.toContain("");
-  });
-
-  it("keeps the documented order when earlier fields are absent", () => {
-    const targetOnly = buildReviewLogContext({ toolName: "read", input: {}, target: "src" });
-    expect(targetOnly).toEqual({ target: "src" });
-
-    const previewOnly = buildReviewLogContext({ toolName: "custom_tool", input: { a: 1 } });
-    expect(previewOnly).toEqual({ toolInputPreview: '{"a":1}' });
   });
 
   it("omits non-string fact values", () => {

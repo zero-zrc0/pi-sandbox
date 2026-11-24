@@ -15,4 +15,4 @@ export function buildLaunchArgs(
   context?: { readonly installRoot?: string },
 ): LinuxLaunchArguments;
 
-export function probeBubblewrap(path: string, expectedVersion?: string): string | undefined;
+export function probeBubblewrap(path: string, expectedVersion?: string, signal?: AbortSignal): Promise<string | undefined>;

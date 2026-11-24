@@ -63,8 +63,10 @@ export function createMacOSDirectBackend(options: MacOSBackendOptions): DirectBa
   return {
     id: BACKEND_ID,
     version: BACKEND_VERSION,
-    async probe(): Promise<DirectBackendProbe | DirectBackendUnavailable> {
-      const result = probeMacOSSeatbelt();
+    probeCacheKey: [BACKEND_ID, BACKEND_VERSION, process.arch].join(":"),
+
+    async probe(signal?: AbortSignal): Promise<DirectBackendProbe | DirectBackendUnavailable> {
+      const result = await probeMacOSSeatbelt(signal);
       return result.status === "candidate-present" ? { ok: true, capabilities: probe } : unavailable(result.reason);
     },
     async prepare(request: ExecutionRequest, egress?: EgressGrantRef): Promise<NativeLaunchPlan | DirectBackendUnavailable> {

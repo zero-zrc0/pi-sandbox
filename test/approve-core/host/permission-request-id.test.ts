@@ -7,16 +7,9 @@
  */
 import { describe, expect, it } from "vitest";
 import {
-  PERMISSION_REQUEST_ID_PREFIX,
   createPermissionRequestId,
   isPermissionRequestId,
 } from "#approve-core/host/permission-request-id";
-
-describe("PERMISSION_REQUEST_ID_PREFIX", () => {
-  it("is the perm- prefix the host audits", () => {
-    expect(PERMISSION_REQUEST_ID_PREFIX).toBe("perm-");
-  });
-});
 
 describe("createPermissionRequestId", () => {
   it("builds perm-<uuid> from the injected source", () => {

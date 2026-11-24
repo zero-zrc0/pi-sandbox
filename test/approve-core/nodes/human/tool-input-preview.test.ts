@@ -3,10 +3,6 @@ import {
   DEFAULT_PREVIEW_LIMITS,
   PREVIEW_ELLIPSIS,
   REDACTED_VALUE,
-  collapseWhitespace,
-  countLabel,
-  countLines,
-  inlinePreview,
   isSensitiveKey,
   jsonPreview,
   logJsonPreview,
@@ -66,51 +62,6 @@ describe("truncateWithEllipsis", () => {
 
   it("does not truncate exactly at the limit", () => {
     expect(truncateWithEllipsis("x".repeat(200), 200)).toBe("x".repeat(200));
-  });
-});
-
-describe("countLines", () => {
-  it("reports zero lines for the empty string", () => {
-    expect(countLines("")).toBe(0);
-  });
-
-  it("counts single and multi line text", () => {
-    expect(countLines("one")).toBe(1);
-    expect(countLines("one\ntwo")).toBe(2);
-    expect(countLines("one\n")).toBe(2);
-  });
-
-  it("counts CRLF, CR and LF line endings", () => {
-    expect(countLines("a\r\nb")).toBe(2);
-    expect(countLines("a\rb")).toBe(2);
-    expect(countLines("a\r\nb\rc\nd")).toBe(4);
-    expect(countLines("\r\n\r\n")).toBe(3);
-  });
-});
-
-describe("countLabel", () => {
-  it("uses the singular only for exactly one", () => {
-    expect(countLabel(0, "line", "lines")).toBe("0 lines");
-    expect(countLabel(1, "line", "lines")).toBe("1 line");
-    expect(countLabel(2, "line", "lines")).toBe("2 lines");
-    expect(countLabel(-1, "line", "lines")).toBe("-1 lines");
-  });
-});
-
-describe("collapseWhitespace and inlinePreview", () => {
-  it("collapses all whitespace runs and trims", () => {
-    expect(collapseWhitespace("  a \t\n b   c  ")).toBe("a b c");
-    expect(collapseWhitespace("\r\n")).toBe("");
-  });
-
-  it("reports the empty text category for blank input", () => {
-    expect(inlinePreview("", 80)).toBeUndefined();
-    expect(inlinePreview("   \n\t ", 80)).toBeUndefined();
-  });
-
-  it("collapses then truncates at the injected limit", () => {
-    expect(inlinePreview("  a\n b  ", 80)).toBe("a b");
-    expect(inlinePreview("abcdef", 3)).toBe(`abc${PREVIEW_ELLIPSIS}`);
   });
 });
 

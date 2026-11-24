@@ -189,12 +189,12 @@ export class PermissionService {
     }).check, bashAnalysis: "incomplete" };
   }
 
-  toolState(toolName: string): RuleAction {
-    return this.manager.toolState(toolName);
+  toolState(toolName: string, agent?: string): RuleAction {
+    return this.manager.toolState(toolName, agent);
   }
 
-  isToolFullyDenied(toolName: string): boolean {
-    return this.manager.isToolFullyDenied(toolName);
+  isToolFullyDenied(toolName: string, agent?: string): boolean {
+    return this.manager.isToolFullyDenied(toolName, agent);
   }
 
   approve(surface: string, pattern: string): SessionRuleView {

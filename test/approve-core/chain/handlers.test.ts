@@ -151,6 +151,23 @@ describe("mode-base", () => {
     expect(verdict.state).toBe("ask");
     expect(verdict.reason).toBe("mode:full-access:one-time-host-execution");
   });
+
+  it("keeps an unproven Host request reviewable instead of denying it", async () => {
+    const verdict = await decide(unit({ access: [{ kind: "unknown" }] }), {
+      hostExecutionRequest: { reason: "run an unparseable command", elevation: { tier: "host", scope: [] } },
+    });
+    expect(verdict.state).toBe("ask");
+    expect(verdict.askFor).toBe("escalate");
+    expect(verdict.reason).toBe("mode:default:one-time-host-execution");
+  });
+
+  it("still denies an unproven Default request that widens the sandbox", async () => {
+    const verdict = await decide(unit({ access: [{ kind: "unknown" }] }), {
+      hostExecutionRequest: { reason: "bypass", elevation: { tier: "default", scope: [] } },
+    });
+    expect(verdict.state).toBe("deny");
+    expect(verdict.reason).toBe("mode:elevation:effects-unproven-or-unsafe");
+  });
 });
 
 describe("explicit-rules", () => {

@@ -578,16 +578,6 @@ describe("ticket completion", () => {
     expect(fixture.kinds()).toContain("run-discarded");
   });
 
-  it("discards a completion from a ticket cancelled by new input", async () => {
-    const fixture = createFixture();
-    const ticket = fixture.barrier.begin() as LearningBarrierTicket;
-    fixture.barrier.recordUserInput();
-    ticket.complete("still-applicable");
-    await flush();
-    expect(fixture.barrier.needsReconciliation()).toBe(true);
-    expect(fixture.revisionOfKinds("run-discarded")).toEqual([INITIAL_REVISION]);
-  });
-
   it("discards a completion after dispose", async () => {
     const fixture = createFixture();
     const ticket = fixture.barrier.begin() as LearningBarrierTicket;

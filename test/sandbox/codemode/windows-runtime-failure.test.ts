@@ -1,10 +1,11 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
+import { FrameDecoder } from "#sandbox/codemode/physical-codec";
 import { windowsRuntimeFiles } from "../fixtures/runtime";
 
-const observed = vi.hoisted(() => ({ children: [] as object[] }));
+const observed = vi.hoisted(() => ({ children: [] as object[], stdinChunks: [] as Uint8Array[], nativeRequests: [] as string[] }));
 
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -13,6 +14,17 @@ vi.mock("node:child_process", async importOriginal => {
     spawn: (...args: Parameters<typeof actual.spawn>) => {
       const child = actual.spawn(...args) as ChildProcessWithoutNullStreams;
       if (!child.spawnfile.toLowerCase().endsWith("pi-sandbox-windows-mxc.exe")) return child;
+      const options = args[2];
+      if (options !== null && typeof options === "object" && "env" in options) {
+        const request = options.env?.PI_MXC_REQUEST;
+        if (typeof request === "string") observed.nativeRequests.push(request);
+      }
+      const input = child.stdin as unknown as { write: (chunk: unknown, ...args: unknown[]) => boolean };
+      const originalWrite = input.write.bind(input);
+      input.write = (chunk, ...writeArgs) => {
+        if (Buffer.isBuffer(chunk) || typeof chunk === "string") observed.stdinChunks.push(Buffer.from(chunk));
+        return originalWrite(chunk, ...writeArgs);
+      };
       let pending = "";
       let resolveReady!: () => void;
       const ready = new Promise<void>(resolve => { resolveReady = resolve; });
@@ -79,6 +91,73 @@ async function waitForRuntimePid(parentPid: number): Promise<number> {
 }
 
 describe.skipIf(process.platform !== "win32" || !existsSync(executable))("Windows Codemode Runtime failure", () => {
+  it("passes QuickJS as a local file reference to the restricted Runtime", async () => {
+    observed.children.length = 0;
+    observed.stdinChunks.length = 0;
+    observed.nativeRequests.length = 0;
+    const sandbox = createWindowsCodemodeSandbox({ timeoutMs: 15_000 }, undefined, windowsRuntimeFiles());
+    const execution = sandbox.execute("return 7;");
+
+    try {
+      let start: Record<string, unknown> | undefined;
+      await vi.waitFor(() => {
+        const decoder = new FrameDecoder({ allowInitialGeneration: true });
+        const frames = decoder.push(Buffer.concat(observed.stdinChunks.map(chunk => Buffer.from(chunk))));
+        start = frames.find(frame => frame.type === "start");
+        expect(start).toBeDefined();
+      }, { timeout: 15_000 });
+      expect(start).toHaveProperty("wasmPath", expect.any(String));
+      expect(start).not.toHaveProperty("wasmBase64");
+      const request = JSON.parse(observed.nativeRequests[0]!) as { plan?: { filesystem?: readonly { path: string; access: string }[] } };
+      expect(request.plan?.filesystem).toContainEqual(expect.objectContaining({
+        path: (start as { wasmPath: string }).wasmPath,
+        access: "read",
+        granularity: "file",
+      }));
+    } finally {
+      await sandbox.close();
+      await execution.catch(() => undefined);
+    }
+  }, 20_000);
+
+  it("reuses the selected runtime and QuickJS path after a same-version manifest change", async () => {
+    observed.children.length = 0;
+    observed.stdinChunks.length = 0;
+    observed.nativeRequests.length = 0;
+    const runtime = (() => {
+      const previousExecutable = process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE;
+      try {
+        process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE = executable;
+        return windowsRuntimeFiles();
+      } finally {
+        if (previousExecutable === undefined) delete process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE;
+        else process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE = previousExecutable;
+      }
+    })();
+    const sandbox = createWindowsCodemodeSandbox({ timeoutMs: 15_000 }, undefined, runtime);
+
+    try {
+      await expect(sandbox.execute("return 7;")).resolves.toMatchObject({ ok: true });
+      const firstDecoder = new FrameDecoder({ allowInitialGeneration: true });
+      const firstStart = firstDecoder.push(Buffer.concat(observed.stdinChunks.map(chunk => Buffer.from(chunk))))
+        .find(frame => frame.type === "start");
+      expect(firstStart).toHaveProperty("wasmPath", expect.any(String));
+      const wasmPath = (firstStart as unknown as { wasmPath: string }).wasmPath;
+
+      writeFileSync(runtime.files.mxcManifest!, `${readFileSync(runtime.files.mxcManifest!, "utf8")}\n`);
+      observed.stdinChunks.length = 0;
+
+      await expect(sandbox.execute("return 8;")).resolves.toMatchObject({ ok: true });
+      const secondDecoder = new FrameDecoder({ allowInitialGeneration: true });
+      const secondStart = secondDecoder.push(Buffer.concat(observed.stdinChunks.map(chunk => Buffer.from(chunk))))
+        .find(frame => frame.type === "start");
+      expect(secondStart).toHaveProperty("wasmPath", wasmPath);
+      expect(observed.children).toHaveLength(2);
+    } finally {
+      await sandbox.close();
+    }
+  }, 30_000);
+
   it("settles the Pi execution when MXC exits after Runtime readiness", async () => {
     observed.children.length = 0;
     const sandbox = createWindowsCodemodeSandbox({ timeoutMs: 15_000 }, undefined, windowsRuntimeFiles());

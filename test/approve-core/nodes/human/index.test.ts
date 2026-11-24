@@ -12,9 +12,6 @@ import {
   createHumanSelectionPort,
   createHumanSelectorComponent,
   describeHumanRequest,
-  formatToolInputPreview,
-  createPromptToolInputFormatter,
-  summarizeBuiltinToolInput,
   type HumanAuditEvent,
   type HumanPromptHost,
   type HumanPromptView,
@@ -934,18 +931,5 @@ describe("createHumanSelectionPort", () => {
     controller.abort();
     const port = createHumanSelectionPort(makeHost(async () => HUMAN_APPROVE_OPTION));
     expect(await port(makeRequest({ signal: controller.signal }))).toBeUndefined();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Module surface
-// ---------------------------------------------------------------------------
-
-describe("human module barrel", () => {
-  it("re-exports the preview, summary, prompt and log formatter entry points", () => {
-    expect(typeof summarizeBuiltinToolInput).toBe("function");
-    expect(typeof createPromptToolInputFormatter).toBe("function");
-    expect(typeof formatToolInputPreview).toBe("function");
-    expect(typeof createHumanApprover).toBe("function");
   });
 });

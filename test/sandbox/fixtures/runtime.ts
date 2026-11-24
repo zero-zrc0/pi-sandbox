@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ResolvedRuntimeFiles } from "#sandbox/runtime-store";
@@ -14,7 +15,8 @@ afterAll(async () => {
 });
 
 export function windowsRuntimeFiles(): ResolvedRuntimeFiles {
-  const storageRoot = fileURLToPath(new URL("../../../", import.meta.url));
+  const storageRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-test-runtime-storage-"));
+  temporaryRuntimes.push(storageRoot);
   const override = process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE;
   let executable = fileURLToPath(new URL("../../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url));
   let directory = dirname(executable);

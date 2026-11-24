@@ -20,6 +20,7 @@ export type SandboxRuntimeState =
 export interface RuntimeProbeResult {
   readonly available: boolean;
   readonly reason?: string;
+  readonly linuxProbe?: NonNullable<ResolvedRuntimeFiles["linuxProbe"]>;
 }
 
 export interface SandboxRuntimeManagerOptions {
@@ -192,6 +193,8 @@ export class SandboxRuntimeManager {
             selected = { kind: "download", release: selected.runtime.catalogEntry };
           }
         }
+        let linuxProbe: RuntimeProbeResult["linuxProbe"];
+        let probed = false;
         if (selected.kind === "download") {
           if (scan.candidates.length === 0 && scan.problems.length === 0 && input.confirmDownload &&
               !(await input.confirmDownload(selected.release))) {
@@ -205,6 +208,8 @@ export class SandboxRuntimeManager {
             beforeCommit: async candidate => {
               const probe = await this.options.probe(candidate, { signal, workspaceRoot: input.workspaceRoot });
               if (!probe.available) throw new Error(probe.reason ?? "runtime capability probe failed");
+              linuxProbe = probe.linuxProbe;
+              probed = true;
               if (generation !== this.generation || signal.aborted) throw new Error("runtime preparation was cancelled");
             },
             onProgress: progress => {
@@ -216,11 +221,13 @@ export class SandboxRuntimeManager {
         }
         if (!runtime) throw new Error("runtime preparation did not produce validated files");
         if (generation !== this.generation || signal.aborted) return this.stateValue;
-        if (selected.kind === "installed") {
+        if (selected.kind === "installed" || !probed) {
           const probe = await this.options.probe(runtime, { signal, workspaceRoot: input.workspaceRoot });
           if (generation !== this.generation || signal.aborted) return this.stateValue;
           if (!probe.available) throw new Error(probe.reason ?? "runtime capability probe failed");
+          linuxProbe = probe.linuxProbe;
         }
+        if (linuxProbe !== undefined) runtime = { ...runtime, linuxProbe };
         this.preparedRuntime = runtime;
         this.stateValue = { status: "ready", runtime };
       } catch (error) {

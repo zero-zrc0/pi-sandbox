@@ -9,7 +9,7 @@ import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ExtensionToolContext, type RegisteredMcpServer } from "@earendil-works/pi-coding-agent";
 import { resolveConfigPaths } from "#config/config-paths";
@@ -23,7 +23,7 @@ import type { RuntimeFileEntry, RuntimeFileRole } from "#sandbox/runtime-catalog
 import type { ResolvedRuntimeFiles } from "#sandbox/runtime-store";
 import { runWithApprovedCodemode } from "#sandbox/codemode/approval-scope";
 import type { AnyToolDefinition } from "#sandbox/pi";
-import type { ExecutionOutcome, ExecutionRecord } from "#sandbox/types";
+import type { ExecutionOutcome, ExecutionRecord, ExecutionRequest } from "#sandbox/types";
 import { compileTestRequest, createTestLayout, makeController, makeInvocation, removeTestLayout, runtimeEnvironment, waitFor, waitForProcessGone } from "./fixtures/harness";
 import { createTestDirectBackend } from "./fixtures/direct-backend";
 import { PROTECTED_CONTROL_DIRECTORY_NAMES } from "#sandbox/path";
@@ -32,6 +32,12 @@ import { findSystemBubblewrap } from "../../src/sandbox/backend/linux/bwrap-sele
 import { selectExecutionEnvironment } from "../../src/sandbox/plan";
 
 const cleanup: (() => Promise<void>)[] = [];
+const windowsExecutable = process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE ??
+  fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url));
+const windowsNative = process.platform === "win32" && existsSync(windowsExecutable);
+const linuxLauncher = fileURLToPath(new URL("../../src/sandbox/backend/linux/linux-sandbox", import.meta.url));
+const linuxNative = process.platform === "linux" && existsSync(linuxLauncher) &&
+  findSystemBubblewrap(process.env.PATH ?? "", process.cwd()) !== undefined;
 const privateAddress = Object.values(networkInterfaces()).flat().find(address => address?.family === "IPv4" && !address.internal)?.address;
 afterEach(async () => { for (const close of cleanup.splice(0)) await close(); });
 
@@ -88,7 +94,7 @@ function setup(
   if (runtimePlatform === "win32") {
     const module = join(dirname(dirname(source)), "src/sandbox/backend/windows/mxc");
     const testExecutable = process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE;
-    installRuntimeFile("windowsExecutable", testExecutable ?? join(module, "pi-sandbox-windows-mxc.exe"), "pi-sandbox-windows-mxc.exe", true);
+    installRuntimeFile("windowsExecutable", windowsExecutable, "pi-sandbox-windows-mxc.exe", true);
     if (testExecutable && runtimeFiles.windowsExecutable) {
       const target = join(runtimeDirectory, "mxc-runtime.json");
       writeFileSync(target, JSON.stringify({ schemaVersion: 1, backend: "windows-mxc", version: "1.0.0",
@@ -114,8 +120,8 @@ function setup(
     }
   }
   const requiredRuntimeFileCount = runtimePlatform === "linux" ? 4 : runtimePlatform === "win32" ? 2 : 0;
-  const bubblewrapVersion = runtimePlatform === "linux"
-    ? /^bubblewrap (\d+\.\d+\.\d+)/u.exec(spawnSync(runtimeFiles.bubblewrap!, ["--version"], { encoding: "utf8" }).stdout ?? "")?.[1]
+  const bubblewrapVersion = runtimeFiles.bubblewrap !== undefined
+    ? /^bubblewrap (\d+\.\d+\.\d+)/u.exec(spawnSync(runtimeFiles.bubblewrap, ["--version"], { encoding: "utf8" }).stdout ?? "")?.[1]
     : undefined;
   if (runtimeManifestFiles.length === requiredRuntimeFileCount && requiredRuntimeFileCount > 0 &&
       (runtimePlatform !== "linux" || bubblewrapVersion !== undefined)) {
@@ -219,22 +225,22 @@ describe("production controlled execution boundary", () => {
     }, 30_000,
   );
 
-  it.skipIf(process.platform !== "win32" || !process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE)(
-    "refuses a runtime changed after selection before starting a tool", async () => {
+  it.skipIf(!windowsNative)(
+    "continues using the selected runtime after a same-version file change", async () => {
       const rig = setup("default", true);
       const event = { type: "tool_call" as const, toolName: "write", toolCallId: "runtime-replaced",
         input: { path: "out.txt", content: "data" } };
       expect(await rig.execution.guard(event, rig.ctx, async () => undefined)).toBeUndefined();
       const manifest = join(rig.runtimeDirectory, "runtime.json");
       writeFileSync(manifest, `${readFileSync(manifest, "utf8")} `);
-      await expect(rig.definitions.get("write")!.execute(event.toolCallId, event.input, undefined, undefined, rig.ctx))
-        .rejects.toThrow("runtime manifest changed");
-      expect(rig.records.some(record => (record as { started?: unknown }).started === true)).toBe(false);
-      expect(existsSync(join(rig.layout.workspace, "out.txt"))).toBe(false);
+      const result = await rig.definitions.get("write")!.execute(event.toolCallId, event.input, undefined, undefined, rig.ctx);
+      expect(result.isError).not.toBe(true);
+      expect(rig.records.some(record => (record as { started?: unknown }).started === true)).toBe(true);
+      expect(readFileSync(join(rig.layout.workspace, "out.txt"), "utf8")).toBe("data");
     }, 20_000,
   );
 
-  it.skipIf(process.platform !== "win32" || !process.env.PI_SANDBOX_TEST_MXC_EXECUTABLE)(
+  it.skipIf(!windowsNative)(
     "enforces configured sensitive paths through the host-direct production Windows backend", async () => {
       const rig = setup("default", true);
       const secretDir = join(rig.layout.workspace, "private-dir");
@@ -431,7 +437,7 @@ describe("production controlled execution boundary", () => {
     },
   );
 
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))
+  it.skipIf(!windowsNative)
     .each(["project", "session-workspace"] as const)(
     "writes through native Default elevation to the %s directory while the session stays read-only", async directory => {
       const rig = setup("read-only", true);
@@ -537,6 +543,107 @@ describe("production controlled execution boundary", () => {
     });
   });
 
+  it("allows reads of the global readable control directories without elevation in every sandboxed mode", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-sandbox-control-home-"));
+    vi.stubEnv(process.platform === "win32" ? "USERPROFILE" : "HOME", home);
+    cleanup.push(async () => { vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }); });
+    for (const mode of ["read-only", "default"] as const) {
+      const rig = setup(mode);
+      const review = vi.fn(async () => undefined);
+      for (const name of [".agents", ".codex"] as const) {
+        const skill = join(homedir(), name, "skills", "demo", "SKILL.md");
+        expect(await rig.execution.guard({
+          type: "tool_call" as const,
+          toolName: "read",
+          toolCallId: `readable-control-read-${mode}-${name}`,
+          input: { path: skill },
+        }, rig.ctx, review)).toBeUndefined();
+      }
+    }
+  });
+
+  it.skipIf(!windowsNative && !linuxNative)("reads global skills and denies control-directory writes in native execution", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-sandbox-native-control-home-"));
+    vi.stubEnv(process.platform === "win32" ? "USERPROFILE" : "HOME", home);
+    expect(homedir()).toBe(home);
+    const rig = setup("default", true);
+    cleanup.push(async () => { vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }); });
+    const files = [
+      { name: ".agents", relative: join("skills", "demo", "SKILL.md"), content: "skill content" },
+      { name: ".codex", relative: "config.toml", content: "model = 'test'" },
+    ];
+    for (const file of files) {
+      const path = join(home, file.name, file.relative);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, file.content);
+    }
+    const review = vi.fn(async () => undefined);
+    const requests: ExecutionRequest[] = [];
+    const execute = ExecutionController.prototype.execute;
+    const executeSpy = vi.spyOn(ExecutionController.prototype, "execute").mockImplementation(function(this: ExecutionController, input) {
+      requests.push(input.request);
+      return execute.call(this, input);
+    });
+
+    try {
+      for (const [index, file] of files.entries()) {
+        const path = join(home, file.name, file.relative);
+        const read = { type: "tool_call" as const, toolName: "read", toolCallId: `control-read-${index}`, input: { path } };
+        expect(await rig.execution.guard(read, rig.ctx, review)).toBeUndefined();
+        let readError: unknown;
+        const readDefinition = rig.definitions.get("read")!;
+        let readResult: Awaited<ReturnType<typeof readDefinition.execute>> | undefined;
+        try {
+          readResult = await readDefinition.execute(read.toolCallId, read.input, undefined, undefined, rig.ctx);
+        } catch (error) {
+          readError = error;
+        }
+        expect(requests.find(request => request.toolCallId === read.toolCallId)?.plan.filesystem).toContainEqual(expect.objectContaining({
+          path: realpathSync(join(home, file.name)), access: "read", granularity: "directory",
+        }));
+        if (readError !== undefined) throw readError;
+        expect(readResult?.isError, JSON.stringify(readResult)).not.toBe(true);
+        expect(JSON.stringify(readResult)).toContain(file.content);
+
+        const write = { type: "tool_call" as const, toolName: "write", toolCallId: `control-write-${index}`,
+          input: { path, content: "must not replace control data" } };
+        expect(await rig.execution.guard(write, rig.ctx, review)).toMatchObject({
+          block: true,
+          reason: expect.stringContaining("protected-control-path"),
+        });
+        expect(readFileSync(path, "utf8")).toBe(file.content);
+      }
+    } finally {
+      executeSpy.mockRestore();
+    }
+
+    const deniedPath = join(home, ".agents", "skills", "demo", "SKILL.md");
+    writeFileSync(rig.paths.globalConfigFile, JSON.stringify({ mode: "default", experimental: { sandboxEnabled: true },
+      execution: { denyPaths: [deniedPath] } }));
+    rig.owner.reload();
+    const deniedRead = { type: "tool_call" as const, toolName: "read", toolCallId: "control-deny-path-read", input: { path: deniedPath } };
+    expect(await rig.execution.guard(deniedRead, rig.ctx, review)).toBeUndefined();
+    const deniedResult = await rig.definitions.get("read")!.execute(deniedRead.toolCallId, deniedRead.input, undefined, undefined, rig.ctx)
+      .catch((error: unknown) => error);
+    expect(deniedResult instanceof Error || (typeof deniedResult === "object" && deniedResult !== null && "isError" in deniedResult && deniedResult.isError === true)).toBe(true);
+    expect(String(deniedResult instanceof Error ? deniedResult.message : JSON.stringify(deniedResult))).not.toContain("skill content");
+  }, 45_000);
+
+  it("certifies only the sanctioned temporary-path rewrite of a file tool's arguments", () => {
+    vi.stubEnv("TEMP", tmpdir());
+    cleanup.push(async () => { vi.unstubAllEnvs(); });
+    const rig = setup("default");
+    const workspaceTmp = join(rig.execution.sessionWorkspace(rig.ctx), "tmp");
+    const before = { path: "$TEMP/handoff.md", content: "doc" };
+    const after = { path: join(workspaceTmp, "handoff.md"), content: "doc" };
+
+    expect(rig.execution.sanctionedArgumentRewrite("write", before, after, rig.ctx)).toBe(true);
+    expect(rig.execution.sanctionedArgumentRewrite("write", before, { ...after, content: "changed" }, rig.ctx)).toBe(false);
+    expect(rig.execution.sanctionedArgumentRewrite("write", before,
+      { path: join(workspaceTmp, "other.md"), content: "doc" }, rig.ctx)).toBe(false);
+    expect(rig.execution.sanctionedArgumentRewrite("powershell", { command: "x" }, { command: "y" }, rig.ctx)).toBe(false);
+  });
+
   it("keeps ordinary session workspace writes read-only and grants directory scopes only for explicit elevation", async () => {
     const rig = setup("read-only");
     const workspace = rig.execution.sessionWorkspace(rig.ctx);
@@ -568,7 +675,7 @@ describe("production controlled execution boundary", () => {
     expect(existsSync(target)).toBe(false);
   });
 
-  it("maps host temporary paths onto the session sandbox temporary directory", async () => {
+  it("keeps raw file paths while selecting session temporary targets for review", async () => {
     const hostTemp = mkdtempSync(join(tmpdir(), "pi-sandbox-host-temp-"));
     cleanup.push(async () => rmSync(hostTemp, { recursive: true, force: true }));
     const previous = process.env.TMPDIR;
@@ -580,8 +687,10 @@ describe("production controlled execution boundary", () => {
 
       const spelled = { type: "tool_call" as const, toolName: "write", toolCallId: "temp-variable-write",
         input: { path: "$TMPDIR/notes.txt", content: "sandboxed" } };
-      expect(await rig.execution.guard(spelled, rig.ctx, async () => undefined)).toBeUndefined();
-      expect(spelled.input.path).toBe(expected);
+      const spelledReview = vi.fn(async () => undefined);
+      expect(await rig.execution.guard(spelled, rig.ctx, spelledReview)).toBeUndefined();
+      expect(spelled.input.path).toBe("$TMPDIR/notes.txt");
+      expect(spelledReview).toHaveBeenCalledWith(expect.objectContaining({ requestedPath: "$TMPDIR/notes.txt", resolvedPath: expected }));
 
       const expanded = { type: "tool_call" as const, toolName: "read", toolCallId: "temp-host-read",
         input: { path: join(hostTemp, "notes.txt") } };
@@ -593,15 +702,17 @@ describe("production controlled execution boundary", () => {
 
       const braces = { type: "tool_call" as const, toolName: "edit", toolCallId: "temp-braced-write",
         input: { path: "${TMPDIR}/notes.txt", oldText: "a", newText: "b" } };
-      await rig.execution.guard(braces, rig.ctx, async () => undefined);
-      expect(braces.input.path).toBe(expected);
+      const bracesReview = vi.fn(async () => undefined);
+      await rig.execution.guard(braces, rig.ctx, bracesReview);
+      expect(braces.input.path).toBe("${TMPDIR}/notes.txt");
+      expect(bracesReview).toHaveBeenCalledWith(expect.objectContaining({ requestedPath: "${TMPDIR}/notes.txt", resolvedPath: expected }));
     } finally {
       if (previous === undefined) delete process.env.TMPDIR;
       else process.env.TMPDIR = previous;
     }
   });
 
-  it("maps temporary paths to the host temporary directory when the sandbox is off and neither is touched in full-access", async () => {
+  it("keeps raw temporary paths when sandboxing is off and in full-access", async () => {
     const hostTemp = mkdtempSync(join(tmpdir(), "pi-sandbox-host-temp-"));
     cleanup.push(async () => rmSync(hostTemp, { recursive: true, force: true }));
     const previous = process.env.TMPDIR;
@@ -610,8 +721,10 @@ describe("production controlled execution boundary", () => {
       const unsandboxed = setup("default", false, "ok", false);
       const mapped = { type: "tool_call" as const, toolName: "write", toolCallId: "host-temp-write",
         input: { path: "$TMPDIR/notes.txt", content: "host" } };
-      await unsandboxed.execution.guard(mapped, unsandboxed.ctx, async () => undefined);
-      expect(mapped.input.path).toBe(join(hostTemp, "notes.txt"));
+      const mappedReview = vi.fn(async () => undefined);
+      await unsandboxed.execution.guard(mapped, unsandboxed.ctx, mappedReview);
+      expect(mapped.input.path).toBe("$TMPDIR/notes.txt");
+      expect(mappedReview).toHaveBeenCalledWith(expect.objectContaining({ requestedPath: "$TMPDIR/notes.txt", resolvedPath: join(hostTemp, "notes.txt") }));
 
       const fullAccess = setup("full-access");
       const unchanged = { type: "tool_call" as const, toolName: "write", toolCallId: "full-access-temp",
@@ -622,6 +735,22 @@ describe("production controlled execution boundary", () => {
       if (previous === undefined) delete process.env.TMPDIR;
       else process.env.TMPDIR = previous;
     }
+  });
+
+  it("grants host elevation for shell tools without deriving a file scope", () => {
+    const rig = setup("read-only");
+    const shell = process.platform === "win32" ? "powershell" : "bash";
+    const command = { command: "Write-Output done" };
+
+    expect(rig.execution.prepareElevation(shell, command, "host", rig.ctx)).toMatchObject({
+      tier: "host",
+      scope: [],
+    });
+    expect(rig.execution.prepareElevation(shell, command, "default", rig.ctx)).toMatchObject({
+      block: true,
+      reason: expect.stringContaining('tier "host"'),
+    });
+    expect(rig.execution.validateElevation(shell, command, { tier: "host", scope: [] }, rig.ctx)).toBe(true);
   });
 
   it("executes an external Host file request only after the elevation reviewer approves", async () => {
@@ -664,6 +793,44 @@ describe("production controlled execution boundary", () => {
       expect(readFileSync(target, "utf8")).toBe("host approved");
       expect(rig.records).toContainEqual(expect.objectContaining({ executionMode: "host", state: "completed" }));
       expect(rig.owner.snapshot({ sessionId: rig.ctx.sessionManager.getSessionId() }).config.mode).toBe("read-only");
+    } finally {
+      rmSync(target, { force: true });
+    }
+  });
+
+  it("executes an approved shell Host request on the host without a derived scope", async () => {
+    const rig = setup("read-only");
+    const shell = process.platform === "win32" ? "powershell" : "bash";
+    const target = join(rig.layout.agent, "approved-shell-host.txt");
+    const command = process.platform === "win32"
+      ? `Set-Content -NoNewline -LiteralPath '${target}' -Value 'host approved'`
+      : `printf 'host approved' > '${target}'`;
+    const bypass = createSandboxBypass({
+      mode: ctx => rig.owner.snapshot({ sessionId: ctx.sessionManager.getSessionId() }).config.mode,
+      policyRevision: ctx => rig.execution.configurationRevision(ctx),
+      resolveHostTool: (name, schema) => rig.execution.resolveHostTool(name, schema),
+      prepareElevation: (name, args, tier, ctx) => rig.execution.prepareElevation(name, args, tier, ctx),
+      validateElevation: (name, args, elevation, ctx) => rig.execution.validateElevation(name, args, elevation, ctx),
+      executeDefault: (input, signal, onUpdate, ctx) => rig.execution.executeDefault(input, signal, onUpdate, ctx),
+      recordExecution: event => rig.records.push(event),
+    });
+    bypass.install(rig.api);
+    bypass.setReviewer(async input => {
+      expect(input.elevation.tier).toBe("host");
+      expect(input.elevation.scope).toEqual([]);
+      return undefined;
+    });
+
+    try {
+      const result = await bypass.tool.execute("approved-shell-host-request", {
+        reason: "write the requested external output through the shell",
+        toolName: shell,
+        arguments: { command },
+        tier: "host",
+      }, undefined, undefined, rig.ctx);
+      expect(result.isError).not.toBe(true);
+      expect(readFileSync(target, "utf8")).toContain("host approved");
+      expect(rig.records).toContainEqual(expect.objectContaining({ executionMode: "host", state: "completed" }));
     } finally {
       rmSync(target, { force: true });
     }
@@ -750,7 +917,7 @@ describe("production controlled execution boundary", () => {
     expect(() => rig.execution.sessionWorkspace(rig.ctx)).toThrow("session-workspace:expected-real-directory");
   });
 
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "isolates concurrent Windows host instances by their network leases", async () => {
       const first = createServer((_request, response) => response.end("instance-one"));
       const second = createServer((_request, response) => response.end("instance-two"));
@@ -784,7 +951,7 @@ describe("production controlled execution boundary", () => {
       }
     }, 35_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url)))).each(["configuration tightening", "cancellation", "timeout"])(
+  it.skipIf(!windowsNative).each(["configuration tightening", "cancellation", "timeout"])(
     "revokes a live Windows proxy connection on %s", async action => {
       let opened = false; let closed = false;
       const server = createServer((_request, response) => {
@@ -815,7 +982,7 @@ describe("production controlled execution boundary", () => {
       } finally { abort.abort(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
     }, 35_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url)))).each([
+  it.skipIf(!windowsNative).each([
     { host: "::1", family: "InterNetworkV6" },
     ...(privateAddress ? [{ host: privateAddress, family: "InterNetwork" }] : []),
   ])("blocks direct $family traffic in the real Windows destination policy", async ({ host, family }) => {
@@ -839,7 +1006,7 @@ describe("production controlled execution boundary", () => {
     } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
   }, 25_000);
 
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "blocks UDP delivery in the real Windows destination policy", async () => {
       const server = createSocket("udp4"); server.bind(0, "127.0.0.1"); await once(server, "listening");
       const port = server.address().port;
@@ -917,7 +1084,7 @@ describe("production controlled execution boundary", () => {
       } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
     }, 25_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url)))).each(["none", "all"] as const)(
+  it.skipIf(!windowsNative).each(["none", "all"] as const)(
     "enforces %s for a real PowerShell tool", async kind => {
       const server = createServer((_request, response) => response.end("reachable"));
       await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -938,7 +1105,7 @@ describe("production controlled execution boundary", () => {
       }
     }, 25_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "enforces destination egress for a real PowerShell tool", async () => {
       const allowed = createServer((_request, response) => response.end("proxy-allowed"));
       const denied = createServer((_request, response) => response.end("proxy-denied"));
@@ -966,7 +1133,7 @@ describe("production controlled execution boundary", () => {
       }
     }, 25_000,
   );
-  it.skipIf(process.platform !== "win32" || !privateAddress || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative || !privateAddress)(
     "uses the controlled proxy automatically for PowerShell web requests", async () => {
       const allowed = createServer((_request, response) => response.end("allowed"));
       const denied = createServer((_request, response) => response.end("denied"));
@@ -1004,7 +1171,7 @@ describe("production controlled execution boundary", () => {
     expect(rig.controllers).toHaveLength(0);
     expect(rig.records).toEqual([]);
   });
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url)))).each([
+  it.skipIf(!windowsNative).each([
     { name: "grep", binary: "rg.exe", input: { path: ".", pattern: "needle" }, expected: "needle" },
     { name: "find", binary: "fd.exe", input: { path: ".", pattern: "*.txt" }, expected: "sample.txt" },
   ] as const)("runs $name from a custom Pi agent directory", async ({ name, binary, input, expected }) => {
@@ -1030,7 +1197,7 @@ describe("production controlled execution boundary", () => {
       if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
     }
   }, 25_000);
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "runs a real builtin through the production Windows backend", async () => {
       const rig = setup("default", true);
       writeFileSync(join(rig.layout.workspace, "approved.txt"), "production-native-read");
@@ -1042,7 +1209,7 @@ describe("production controlled execution boundary", () => {
       expect(rig.records).toEqual([expect.objectContaining({ state: "completed", started: true, toolName: "read" })]);
     }, 25_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "writes an approved file through the production Windows backend", async () => {
       const rig = setup("default", true);
       const event = { type: "tool_call" as const, toolName: "write", toolCallId: "native-write", input: { path: "approved.txt", content: "production-native-write" } };
@@ -1053,7 +1220,7 @@ describe("production controlled execution boundary", () => {
       expect(rig.records).toEqual([expect.objectContaining({ state: "completed", started: true, toolName: "write" })]);
     }, 25_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "overwrites an existing approved file through the production Windows backend", async () => {
       const rig = setup("default", true);
       const target = join(rig.layout.workspace, "approved.txt");
@@ -1065,7 +1232,7 @@ describe("production controlled execution boundary", () => {
       expect(readFileSync(target, "utf8")).toBe("updated");
     }, 25_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "overwrites an existing file addressed with the Pi @ prefix", async () => {
       const rig = setup("default", true);
       const target = join(rig.layout.workspace, "approved.txt");
@@ -1077,7 +1244,7 @@ describe("production controlled execution boundary", () => {
       expect(readFileSync(target, "utf8")).toBe("updated");
     }, 25_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "serializes concurrent edits to the same file through the production Windows backend", async () => {
       const rig = setup("default", true);
       const target = join(rig.layout.workspace, "concurrent.txt");
@@ -1092,7 +1259,7 @@ describe("production controlled execution boundary", () => {
       expect(readFileSync(target, "utf8")).toBe("LEFT RIGHT");
     }, 30_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "does not allow editing a protected file through the production Windows backend", async () => {
       const rig = setup("default", true);
       const control = join(rig.layout.workspace, ".git");
@@ -1107,7 +1274,7 @@ describe("production controlled execution boundary", () => {
       expect(readFileSync(target, "utf8")).toBe("original");
     }, 25_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "allows workspace writes while denying protected control paths", async () => {
       const rig = setup("default", true);
       for (const name of PROTECTED_CONTROL_DIRECTORY_NAMES) mkdirSync(join(rig.layout.workspace, name));
@@ -1129,7 +1296,7 @@ describe("production controlled execution boundary", () => {
       expect(JSON.stringify(result)).toContain("move-denied");
     }, 25_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url)))).each(["existing", "created"])(
+  it.skipIf(!windowsNative).each(["existing", "created"])(
     "does not implicitly protect nested control directories: %s", async state => {
       const rig = setup("default", true);
       for (const name of PROTECTED_CONTROL_DIRECTORY_NAMES) mkdirSync(join(rig.layout.workspace, name));
@@ -1146,7 +1313,7 @@ describe("production controlled execution boundary", () => {
       expect(JSON.stringify(result)).toContain("writable");
     }, 25_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "denies writes to a protected file's alternate data stream", async () => {
       const rig = setup("default", true);
       for (const name of PROTECTED_CONTROL_DIRECTORY_NAMES) mkdirSync(join(rig.layout.workspace, name));
@@ -1165,7 +1332,7 @@ describe("production controlled execution boundary", () => {
       expect(readFileSync(file, "utf8")).toBe("original");
     }, 25_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "cancels a running PowerShell process through the production Windows backend", async () => {
       const rig = setup("default", true);
       for (const name of PROTECTED_CONTROL_DIRECTORY_NAMES) mkdirSync(join(rig.layout.workspace, name));
@@ -1191,7 +1358,7 @@ describe("production controlled execution boundary", () => {
       } finally { abort.abort(); await running; }
     }, 35_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "times out a PowerShell process tree through the production Windows backend", async () => {
       const rig = setup("default", true);
       for (const name of PROTECTED_CONTROL_DIRECTORY_NAMES) mkdirSync(join(rig.layout.workspace, name));
@@ -1222,7 +1389,7 @@ describe("production controlled execution boundary", () => {
       expect(rig.records).toEqual([expect.objectContaining({ state: "cancelled", code: "execution-timeout", started: true })]);
     }, 45_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "runs PowerShell Start-Process through the production Windows backend", async () => {
       const rig = setup("default", true);
       for (const name of PROTECTED_CONTROL_DIRECTORY_NAMES) mkdirSync(join(rig.layout.workspace, name));
@@ -1234,7 +1401,7 @@ describe("production controlled execution boundary", () => {
       expect(JSON.stringify(result)).toContain("start-success");
     }, 25_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "allows workspace writes and leaves a missing automatic protection path unprotected", async () => {
       const rig = setup("default", true);
       const target = join(rig.layout.workspace, ".aws");
@@ -1250,7 +1417,7 @@ describe("production controlled execution boundary", () => {
       expect(rig.records).toEqual([expect.objectContaining({ state: "completed", started: true })]);
     }, 25_000,
   );
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url)))).each([
+  it.skipIf(!windowsNative).each([
     { name: "edit", input: { path: "sample.txt", edits: [{ oldText: "needle", newText: "changed" }] }, expected: "changed" },
     { name: "ls", input: { path: "." }, expected: "sample.txt" },
     { name: "grep", input: { path: ".", pattern: "needle" }, expected: "needle" },
@@ -1265,7 +1432,7 @@ describe("production controlled execution boundary", () => {
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
     expect(name === "edit" ? readFileSync(file, "utf8") : JSON.stringify(result)).toContain(expected);
   }, 25_000);
-  it.skipIf(process.platform !== "win32" || !existsSync(fileURLToPath(new URL("../../src/sandbox/backend/windows/mxc/pi-sandbox-windows-mxc.exe", import.meta.url))))(
+  it.skipIf(!windowsNative)(
     "blocks the bash builtin before approval through production MXC", async () => {
       const rig = setup("default", true);
       const event = { type: "tool_call" as const, toolName: "bash", toolCallId: "native-bash", input: { command: "printf mxc-bash-ok" } };
@@ -1560,15 +1727,35 @@ describe("tool admission rules at the gate (design §5)", () => {
     })]);
   });
 
-  it("admits an unmanaged tool declared by an allow rule", async () => {
-    const rig = setup();
-    configureRules(rig, [{ id: "allow-diff", match: { tool: "watchdog_diff" }, decision: "allow" }]);
+  it("refuses one-time Host elevation when toolRules deny the target", async () => {
+    const rig = setup("read-only");
+    configureRules(rig, [{ id: "deny-host-write", match: { tool: "write" }, decision: "deny" }]);
+    const targetPath = join(rig.layout.agent, "denied-host-write.txt");
+    const definition = rig.definitions.get("write")!;
+    const target = rig.execution.resolveHostTool("write", definition.parameters)!;
+    const execute = vi.spyOn(target, "execute");
     const review = vi.fn(async () => undefined);
-    const event = { type: "tool_call" as const, toolName: "watchdog_diff", toolCallId: "allowed-1", input: { path: "a.ts" } };
+    const bypass = createSandboxBypass({
+      mode: ctx => rig.owner.snapshot({ sessionId: ctx.sessionManager.getSessionId() }).config.mode,
+      policyRevision: ctx => rig.execution.configurationRevision(ctx),
+      resolveHostTool: (name, schema) => rig.execution.resolveHostTool(name, schema),
+      prepareElevation: (name, args, tier, ctx) => rig.execution.prepareElevation(name, args, tier, ctx),
+      validateElevation: (name, args, elevation, ctx) => rig.execution.validateElevation(name, args, elevation, ctx),
+      executeDefault: (input, signal, onUpdate, ctx) => rig.execution.executeDefault(input, signal, onUpdate, ctx),
+      recordExecution: vi.fn(),
+    });
+    bypass.install(rig.api);
+    bypass.setReviewer(review);
 
-    expect(await rig.execution.guard(event, rig.ctx, review)).toBeUndefined();
+    await expect(bypass.tool.execute("denied-host-write", {
+      reason: "save outside the workspace",
+      toolName: "write",
+      arguments: { path: targetPath, content: "must not be written" },
+      tier: "host",
+    }, undefined, undefined, rig.ctx)).rejects.toThrow("sandbox-denied-tool:deny-host-write");
     expect(review).not.toHaveBeenCalled();
-    expect(rig.records).toEqual([expect.objectContaining({ decision: "allow", ruleId: "allow-diff" })]);
+    expect(execute).not.toHaveBeenCalled();
+    expect(existsSync(targetPath)).toBe(false);
   });
 
   it.each(["default", "read-only", "full-access"] as const)(
@@ -1630,7 +1817,11 @@ describe("tool admission rules at the gate (design §5)", () => {
     const review = vi.fn(async (_input?: { readonly ask?: boolean }) => undefined);
     const event = { type: "tool_call" as const, toolName: "write", toolCallId: "ask-1", input: { path: "a.txt", content: "x" } };
     expect(await rig.execution.guard(event, rig.ctx, review)).toBeUndefined();
-    expect(review).toHaveBeenCalledWith({ ask: true });
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({
+      ask: true,
+      requestedPath: "a.txt",
+      resolvedPath: expect.any(String),
+    }));
   });
 
   it("skips the review channel when an allow rule admits an owned tool", async () => {
@@ -1668,7 +1859,11 @@ describe("tool admission rules at the gate (design §5)", () => {
     // `write` is not covered by these rules, so the ask branch still applies.
     const review = vi.fn(async (_input?: { readonly ask?: boolean }) => undefined);
     expect(await rig.execution.guard(event, rig.ctx, review)).toBeUndefined();
-    expect(review).toHaveBeenCalledWith({ ask: true });
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({
+      ask: true,
+      requestedPath: "a.txt",
+      resolvedPath: expect.any(String),
+    }));
   });
 });
 

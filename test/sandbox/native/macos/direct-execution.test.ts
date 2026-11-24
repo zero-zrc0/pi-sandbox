@@ -17,7 +17,7 @@ import { resolveHostPathIdentity } from "#sandbox/path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 const operationWorkerPath = fileURLToPath(new URL("../../../../src/sandbox/backend/macos/operation-worker.mjs", import.meta.url));
-const seatbelt = process.platform === "darwin" ? probeMacOSSeatbelt() : undefined;
+const seatbelt = process.platform === "darwin" ? await probeMacOSSeatbelt() : undefined;
 const nativeReady = process.platform === "darwin" && existsSync(operationWorkerPath) && seatbelt?.status === "candidate-present";
 
 // The Seatbelt backend is the system runtime: no downloaded files, so the

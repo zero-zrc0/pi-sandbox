@@ -4,11 +4,9 @@ import {
   resolvePreviewLimits,
 } from "#approve-core/nodes/human/tool-input-preview";
 import {
-  createMcpPromptFormatter,
   createPromptToolInputFormatter,
   formatMcpProxyInput,
   registerMcpPromptFormatter,
-  type FormatterRegistrationPort,
   type PromptToolInputFormatter,
   type ToolInputFormatterLookup,
 } from "#approve-core/nodes/human/tool-input-prompt-formatters";
@@ -29,20 +27,6 @@ function fakeLookup(table: Readonly<Record<string, (input: unknown) => unknown>>
     },
   };
 }
-
-describe("attach", () => {
-  it("returns the bare title when there is no preview", () => {
-    const formatter = createPromptToolInputFormatter();
-    expect(formatter.attach("Approve this call once", undefined)).toBe("Approve this call once");
-  });
-
-  it("appends the preview with the documented connector", () => {
-    const formatter = createPromptToolInputFormatter();
-    expect(formatter.attach("Approve this call once", "read src/a.ts")).toBe(
-      "Approve this call once with input read src/a.ts",
-    );
-  });
-});
 
 describe("createPromptToolInputFormatter custom formatter dispatch", () => {
   it("prefers a custom formatter over the built-in summary", () => {
@@ -220,26 +204,6 @@ describe("formatMcpProxyInput", () => {
     );
   });
 
-  it("uses the singular item label for one-element arrays", () => {
-    expect(formatMcpProxyInput({ arguments: { tags: ["only"] } })).toBe("parameters tags: 1 item");
-  });
-
-  it("collapses whitespace inside string arguments before quoting", () => {
-    expect(formatMcpProxyInput({ arguments: { q: "  hello \n\t world  " } })).toBe(
-      'parameters q: "hello world"',
-    );
-  });
-
-  it("quotes an empty string argument", () => {
-    expect(formatMcpProxyInput({ arguments: { q: "" } })).toBe('parameters q: ""');
-  });
-
-  it("renders non-finite numbers and primitive fallbacks with String()", () => {
-    expect(formatMcpProxyInput({ arguments: { n: Number.NaN } })).toBe("parameters n: NaN");
-    expect(formatMcpProxyInput({ arguments: { n: null } })).toBe("parameters n: null");
-    expect(formatMcpProxyInput({ arguments: { flag: false } })).toBe("parameters flag: false");
-  });
-
   it("returns undefined for a missing, null or non-object arguments field", () => {
     expect(formatMcpProxyInput(undefined)).toBeUndefined();
     expect(formatMcpProxyInput(null)).toBeUndefined();
@@ -289,44 +253,7 @@ describe("formatMcpProxyInput", () => {
   });
 });
 
-describe("createMcpPromptFormatter", () => {
-  it("returns the documented arguments preview", () => {
-    const formatter = createMcpPromptFormatter();
-    expect(formatter({ arguments: { query: "hello" } })).toBe('parameters query: "hello"');
-  });
-
-  it("returns undefined for empty arguments", () => {
-    const formatter = createMcpPromptFormatter();
-    expect(formatter({ arguments: {} })).toBeUndefined();
-    expect(formatter({})).toBeUndefined();
-  });
-
-  it("applies injected limits", () => {
-    const formatter = createMcpPromptFormatter(resolvePreviewLimits({ mcpSummary: 6 }));
-    expect(formatter({ arguments: { query: "hello" } })).toBe(`parame${PREVIEW_ELLIPSIS}`);
-  });
-});
-
 describe("registerMcpPromptFormatter", () => {
-  it("registers exactly one formatter named mcp through the injected port", () => {
-    const registrations: Array<{ name: string; formatter: (input: unknown) => unknown }> = [];
-    const port: FormatterRegistrationPort = {
-      register(name, formatter) {
-        registrations.push({ name, formatter });
-        return () => {};
-      },
-    };
-
-    const dispose = registerMcpPromptFormatter(port, { limits: { mcpSummary: 6 } });
-
-    expect(registrations).toHaveLength(1);
-    expect(registrations[0]?.name).toBe("mcp");
-    expect(registrations[0]?.formatter({ arguments: { query: "hello" } })).toBe(
-      `parame${PREVIEW_ELLIPSIS}`,
-    );
-    expect(typeof dispose).toBe("function");
-  });
-
   it("registers into the real public ToolInputFormatterRegistry", () => {
     const registry = new ToolInputFormatterRegistry();
     const dispose = registerMcpPromptFormatter(registry);

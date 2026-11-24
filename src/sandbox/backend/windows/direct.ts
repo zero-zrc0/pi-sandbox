@@ -1,18 +1,18 @@
-import { createHash } from "node:crypto";
+
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import type { EgressGrantRef } from "../../lifecycle";
 import { jsonDigest } from "../../../json";
 import type { DirectBackendDriver, DirectBackendProbe, DirectBackendUnavailable, NativeLaunchPlan } from "../direct";
 import { isPathWithin } from "../../path";
 import type { ResolvedRuntimeFiles } from "../../runtime-store";
-import { parseRuntimeManifest } from "../../runtime-manifest";
+
 import { MAX_NATIVE_REQUEST_BYTES, type ExecutionFilesystemRule, type ExecutionRequest } from "../../types";
 
 const BACKEND_ID = "windows-mxc";
 const BACKEND_VERSION = "1.0.0";
-const MXC_SDK_REVISION = "b21120168d70befe12356411423266bfef168446";
+
 const MXC_READY_MARKER = "\x1ePI-MXC-READY\x1f";
 const FILE_ENV_DENY = new Set(["NODE_OPTIONS", "NODE_PATH"]);
 
@@ -77,39 +77,16 @@ function runtimePaths(runtime: ResolvedRuntimeFiles): { readonly executable: str
       runtime.manifest.protocolVersion !== 3 || runtime.manifest.arch !== process.arch) {
     throw new Error("runtime manifest does not match the Windows backend");
   }
-  const directory = realpathSync(runtime.directory);
-  const storageRoot = realpathSync(runtime.storageRoot);
-  if (directory !== runtime.directory || storageRoot !== runtime.storageRoot || !isPathWithin(storageRoot, directory)) {
-    throw new Error("runtime directory is not canonical or is outside the trusted runtime root");
-  }
-  const manifestPath = join(directory, "runtime.json");
-  const manifestStat = lstatSync(manifestPath);
-  if (manifestStat.isSymbolicLink() || !manifestStat.isFile() || manifestStat.nlink > 1) {
-    throw new Error("runtime manifest is not a regular file");
-  }
-  const currentManifest = parseRuntimeManifest(JSON.parse(readFileSync(manifestPath, "utf8")) as unknown);
-  if (jsonDigest(currentManifest) !== jsonDigest(runtime.manifest)) {
-    throw new Error("runtime manifest changed after selection");
+  const directory = runtime.directory;
+  if (!isPathWithin(runtime.storageRoot, directory)) {
+    throw new Error("runtime directory is outside the trusted runtime root");
   }
   const executable = runtime.files.windowsExecutable;
   const mxcManifest = runtime.files.mxcManifest;
   if (!executable || !mxcManifest || executable !== join(directory, "pi-sandbox-windows-mxc.exe") ||
-      mxcManifest !== join(directory, "mxc-runtime.json")) {
+      mxcManifest !== join(directory, "mxc-runtime.json") ||
+      !isPathWithin(directory, executable) || !isPathWithin(directory, mxcManifest)) {
     throw new Error("Windows runtime files are incomplete or outside their fixed paths");
-  }
-  for (const [role, path] of [["windowsExecutable", executable], ["mxcManifest", mxcManifest]] as const) {
-    const entry = runtime.manifest.files.find(file => file.role === role);
-    const info = lstatSync(path);
-    if (!entry || info.isSymbolicLink() || !info.isFile() || info.nlink > 1 || realpathSync(path) !== path ||
-        !isPathWithin(directory, path) || createHash("sha256").update(readFileSync(path)).digest("hex") !== entry.sha256) {
-      throw new Error(`runtime file ${basename(path)} failed path or hash validation`);
-    }
-  }
-  const nativeManifest = JSON.parse(readFileSync(mxcManifest, "utf8")) as Record<string, unknown>;
-  if (nativeManifest.schemaVersion !== 1 || nativeManifest.backend !== BACKEND_ID || nativeManifest.version !== BACKEND_VERSION ||
-      nativeManifest.sdkRevision !== MXC_SDK_REVISION || nativeManifest.sha256 !== runtime.manifest.files.find(file =>
-        file.role === "windowsExecutable")?.sha256) {
-    throw new Error("native runtime manifest is invalid");
   }
   return { executable, mxcManifest };
 }
@@ -275,6 +252,8 @@ export function createWindowsDirectBackend(options: WindowsBackendOptions): Dire
   return {
     id: BACKEND_ID,
     version: BACKEND_VERSION,
+    probeCacheKey: [BACKEND_ID, BACKEND_VERSION, options.runtime.directory, options.runtime.manifest.version].join(":"),
+
     async probe(signal?: AbortSignal): Promise<DirectBackendProbe | DirectBackendUnavailable> {
       if (signal?.aborted) return unavailable(new Error("runtime probe was cancelled"));
       let files: ReturnType<typeof runtimePaths>;

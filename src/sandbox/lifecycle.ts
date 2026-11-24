@@ -20,7 +20,7 @@ import {
 } from "#sandbox/types";
 import { captureExecutionRequest } from "#sandbox/plan";
 import { capabilityGap, backendFailureCode, requiredCapabilities } from "#sandbox/backend/capabilities";
-import type { DirectBackendDriver, DirectBackendUnavailable, NativeLaunchPlan } from "#sandbox/backend/direct";
+import { probeDirectBackendOnce, type DirectBackendDriver, type DirectBackendUnavailable, type NativeLaunchPlan } from "#sandbox/backend/direct";
 import { runNativeProcess, type NativeProcessResult } from "#sandbox/backend/native-process";
 import { correlationKey } from "#sandbox/keys";
 import {
@@ -34,6 +34,7 @@ export interface BackendProbeSuccess {
   readonly status: "available";
   readonly backend: BackendIdentity;
   readonly capabilities: BackendCapabilities;
+  readonly linuxBubblewrap?: import("./runtime-store").LinuxBubblewrapSelection;
 }
 
 export type BackendProbeResult = BackendProbeSuccess | {
@@ -364,7 +365,7 @@ export class ExecutionController {
     }, this.probeTimeoutMs);
     timer.unref?.();
     try {
-      const result = await this.directBackend.probe(controller.signal);
+      const result = await probeDirectBackendOnce(this.directBackend, controller.signal);
       if (timedOut) return { status: "setup-failed", reason: "native backend probe timed out" };
       if (controller.signal.aborted) return { status: "setup-failed", reason: "native backend probe was cancelled" };
       if (!result.ok) {
@@ -377,6 +378,7 @@ export class ExecutionController {
         status: "available",
         backend: { id: this.directBackend.id, version: this.directBackend.version },
         capabilities: result.capabilities,
+        ...(result.linuxBubblewrap === undefined ? {} : { linuxBubblewrap: result.linuxBubblewrap }),
       };
     } catch (error) {
       return {
@@ -705,7 +707,7 @@ export class ExecutionController {
         }
 
         if (!active.cancel) {
-          const probe = await this.directBackend.probe(task.signal.signal);
+          const probe = await probeDirectBackendOnce(this.directBackend, task.signal.signal);
           if (task.cancel) active.cancel = task.cancel;
           let capabilities: BackendCapabilities | undefined;
           if (!active.cancel && !probe.ok) {

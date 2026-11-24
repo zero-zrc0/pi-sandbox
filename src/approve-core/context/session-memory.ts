@@ -116,6 +116,7 @@ export interface ReviewerSessionMemory {
   readonly degraded: boolean;
   state(): ReviewerMemoryState;
   capture(owner: string): ReviewCaptureResult;
+  isCurrent(owner: string, view: ReviewView, revisions: ReviewSessionRevisions): boolean;
   noteUserInput(text: string): void;
   noteNavigation(): void;
   requestHistoryRebuild(): void;
@@ -353,10 +354,6 @@ interface ResultEventRecord {
   placeholder: ReviewTranscriptEntry | undefined;
 }
 
-type PendingEvent =
-  | { readonly kind: "call"; readonly record: CallEventRecord }
-  | { readonly kind: "result"; readonly record: ResultEventRecord };
-
 /** The immutable facts one publish needs. */
 interface PublishFacts {
   readonly owner: string;
@@ -401,6 +398,33 @@ function isCallRecord(record: EventRecord): record is CallEventRecord {
 function compareEventRecords(left: EventRecord, right: EventRecord): number {
   if (left.recordedAt !== right.recordedAt) return left.recordedAt - right.recordedAt;
   return left.sequence - right.sequence;
+}
+
+function transcriptUnits(entries: readonly ReviewTranscriptEntry[]): readonly (readonly number[])[] {
+  const pairs = new Map<string, { calls: number[]; results: number[] }>();
+  entries.forEach((entry, index) => {
+    const id = entry.tool?.callId;
+    if (id === undefined || (entry.kind !== "tool_call" && entry.kind !== "tool_result")) return;
+    let pair = pairs.get(id);
+    if (pair === undefined) { pair = { calls: [], results: [] }; pairs.set(id, pair); }
+    (entry.kind === "tool_call" ? pair.calls : pair.results).push(index);
+  });
+  const partners = new Map<number, number>();
+  for (const pair of pairs.values()) {
+    for (let index = 0; index < Math.min(pair.calls.length, pair.results.length); index += 1) {
+      const call = pair.calls[index]!;
+      const result = pair.results[index]!;
+      partners.set(call, result);
+      partners.set(result, call);
+    }
+  }
+  const units: number[][] = [];
+  entries.forEach((_entry, index) => {
+    const partner = partners.get(index);
+    if (partner !== undefined && partner < index) return;
+    units.push(partner === undefined ? [index] : [index, partner]);
+  });
+  return units;
 }
 
 /**
@@ -484,7 +508,10 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
 
   readonly #calls = new Map<string, CallEventRecord>();
   readonly #results = new Map<string, ResultEventRecord>();
-  #pending: PendingEvent[] = [];
+  readonly #trackedToolEvents = new Set<string>();
+  readonly #archivedEvents = new Map<string, { readonly call: CallEventRecord; readonly result: ResultEventRecord; readonly bytes: number }>();
+  #archivedBytes = 0;
+  #pending = new Set<string>();
   #eventSequence = 0;
 
   constructor(options: ReviewerSessionMemoryOptions) {
@@ -514,7 +541,7 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
       view: this.#viewState,
       historyVersion: this.#viewState?.historyVersion ?? 0,
       captureSeq: this.#viewState?.captureSeq ?? 0,
-      pendingEvents: this.#pending.length,
+      pendingEvents: this.#pending.size,
     });
   }
 
@@ -528,6 +555,23 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
     if (this.#viewState === undefined) return this.#initialize(owner);
     if (this.#viewState.owner !== owner) return { ok: false, reason: "invalid-owner" };
     return this.#synchronize();
+  }
+
+  isCurrent(owner: string, view: ReviewView, revisions: ReviewSessionRevisions): boolean {
+    if (this.#disposedState || this.#pendingRebuild || this.#viewState === undefined ||
+        owner !== view.owner || owner !== this.#viewState.owner ||
+        revisions.owner !== this.#ownerRevision || revisions.navigation !== this.#navigationRevision ||
+        revisions.authorization !== this.#authorizationRevision) return false;
+    try {
+      const host = this.#requireHost();
+      if (host.getSessionId() !== view.sessionId) return false;
+      const leaf = host.getLeafId();
+      if ((leaf ?? "") === view.leafId) return true;
+      const suffix = this.#walkSuffix(view.leafId, leaf);
+      return suffix.kind === "ok" && suffixDisposition(suffix.entries) === "append";
+    } catch {
+      return false;
+    }
   }
 
   /** First capture: prefer the host projection, otherwise serve only an empty session (§2). */
@@ -623,6 +667,12 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
     }
     if (!nonEmptyString(sessionId)) return this.#failed("sync-failed");
     if (sessionId !== current.sessionId) return this.#failed("fatal");
+
+    if (!current.degraded && !this.#pendingRebuild && this.#pending.size === 0 && (leafId ?? "") === current.leafId) {
+      this.#lastFailure = undefined;
+      this.#applyObservations(0, false);
+      return { ok: true, view: current, revisions: this.#revisions() };
+    }
 
     let candidate: PublishFacts | undefined;
     let observedUsers = 0;
@@ -871,7 +921,7 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
     degraded: boolean,
     sessionId: string,
   ): { readonly placeholders: readonly ReviewTranscriptEntry[] } {
-    this.#pending = [];
+    this.#pending.clear();
     this.#dropForeignSession(sessionId);
     if (degraded) return { placeholders: [] };
 
@@ -882,10 +932,24 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
       const callId = entry.tool?.callId;
       if (entry.kind === "tool_call" && callId !== undefined) baseCalls.set(callId, entry.tool?.name ?? "");
     }
+    for (const [id, call] of this.#calls) {
+      if (baseKeys.has(call.key) && baseKeys.has(`result:${id}`)) {
+        this.#calls.delete(id);
+        this.#results.delete(id);
+        this.#trackedToolEvents.delete(id);
+        this.#pending.delete(id);
+      }
+    }
+    for (const [id, record] of this.#archivedEvents) {
+      if (baseKeys.has(record.call.key) && baseKeys.has(record.result.key)) this.#deleteArchivedEvent(id);
+    }
     const manifestCalls = new Map<string, string>();
     for (const call of manifest?.directCalls ?? []) manifestCalls.set(call.toolCallId, call.toolName);
 
-    const records: EventRecord[] = [...this.#calls.values(), ...this.#results.values()];
+    const records: EventRecord[] = [
+      ...[...this.#archivedEvents.values()].flatMap(({ call, result }) => [call, result]),
+      ...this.#calls.values(), ...this.#results.values(),
+    ];
     records.sort(compareEventRecords);
     const placeholders: ReviewTranscriptEntry[] = [];
     for (const record of records) {
@@ -900,6 +964,7 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
       }
       // A result is attributable only when its call is known under the same name.
       const knownName = this.#calls.get(record.toolCallId)?.toolName
+        ?? this.#archivedEvents.get(record.toolCallId)?.call.toolName
         ?? manifestCalls.get(record.toolCallId)
         ?? baseCalls.get(record.toolCallId);
       if (knownName !== record.toolName) continue;
@@ -916,6 +981,12 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
     }
     for (const [id, record] of this.#results) {
       if (record.sessionId !== sessionId) this.#results.delete(id);
+    }
+    for (const id of this.#trackedToolEvents) {
+      if (!this.#calls.has(id) && !this.#results.has(id)) this.#trackedToolEvents.delete(id);
+    }
+    for (const [id, record] of this.#archivedEvents) {
+      if (record.call.sessionId !== sessionId) this.#deleteArchivedEvent(id);
     }
   }
 
@@ -945,9 +1016,6 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
   ): ReviewView {
     let transcript = [...facts.transcript];
     let authorization = [...facts.authorization];
-    if (transcript.length > this.#limits.maxTranscriptEntries) {
-      transcript = transcript.slice(transcript.length - this.#limits.maxTranscriptEntries);
-    }
     if (authorization.length > this.#limits.maxAuthorizationEntries) {
       authorization = authorization.slice(authorization.length - this.#limits.maxAuthorizationEntries);
     }
@@ -964,21 +1032,39 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
       degraded: facts.degraded,
     }) satisfies ReviewView;
 
-    // The byte budget covers the frozen view the memory retains (transcript,
-    // authorization and the step manifest). Drop the oldest transcript entries
-    // until the view fits; a single oversized entry may leave the view empty.
-    let view = build();
-    while (viewBytes(view) > this.#limits.maxViewBytes && transcript.length > 0) {
-      transcript = transcript.slice(Math.max(1, Math.ceil(transcript.length / 8)));
-      view = build();
+    const units = transcriptUnits(transcript);
+    const entryBytes = transcript.map(entry => Buffer.byteLength(JSON.stringify(entry), "utf8"));
+    const fullTranscript = transcript;
+    transcript = [];
+    const emptyView = build();
+    let entriesLeft = fullTranscript.length;
+    let bytes = viewBytes(emptyView) + entryBytes.reduce((sum, value) => sum + value, 0) + Math.max(0, entriesLeft - 1);
+    let unitsLeft = units.length;
+    const removed = new Set<number>();
+    for (const unit of units) {
+      if (unitsLeft <= this.#limits.maxTranscriptEntries && bytes <= this.#limits.maxViewBytes) break;
+      for (const index of unit) {
+        removed.add(index);
+        bytes -= entryBytes[index]!;
+        if (entriesLeft > 1) bytes -= 1;
+        entriesLeft -= 1;
+      }
+      unitsLeft -= 1;
     }
+    transcript = fullTranscript.filter((_entry, index) => !removed.has(index));
+    const view = build();
 
     const retainedKeys = new Set(transcript.map((entry) => entry.entryKey));
+    for (const [id, record] of this.#archivedEvents) {
+      if (!record.call.direct && !retainedKeys.has(record.call.key) && !retainedKeys.has(record.result.key)) {
+        this.#deleteArchivedEvent(id);
+      }
+    }
     const retainedPlaceholders = placeholderEntries.filter((entry) => retainedKeys.has(entry.entryKey));
     this.#viewState = view;
     this.#placeholderEntries = Object.freeze([...retainedPlaceholders]);
     this.#placeholderKeys = new Set(retainedPlaceholders.map((entry) => entry.entryKey));
-    this.#pending = [];
+    this.#pending.clear();
     this.#pendingRebuild = false;
     return view;
   }
@@ -1049,6 +1135,7 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
     const view = this.#viewState;
     // §4.1: an event from another session belongs to nothing we serve.
     if (view !== undefined && sessionId !== view.sessionId) return;
+    if (this.#archivedEvents.has(toolCallId)) return;
 
     const recordedAt = this.#readNow();
     const sequence = ++this.#eventSequence;
@@ -1066,11 +1153,11 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
           existing.parentToolCallId === parentToolCallId &&
           existing.inputJson === inputJson
         ) {
-          this.#pending.push({ kind: "call", record: existing });
+          this.#pending.add(toolCallId);
         }
         return;
       }
-      if (this.#calls.size + this.#results.size >= this.#limits.maxToolEvents) return;
+      if (!this.#makeRoomForToolEvent(toolCallId)) return;
       const record: CallEventRecord = {
         key: `call:${toolCallId}`,
         sessionId,
@@ -1085,7 +1172,8 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
         placeholder: undefined,
       };
       this.#calls.set(toolCallId, record);
-      this.#pending.push({ kind: "call", record });
+      this.#trackedToolEvents.add(toolCallId);
+      this.#pending.add(toolCallId);
       return;
     }
 
@@ -1095,11 +1183,11 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
     const existing = this.#results.get(toolCallId);
     if (existing !== undefined) {
       if (existing.toolName === toolName && existing.text === text && existing.isError === isError) {
-        this.#pending.push({ kind: "result", record: existing });
+        this.#pending.add(toolCallId);
       }
       return;
     }
-    if (this.#calls.size + this.#results.size >= this.#limits.maxToolEvents) return;
+    if (!this.#makeRoomForToolEvent(toolCallId)) return;
     const result: ResultEventRecord = {
       key: `result:${toolCallId}`,
       sessionId,
@@ -1112,7 +1200,55 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
       placeholder: undefined,
     };
     this.#results.set(toolCallId, result);
-    this.#pending.push({ kind: "result", record: result });
+    this.#trackedToolEvents.add(toolCallId);
+    this.#pending.add(toolCallId);
+  }
+
+  #makeRoomForToolEvent(toolCallId: string): boolean {
+    if (this.#calls.has(toolCallId) || this.#results.has(toolCallId)) return true;
+    while (this.#trackedToolEvents.size >= this.#limits.maxToolEvents) {
+      let oldest: CallEventRecord | undefined;
+      for (const [id, call] of this.#calls) {
+        if (!this.#results.has(id)) continue;
+        if (oldest === undefined || call.sequence < oldest.sequence) oldest = call;
+      }
+      if (oldest === undefined) return false;
+      const result = this.#results.get(oldest.toolCallId)!;
+      if (oldest.sessionId === result.sessionId && oldest.toolName === result.toolName) {
+        this.#archiveEvent(oldest, result);
+      }
+      this.#calls.delete(oldest.toolCallId);
+      this.#results.delete(oldest.toolCallId);
+      this.#pending.delete(oldest.toolCallId);
+      this.#trackedToolEvents.delete(oldest.toolCallId);
+    }
+    return true;
+  }
+
+  #archiveEvent(call: CallEventRecord, result: ResultEventRecord): void {
+    call.placeholder ??= makeCallPlaceholder(call);
+    result.placeholder ??= makeResultPlaceholder(result);
+    const bytes = Buffer.byteLength(JSON.stringify(result.placeholder), "utf8") +
+      (call.direct ? 0 : Buffer.byteLength(JSON.stringify(call.placeholder), "utf8") + 1);
+    this.#archivedEvents.set(call.toolCallId, { call, result, bytes });
+    this.#archivedBytes += bytes;
+    while (this.#archivedEvents.size > this.#limits.maxTranscriptEntries || this.#archivedBytes > this.#limits.maxViewBytes) {
+      let oldestId: string | undefined;
+      let oldestSequence = Infinity;
+      for (const [id, archived] of this.#archivedEvents) {
+        const sequence = Math.min(archived.call.sequence, archived.result.sequence);
+        if (sequence < oldestSequence) { oldestId = id; oldestSequence = sequence; }
+      }
+      if (oldestId === undefined) break;
+      this.#deleteArchivedEvent(oldestId);
+    }
+  }
+
+  #deleteArchivedEvent(id: string): void {
+    const record = this.#archivedEvents.get(id);
+    if (record === undefined) return;
+    this.#archivedBytes -= record.bytes;
+    this.#archivedEvents.delete(id);
   }
 
   // -------------------------------------------------------------------------
@@ -1135,7 +1271,10 @@ class ReviewerSessionMemoryImpl implements ReviewerSessionMemory {
     this.#navigationNoticePending = false;
     this.#calls.clear();
     this.#results.clear();
-    this.#pending = [];
+    this.#trackedToolEvents.clear();
+    this.#archivedEvents.clear();
+    this.#archivedBytes = 0;
+    this.#pending.clear();
     this.#eventSequence = 0;
   }
 

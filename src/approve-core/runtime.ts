@@ -70,6 +70,7 @@ export interface StepContext {
    */
   readonly bashPrograms?: Readonly<Record<string, BashProgramFactsView>>;
   readonly powershellPrograms?: Readonly<Record<string, PowerShellProgramFactsView>>;
+  readonly selectedFilePaths?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -244,6 +245,7 @@ export interface RunStepChainInput {
    */
   readonly bashPrograms?: Readonly<Record<string, BashProgramFactsView>>;
   readonly powershellPrograms?: Readonly<Record<string, PowerShellProgramFactsView>>;
+  readonly selectedFilePaths?: Readonly<Record<string, string>>;
 }
 
 export type RunStepChainResult =
@@ -630,6 +632,9 @@ export async function runStepChain(
   const powershellPrograms = input.powershellPrograms === undefined
     ? undefined
     : Object.freeze(nullProtoRecord(input.powershellPrograms));
+  const selectedFilePaths = input.selectedFilePaths === undefined
+    ? undefined
+    : Object.freeze(nullProtoRecord(input.selectedFilePaths));
   const runs: NodeRunRecord[] = [];
   const faults: ChainFault[] = [];
   const readyResults: FinalCallResult[] = [];
@@ -792,6 +797,7 @@ export async function runStepChain(
           deadlineAt,
           ...(bashPrograms === undefined ? {} : { bashPrograms }),
           ...(powershellPrograms === undefined ? {} : { powershellPrograms }),
+          ...(selectedFilePaths === undefined ? {} : { selectedFilePaths }),
         }),
         host,
       ));

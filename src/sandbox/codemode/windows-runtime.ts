@@ -1,14 +1,19 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  existsSync,
+  mkdirSync,
+  lstatSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ResolvedRuntimeFiles } from "../runtime-store";
 import { CodemodeSandboxBase, type CodemodeSandboxBaseOptions } from "@earendil-works/pi-codemode";
@@ -40,6 +45,63 @@ const MAX_STDERR_BYTES = CODEMODE_RUNTIME_LIMITS.maxDiagnosticBytes;
 const READY_TIMEOUT_MS = 15_000;
 const STOP_GRACE_MS = 300;
 
+interface WindowsCodemodeRuntimeFiles {
+  readonly executable: string;
+  readonly mxc: string;
+  readonly mxcManifest: string;
+  readonly bootstrapSource: string;
+  readonly workerSource: string;
+  readonly wasmPath: string;
+}
+
+const resolvedRuntimes = new WeakMap<ResolvedRuntimeFiles, WindowsCodemodeRuntimeFiles>();
+
+function ensureCodemodeDirectory(storageRoot: string, path: string): string {
+  if (!isPathWithin(storageRoot, resolve(path))) throw new Error("Codemode WASM path is outside runtime storage");
+  if (!existsSync(path)) {
+    try { mkdirSync(path); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  }
+  const metadata = lstatSync(path);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error("Codemode WASM directory is invalid");
+  const actual = realpathSync(path);
+  if (!isPathWithin(storageRoot, actual)) throw new Error("Codemode WASM directory resolves outside runtime storage");
+  return actual;
+}
+
+function prepareQuickJsFile(storageRoot: string, workerSource: string): string {
+  const wasmSource = fileURLToPath(import.meta.resolve("quickjs-wasi/quickjs.wasm"));
+  const packagePath = fileURLToPath(import.meta.resolve("quickjs-wasi/package.json"));
+  const packageData = JSON.parse(readFileSync(packagePath, "utf8")) as { version?: unknown };
+  if (typeof packageData.version !== "string" || packageData.version.length === 0) {
+    throw new Error("sandbox-unavailable: QuickJS package version is invalid");
+  }
+  const wasmBytes = readFileSync(wasmSource);
+  const wasmHash = createHash("sha256").update(wasmBytes).digest("hex");
+  const workerHash = createHash("sha256").update(workerSource).digest("hex");
+  const root = realpathSync(storageRoot);
+  const codemodeRoot = ensureCodemodeDirectory(root, join(root, "codemode"));
+  const versionDirectory = ensureCodemodeDirectory(codemodeRoot,
+    join(codemodeRoot, `${workerHash}-${packageData.version}-${wasmHash}`));
+  const wasmPath = join(versionDirectory, "quickjs.wasm");
+  if (!existsSync(wasmPath)) {
+    const staged = join(versionDirectory, `.quickjs-${process.pid}-${randomUUID()}.tmp`);
+    writeFileSync(staged, wasmBytes, { flag: "wx", mode: 0o600 });
+    try {
+      renameSync(staged, wasmPath);
+    } catch (error) {
+      rmSync(staged, { force: true });
+      if (!existsSync(wasmPath)) throw error;
+    }
+  }
+  const metadata = lstatSync(wasmPath);
+  if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.nlink > 1 ||
+      createHash("sha256").update(readFileSync(wasmPath)).digest("hex") !== wasmHash) {
+    throw new Error("sandbox-unavailable: selected QuickJS WASM file is invalid");
+  }
+  return realpathSync(wasmPath);
+}
+
 function runtimeFile(path: string, expectedHash?: string): string {
   try {
     const resolved = realpathSync(path);
@@ -53,8 +115,9 @@ function runtimeFile(path: string, expectedHash?: string): string {
   }
 }
 
-function resolveRuntimeFiles(runtime: ResolvedRuntimeFiles) {
-  const wasm = fileURLToPath(import.meta.resolve("quickjs-wasi/quickjs.wasm"));
+function resolveRuntimeFiles(runtime: ResolvedRuntimeFiles): WindowsCodemodeRuntimeFiles {
+  const cached = resolvedRuntimes.get(runtime);
+  if (cached !== undefined) return cached;
   const executableEntry = runtime.manifest.files.find(file => file.role === "windowsExecutable");
   const manifestEntry = runtime.manifest.files.find(file => file.role === "mxcManifest");
   if (!runtime.files.windowsExecutable || !runtime.files.mxcManifest || !executableEntry || !manifestEntry) {
@@ -79,23 +142,26 @@ function resolveRuntimeFiles(runtime: ResolvedRuntimeFiles) {
       nativeManifest.sha256 !== executableEntry.sha256) {
     throw new Error("sandbox-unavailable: Windows Codemode runtime manifest is invalid");
   }
-  return {
+  const workerSource = readFileSync(new URL("./worker.bundle.cjs", import.meta.url), "utf8");
+  const resolved = {
     executable: runtimeFile(process.execPath),
     mxc,
+    mxcManifest,
     bootstrapSource: readFileSync(
       runtimeFile(fileURLToPath(new URL("./runtime-worker.bundle.cjs", import.meta.url))),
       "utf8",
     ),
-    workerSource: readFileSync(new URL("./worker.bundle.cjs", import.meta.url), "utf8"),
-    wasmBase64: readFileSync(wasm).toString("base64"),
+    workerSource,
+    wasmPath: prepareQuickJsFile(runtime.storageRoot, workerSource),
   };
+  resolvedRuntimes.set(runtime, resolved);
+  return resolved;
 }
 
 function requestFor(input: {
   readonly mxc: string;
-  readonly runtimeDirectory: string;
-  readonly runtimeStorageRoot: string;
   readonly mxcManifest: string;
+  readonly wasmPath: string;
   readonly cwd: string;
   readonly executable: string;
   readonly bootstrapSource: string;
@@ -109,10 +175,9 @@ function requestFor(input: {
     operation: { kind: "builtin-tool", name: "read", arguments: {} } });
   const runtimeFilesystem: FilesystemGrantInput[] = [
     ...runtime.grants,
-    { path: input.runtimeStorageRoot, access: "read", granularity: "directory" },
-    { path: input.runtimeDirectory, access: "read", granularity: "directory" },
     { path: input.mxc, access: "read", granularity: "file" },
     { path: input.mxcManifest, access: "read", granularity: "file" },
+    { path: input.wasmPath, access: "read", granularity: "file" },
   ];
   const compiled = compilePermissionPlan({
     baseline: { filesystem: [
@@ -152,6 +217,7 @@ async function launchWindowsRuntime(
       storageRoot: runtime.storageRoot,
       platform: runtime.manifest.platform,
       arch: runtime.manifest.arch,
+      version: runtime.manifest.version,
     });
   } catch (error) {
     return Promise.reject(error);
@@ -171,9 +237,6 @@ async function launchWindowsRuntime(
   try {
     nativeRequest = requestFor({
       ...files,
-      runtimeDirectory: runtime.directory,
-      runtimeStorageRoot: runtime.storageRoot,
-      mxcManifest: runtime.files.mxcManifest!,
       cwd,
       sensitivePaths,
     });
@@ -196,7 +259,7 @@ async function launchWindowsRuntime(
       type: "start",
       data,
       workerSource: files.workerSource,
-      wasmBase64: files.wasmBase64,
+      wasmPath: files.wasmPath,
     }, generation, nextMessageId++);
   } catch (error) {
     releaseRuntimeUse();
@@ -218,8 +281,6 @@ async function launchWindowsRuntime(
   }
   let child: ChildProcessWithoutNullStreams;
   try {
-    runtimeFile(files.mxc, runtime.manifest.files.find(file => file.role === "windowsExecutable")?.sha256);
-    runtimeFile(runtime.files.mxcManifest!, runtime.manifest.files.find(file => file.role === "mxcManifest")?.sha256);
     if (!sensitivePaths.every(sensitivePathIdentityMatches)) throw new Error("sensitive path changed before Codemode Runtime startup");
     child = spawn(files.mxc, ["stdio"], {
       cwd,

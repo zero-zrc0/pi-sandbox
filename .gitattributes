@@ -5,6 +5,7 @@ schemas/permissions.schema.json text eol=lf
 
 # Shell scripts run on Linux and WSL; CRLF breaks `set -o pipefail`.
 *.sh text eol=lf
+.husky/pre-commit text eol=lf
 
 # Generated single-file bundle: keep the committed bytes identical to the build
 # output and out of diffs.
