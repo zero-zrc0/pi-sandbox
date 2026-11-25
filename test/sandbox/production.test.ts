@@ -713,7 +713,7 @@ describe("production controlled execution boundary", () => {
   });
 
   it("keeps raw temporary paths when sandboxing is off and in full-access", async () => {
-    const hostTemp = mkdtempSync(join(tmpdir(), "pi-sandbox-host-temp-"));
+    const hostTemp = realpathSync(mkdtempSync(join(tmpdir(), "pi-sandbox-host-temp-")));
     cleanup.push(async () => rmSync(hostTemp, { recursive: true, force: true }));
     const previous = process.env.TMPDIR;
     process.env.TMPDIR = hostTemp;

@@ -69,7 +69,7 @@ describe.skipIf(process.platform !== "darwin")("darwin production controller wir
       source: "global",
       projectConfigInvalid: false,
       toolRules: [],
-      paths: { projectConfigDir: workspace, globalConfigDir: agentDir },
+      paths: { projectConfigDir: workspace, globalConfigDir: agentDir, globalConfigFile: join(agentDir, "config.json") },
       cwd: workspace,
     } as unknown as ApprovalChainConfigSnapshot;
     const runtime = {

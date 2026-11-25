@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -92,7 +92,7 @@ function fixture(extra: readonly { readonly name: string; readonly bytes: Buffer
       { role: "runtimeManifest", path: "runtime.json", sha256: digest(manifestBytes), executable: false },
     ],
   }] }).runtimes[0]!;
-  const parent = mkdtempSync(join(tmpdir(), "runtime-archive-test-"));
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), "runtime-archive-test-")));
   temporaryDirectories.push(parent);
   const archivePath = join(parent, "runtime.tar.gz");
   const destination = join(parent, "extracted");
@@ -200,7 +200,7 @@ it.skipIf(process.platform === "win32")("binds a staged bundled bubblewrap selec
 
 describe("runtime version leases", () => {
   it("leases only the selected runtime version", async () => {
-    const pluginRoot = mkdtempSync(join(tmpdir(), "runtime-lease-test-"));
+    const pluginRoot = realpathSync(mkdtempSync(join(tmpdir(), "runtime-lease-test-")));
     temporaryDirectories.push(pluginRoot);
     const release = await acquireRuntimeUseLease({
       storageRoot: pluginRoot,

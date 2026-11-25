@@ -106,10 +106,15 @@ describe.skipIf(!nativeReady)("native macOS runtime end to end", () => {
   it("writes a $TMPDIR path into the session workspace temporary directory", async () => {
     const event = { type: "tool_call" as const, toolName: "write", toolCallId: "macos-e2e-temp-write",
       input: { path: "$TMPDIR/notes.txt", content: "sandboxed temporary" } };
-    const review = async () => undefined;
+    const reviews: unknown[] = [];
+    const review = async (input: unknown) => { reviews.push(input); return undefined; };
 
     expect(await execution.guard(event, ctx, review)).toBeUndefined();
-    expect(event.input.path).not.toBe("$TMPDIR/notes.txt");
+    expect(event.input.path).toBe("$TMPDIR/notes.txt");
+    expect(reviews.at(-1)).toMatchObject({
+      requestedPath: "$TMPDIR/notes.txt",
+      resolvedPath: join(execution.sessionWorkspace(ctx), "tmp", "notes.txt"),
+    });
 
     const result = await definitions.get("write")!.execute(
       event.toolCallId, event.input, undefined, undefined, ctx as never,
@@ -152,8 +157,11 @@ describe.skipIf(!nativeReady)("native macOS runtime end to end", () => {
     owner.reload();
     const deniedRead = { type: "tool_call" as const, toolName: "read", toolCallId: "macos-control-deny-path", input: { path: deniedPath } };
     expect(await execution.guard(deniedRead, ctx, async () => undefined)).toBeUndefined();
-    const deniedResult = await definitions.get("read")!.execute(deniedRead.toolCallId, deniedRead.input, undefined, undefined, ctx as never);
-    expect(deniedResult.isError, JSON.stringify(deniedResult)).toBe(true);
-    expect(JSON.stringify(deniedResult)).not.toContain("skill content");
+    const deniedResult = await definitions.get("read")!.execute(deniedRead.toolCallId, deniedRead.input, undefined, undefined, ctx as never)
+      .catch((error: unknown) => error);
+    const deniedFailure = deniedResult instanceof Error || (typeof deniedResult === "object" && deniedResult !== null &&
+      "isError" in deniedResult && deniedResult.isError === true);
+    expect(deniedFailure, JSON.stringify(deniedResult)).toBe(true);
+    expect(String(deniedResult instanceof Error ? deniedResult.message : JSON.stringify(deniedResult))).not.toContain("skill content");
   }, 60_000);
 });
